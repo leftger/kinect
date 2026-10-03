@@ -59,6 +59,8 @@ struct Options {
     /// trajectory. Costs memory: the frames have to be kept so the model can be
     /// rebuilt once the poses move.
     loop_closure: bool,
+    /// Capture colour and paint it onto the mesh.
+    color: bool,
 }
 
 impl Default for Options {
@@ -72,6 +74,7 @@ impl Default for Options {
             drain_color: false,
             gpu: false,
             loop_closure: false,
+            color: false,
         }
     }
 }
@@ -104,7 +107,7 @@ async fn run() -> Result<(), Box<dyn Error>> {
                 };
             }
             "--no-filter" => options.filters = false,
-            "--drain-color" => options.drain_color = true,
+            "--color" => options.color = true,
             "--loop-closure" => options.loop_closure = true,
             "--gpu" => options.gpu = true,
             "-h" | "--help" => {
@@ -189,7 +192,7 @@ async fn live(options: &Options) -> Result<(), Box<dyn Error>> {
     let frames = options.frames.unwrap_or(DEFAULT_FRAMES);
 
     let mut capture =
-        capture::Capture::open(options.filters, options.drain_color, options.gpu).await?;
+        capture::Capture::open(options.filters, options.color, options.gpu).await?;
     let intrinsics = capture.intrinsics();
     let (width, height) = capture.dimensions();
 
@@ -202,8 +205,18 @@ async fn live(options: &Options) -> Result<(), Box<dyn Error>> {
     let mut scanner = Scanner::new(intrinsics, scanner_config(options));
 
     for index in 1..=frames {
-        let frame = capture.next_frame().await?;
-        let report = scanner.add_frame(frame, width, height);
+        // Owned, because `next_frame` borrows the capture mutably for as long as
+        // its result lives, and the colour has to be read afterwards. One 850 KB
+        // copy per frame against a 270 ms frame is not worth restructuring the
+        // capture API over.
+        let frame = capture.next_frame().await?.to_vec();
+
+        // Both come from `capture`, and the scanner needs them together to pair
+        // them with one pose.
+        let color = capture
+            .color()
+            .map(|captured| (captured.rgb.as_slice(), captured.depth.as_slice()));
+        let report = scanner.add_frame_with_color(&frame, width, height, color);
         print_progress(index, &report);
     }
 
@@ -398,6 +411,12 @@ fn finish(scanner: &Scanner, options: &Options) -> Result<(), Box<dyn Error>> {
         scanner.total_tracking().as_secs_f64() * 1000.0 / frames,
         scanner.total_fusion().as_secs_f64() * 1000.0 / frames,
     );
+    if scanner.color_views() > 0 {
+        println!(
+            "[scan] colour: {} views used to texture the mesh",
+            scanner.color_views()
+        );
+    }
     println!(
         "[scan] TSDF: {} blocks, {:.1} MB",
         scanner.block_count(),

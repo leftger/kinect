@@ -2,6 +2,7 @@
 
 use geom::mesh::Mesh;
 use geom::tsdf::{IntegrationStats, TsdfParams, TsdfVolume};
+use geom::coloring::{colorize, ColoringParams, ColorView};
 use geom::pose_graph::{PoseGraph, PoseGraphParams};
 use geom::{DepthImage, Intrinsics};
 use nalgebra::{Isometry3, Vector3};
@@ -122,6 +123,9 @@ pub struct Scanner {
     /// Frames retained so the model can be rebuilt; parallel to `poses`.
     kept: Vec<KeptFrame>,
     loops: Option<LoopFinder>,
+    /// Colour from the frames that saw the surface, for texturing the mesh.
+    color_views: Vec<ColorView>,
+    coloring: ColoringParams,
     dimensions: Option<(usize, usize)>,
     closure: Option<ClosureReport>,
 }
@@ -154,6 +158,8 @@ impl Scanner {
             poses: Vec::new(),
             kept: Vec::new(),
             loops,
+            color_views: Vec::new(),
+            coloring: ColoringParams::default(),
             dimensions: None,
             closure: None,
         }
@@ -163,6 +169,21 @@ impl Scanner {
     ///
     /// Anywhere the depth is `NaN` or non-positive is treated as no measurement.
     pub fn add_frame(&mut self, depth_metres: &[f32], width: usize, height: usize) -> FrameReport {
+        self.add_frame_with_color(depth_metres, width, height, None)
+    }
+
+    /// As `add_frame`, but also keeping this frame's colour for texturing.
+    ///
+    /// `color` is the registered colour and the undistorted depth from the same
+    /// frame; the pose is not needed because it is the pose this frame is about
+    /// to be tracked to.
+    pub fn add_frame_with_color(
+        &mut self,
+        depth_metres: &[f32],
+        width: usize,
+        height: usize,
+        color: Option<(&[u8], &[f32])>,
+    ) -> FrameReport {
         let intrinsics = self.intrinsics;
         let image = DepthImage::new(width, height, depth_metres);
 
@@ -211,6 +232,17 @@ impl Scanner {
 
         self.poses.push(track.pose);
         self.dimensions.get_or_insert((width, height));
+
+        if let Some((rgb, depth)) = color {
+            self.color_views.push(ColorView {
+                color: rgb.to_vec(),
+                width,
+                height,
+                depth: depth.to_vec(),
+                pose: track.pose,
+                intrinsics,
+            });
+        }
 
         // Offer this frame as somewhere the sensor might return to. The cloud is
         // the one already back-projected for fusion, so the extra cost is the
@@ -378,7 +410,19 @@ impl Scanner {
     }
 
     pub fn mesh(&self) -> Mesh {
-        self.volume.extract_mesh()
+        let mut mesh = self.volume.extract_mesh();
+
+        if !self.color_views.is_empty() {
+            let (colors, _report) = colorize(&mesh.vertices, &self.color_views, &self.coloring);
+            mesh.colors = Some(colors);
+        }
+
+        mesh
+    }
+
+    /// How many frames contributed colour. Zero when texturing is off.
+    pub fn color_views(&self) -> usize {
+        self.color_views.len()
     }
 
     pub fn trajectory(&self) -> &[Vector3<f32>] {

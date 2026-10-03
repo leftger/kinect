@@ -13,6 +13,7 @@
 //! 5. [`tsdf`] — fused truncated signed distance field with surface extraction.
 //! 6. [`mesh`] — triangle mesh output.
 
+pub mod coloring;
 pub mod icp;
 pub mod mesh;
 pub mod normals;

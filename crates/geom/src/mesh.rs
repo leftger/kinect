@@ -10,6 +10,12 @@ use std::path::Path;
 pub struct Mesh {
     pub vertices: Vec<Vector3<f32>>,
     pub triangles: Vec<[u32; 3]>,
+    /// Per-vertex RGB, one entry per vertex, or `None` for an uncoloured mesh.
+    ///
+    /// Not fused into the TSDF: colouring the finished mesh lets every frame that
+    /// saw a surface contribute, not just the ones that arrived while it was
+    /// being integrated. See `crate::coloring`.
+    pub colors: Option<Vec<[u8; 3]>>,
 }
 
 impl Mesh {
@@ -62,22 +68,49 @@ impl Mesh {
     }
 
     /// Binary little-endian PLY with vertices and triangle faces.
+    ///
+    /// Per-vertex colour is written as `uchar red/green/blue` when the mesh has
+    /// one entry per vertex. Those are the conventional property names, which is
+    /// what MeshLab, CloudCompare and Blender read. PLY has no texture
+    /// coordinates in its core format, so a proper texture atlas would need OBJ
+    /// or glTF rather than an extension here.
     pub fn write_ply<W: Write>(&self, writer: &mut W) -> io::Result<()> {
+        let colored = self
+            .colors
+            .as_ref()
+            .is_some_and(|colors| colors.len() == self.vertices.len());
+
         write!(
             writer,
             "ply\nformat binary_little_endian 1.0\n\
              element vertex {}\n\
-             property float x\nproperty float y\nproperty float z\n\
-             element face {}\n\
+             property float x\nproperty float y\nproperty float z\n",
+            self.vertices.len()
+        )?;
+
+        if colored {
+            write!(
+                writer,
+                "property uchar red\nproperty uchar green\nproperty uchar blue\n"
+            )?;
+        }
+
+        write!(
+            writer,
+            "element face {}\n\
              property list uchar int vertex_indices\n\
              end_header\n",
-            self.vertices.len(),
             self.triangles.len()
         )?;
 
-        for v in &self.vertices {
+        for (index, v) in self.vertices.iter().enumerate() {
             for c in [v.x, v.y, v.z] {
                 writer.write_all(&c.to_le_bytes())?;
+            }
+            if colored {
+                if let Some(colors) = &self.colors {
+                    writer.write_all(&colors[index])?;
+                }
             }
         }
 
@@ -125,6 +158,7 @@ mod tests {
 
     fn tetrahedron() -> Mesh {
         Mesh {
+            colors: None,
             vertices: vec![
                 Vector3::new(0.0, 0.0, 0.0),
                 Vector3::new(1.0, 0.0, 0.0),

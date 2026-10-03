@@ -20,6 +20,7 @@ gaps. Read this section before the code.
 - TSDF fusion and triangle-mesh extraction, written as binary PLY
 - Trajectory export, which is the quickest way to see how badly a scan drifted
 - Loop closure and pose-graph optimisation, wired and tested
+- Optional colour, registered onto the mesh as per-vertex PLY colours
 
 **Found by profiling, and fixed**
 
@@ -130,6 +131,41 @@ is enumerated once per frame and the projective update runs over its voxels.
 connectivity is recovered by, for each grid edge with a sign change, joining the
 four surrounding cubes. It is far less code than marching cubes and produces
 cleaner quads at the cost of some detail.
+
+## Colour
+
+`--color` captures the colour stream and paints it onto the finished mesh, written
+as per-vertex `uchar red/green/blue` properties that MeshLab, CloudCompare and
+Blender read.
+
+The colour is registered into the *depth* camera's grid as each frame arrives
+(`Registration::undistort_depth_and_color`), so a view is a 512x424 RGB image plus
+the undistorted depth from the same frame. That registration is what makes the
+rest simple: projecting a vertex needs only the depth intrinsics, and the view's
+own depth is directly usable as an occlusion test, which is the same test the
+projective odometry already does.
+
+A vertex is only painted by a view whose measured depth agrees with how far away
+the vertex actually is. Without that, a vertex on a far wall seen through a
+doorway from some other pose would be painted with whatever is in front of it.
+Every view that passes contributes, so the finished model is smoother than any
+single frame.
+
+PLY has no texture coordinates in its core format, so this is per-vertex colour
+rather than a texture atlas. Unlike fused colour it costs no extra volume and
+lets every frame that saw a surface contribute, not only the frames that arrived
+while that surface was being integrated. A real texture atlas would mean
+outputting OBJ or glTF instead.
+
+**It costs capture rate.** The colour stream delivers at about a third of the
+depth rate, so waiting for a packet takes a frame from roughly 270 ms to 530 ms.
+Capturing colour every Nth frame would pay that proportionally less often and is
+the obvious next step.
+
+The alignment this relies on was checked before any of it was written:
+`crates/scan/examples/color_check.rs` writes the registered colour and the depth
+discontinuities overlaid, and the depth edges land on colour edges with a
+one-pixel offset. That is the check the GPU port should have had first.
 
 ## The vendored driver
 

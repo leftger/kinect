@@ -12,6 +12,7 @@ use kinect_one::processor::depth::{
 use kinect_one::processor::depth::OpenCLDepthProcessor;
 #[cfg(feature = "wgpu-decode")]
 use crate::wgpu_depth::WgpuDepthProcessor;
+use kinect_one::processor::color::{ColorSpace, ZuneColorProcessor};
 use kinect_one::processor::{ProcessTrait, ProcessorTrait, Registration};
 use kinect_one::{
     Device, DeviceEnumerator, Opened, DEPTH_HEIGHT, DEPTH_SIZE, DEPTH_WIDTH, LUT_SIZE,
@@ -23,7 +24,12 @@ pub struct Capture {
     registration: Registration,
     depth_processor: DepthBackend,
     intrinsics: Intrinsics,
-    drain_color: bool,
+    /// Capture colour as well as depth, for texturing. Off by default: the
+    /// colour stream delivers at about a third of the depth rate, so waiting for
+    /// a packet costs more than half the frame time.
+    color: bool,
+    color_processor: Option<ZuneColorProcessor>,
+    captured: Option<CapturedColor>,
     frame: Vec<f32>,
 }
 
@@ -33,6 +39,19 @@ pub struct Capture {
 /// not care which is in use. The enum exists only so the choice can be made at
 /// runtime: the OpenCL path needs a driver that may not be installed, and the
 /// CPU path is the fallback that always works.
+/// Colour for one frame, registered into the depth camera's grid.
+///
+/// Registering it here rather than at texturing time is deliberate: registration
+/// needs the colour frame and the raw depth frame together, and afterwards only
+/// the pose is missing. It is also the expensive part, done once per frame rather
+/// than once per vertex.
+pub struct CapturedColor {
+    /// RGB, `DEPTH_WIDTH * DEPTH_HEIGHT * 3`, in the depth grid.
+    pub rgb: Vec<u8>,
+    /// Undistorted depth in metres, same grid, for the visibility test.
+    pub depth: Vec<f32>,
+}
+
 enum DepthBackend {
     Cpu(CpuDepthProcessor),
     #[cfg(feature = "gpu-decode")]
@@ -188,7 +207,7 @@ impl Capture {
     /// `gpu-decode` feature.
     pub async fn open(
         filters: bool,
-        drain_color: bool,
+        color: bool,
         use_gpu: bool,
     ) -> Result<Self, Box<dyn Error>> {
         let mut device = DeviceEnumerator::open_default(true)
@@ -224,6 +243,12 @@ impl Capture {
         depth_processor.set_p0_tables(&p0_tables)?;
         depth_processor.set_ir_params(&ir_params)?;
 
+        let color_processor = if color {
+            Some(ZuneColorProcessor::new(ColorSpace::RGB)?)
+        } else {
+            None
+        };
+
         let mut registration = Registration::new();
         registration.set_ir_params(&ir_params);
         registration.set_color_params(&color_params);
@@ -238,7 +263,9 @@ impl Capture {
                 cx: ir_params.cx,
                 cy: ir_params.cy,
             },
-            drain_color,
+            color,
+            color_processor,
+            captured: None,
             frame: Vec::new(),
         })
     }
@@ -255,17 +282,6 @@ impl Capture {
     /// undistorted.
     pub async fn next_frame(&mut self) -> Result<&[f32], Box<dyn Error>> {
         loop {
-            // Draining colour is opt-in and off by default. Each poll
-            // re-submits that stream's transfers, so not draining lets the colour
-            // stream go idle -- which is exactly what a depth-only scanner wants.
-            // Measured cost of waiting for a colour packet per depth frame:
-            // 633 ms/frame against 278 ms/frame over 100 frames on the machine
-            // this was developed on. The colour stream delivers at roughly a
-            // third of the depth rate, and polling it blocks on that.
-            if self.drain_color {
-                let _ = self.device.poll_color_packet().await;
-            }
-
             let Some(packet) = self.device.poll_depth_packet().await? else {
                 continue;
             };
@@ -274,6 +290,35 @@ impl Capture {
                 .process(&self.depth_processor)
                 .await
                 .map_err(|e| format!("processing depth packet: {e}"))?;
+
+            // Colour is captured every frame when enabled, and the pair is
+            // registered together because that is what registration needs. It
+            // costs the wait documented on the `color` field; capturing it less
+            // often would cost proportionally less and is the obvious next step.
+            if let Some(processor) = self.color_processor.as_ref() {
+                let color_packet = loop {
+                    if let Some(packet) = self.device.poll_color_packet().await? {
+                        break packet;
+                    }
+                };
+
+                let color_frame = color_packet
+                    .process(processor)
+                    .await
+                    .map_err(|e| format!("processing colour packet: {e}"))?;
+
+                let (registered, undistorted_depth) = self.registration
+                    .undistort_depth_and_color(&color_frame, &depth_frame, false);
+
+                self.captured = Some(CapturedColor {
+                    rgb: registered.buffer,
+                    depth: undistorted_depth
+                        .buffer
+                        .iter()
+                        .map(|millimetres| millimetres / 1000.0)
+                        .collect(),
+                });
+            }
 
             let undistorted = self.registration.undistort_depth(&depth_frame);
 
@@ -291,6 +336,11 @@ impl Capture {
 
             return Ok(&self.frame);
         }
+    }
+
+    /// The colour for the frame most recently returned by `next_frame`.
+    pub fn color(&self) -> Option<&CapturedColor> {
+        self.captured.as_ref()
     }
 
     pub async fn stop(&mut self) -> Result<(), Box<dyn Error>> {
