@@ -20,6 +20,36 @@
 //! transfers them correctly, and then silently never executes a kernel. Vulkan
 //! compute works. `examples/ocl_check.rs` and `examples/vk_check.rs` are the two
 //! measurements behind that.
+//!
+//! # What it actually bought
+//!
+//! Not capture rate, which is what it was built for.
+//!
+//! `record`, 60 frames, filters off, on this machine:
+//!
+//! ```text
+//!              wall     user CPU
+//!   CPU        18.1 s      8.4 s
+//!   Vulkan     15.7 s      1.4 s
+//! ```
+//!
+//! and the whole `live` pipeline -- decode, odometry, fusion, mesh -- 60 frames:
+//!
+//! ```text
+//!              wall     user CPU
+//!   CPU        45.4 s     24.3 s
+//!   Vulkan     46.3 s     18.2 s
+//! ```
+//!
+//! So the decode gets six to thirteen times cheaper on the host and the wall
+//! clock does not move. The premise this port was built on -- that the decode is
+//! what caps capture rate -- came from a measurement taken with the filters *on*,
+//! where the decode cost about 148 ms a frame. With them off it is a small part
+//! of a frame that costs roughly 760 ms end to end, and the rest is spent
+//! somewhere this port does not touch.
+//!
+//! The next person to optimise this should measure where that 760 ms goes before
+//! assuming; the decode is no longer it.
 
 use std::error::Error;
 
