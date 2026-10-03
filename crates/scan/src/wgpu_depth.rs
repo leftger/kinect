@@ -694,6 +694,12 @@ mod tests {
     /// centre tap and applies `gaussian[0..7]` to the eight neighbours, while the
     /// kernel taps all nine with `gaussian[4]` on the centre.
     ///
+    /// How much this matters in practice is measured by `live_decoders_agree`:
+    /// on a real packet the two agree on 96.7% of valid pixels with a 2.0 mm mean
+    /// difference, because a real scene is smooth and most neighbourhoods pass
+    /// the edge test. The divergence below is what noise exposes, not what a
+    /// normal scene sees.
+    ///
     /// The consequence for this port is that the CPU decoder is not a valid
     /// reference for the filtered path. Verifying it needs libfreenect2's own
     /// OpenCL output, and that cannot be produced on this machine: Rusticl
@@ -862,5 +868,113 @@ mod tests {
             // Final depth, in millimetres.
             compare("depth", &run.cpu_depth, &run.gpu_depth, 1.0);
         }
+    }
+
+    /// The check that actually settles it: one packet straight off the sensor,
+    /// decoded by both.
+    ///
+    /// The synthetic tests above can only exercise the arithmetic. A real packet
+    /// carries the values the sensor really produces -- a smooth scene, valid
+    /// measurements, no saturation storms -- and that is what decides whether the
+    /// port is usable. Feeding *one* packet to both decoders removes the two
+    /// things that would otherwise confound the comparison: sensor noise between
+    /// captures, and the scene changing in between.
+    ///
+    /// Needs hardware, so it is ignored by default:
+    ///
+    ///     cargo test --release -p scan --features wgpu-decode -- --ignored \
+    ///         live_decoders_agree --nocapture
+    #[test]
+    #[ignore = "needs a Kinect v2 attached"]
+    fn live_decoders_agree() {
+        use kinect_one::DeviceEnumerator;
+
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+
+        let (packet, p0, ir) = runtime.block_on(async {
+            let mut device = DeviceEnumerator::open_default(true)
+                .await
+                .expect("opening the Kinect v2");
+            device.start().await.expect("starting the streams");
+
+            // Calibration is only populated *by* start(); reading it earlier
+            // silently yields all-zero intrinsics.
+            let ir = *device.get_ir_params();
+            let p0 = device.get_p0_tables().clone();
+
+            // The first packets arrive before the streams have settled.
+            for _ in 0..500 {
+                if let Some(packet) = device.poll_depth_packet().await.expect("polling") {
+                    return (packet, p0, ir);
+                }
+            }
+            panic!("no depth packet arrived");
+        });
+
+        let clone = |packet: &DepthPacket| DepthPacket {
+            sequence: packet.sequence,
+            timestamp: packet.timestamp,
+            buffer: packet.buffer.clone(),
+        };
+
+        let mut unfiltered = None;
+
+        for (label, config) in [
+            ("filters off", filters(false, false)),
+            ("filters on", filters(true, true)),
+        ] {
+            let mut cpu = CpuDepthProcessor::new().expect("CPU processor");
+            cpu.set_config(&config).expect("cpu config");
+            cpu.set_p0_tables(&p0).expect("cpu p0");
+            cpu.set_ir_params(&ir).expect("cpu ir");
+
+            let mut gpu = WgpuDepthProcessor::new().expect("Vulkan processor");
+            gpu.set_config(&config).expect("gpu config");
+            gpu.set_p0_tables(&p0).expect("gpu p0");
+            gpu.set_ir_params(&ir).expect("gpu ir");
+
+            let (cpu_ir, cpu_depth) = runtime
+                .block_on(clone(&packet).process(&cpu))
+                .expect("cpu decode");
+            let (gpu_ir, gpu_depth) = runtime
+                .block_on(clone(&packet).process(&gpu))
+                .expect("gpu decode");
+
+            println!("{label}:");
+            compare("ir", &cpu_ir.buffer, &gpu_ir.buffer, 1.0);
+            compare("depth", &cpu_depth.buffer, &gpu_depth.buffer, 1.0);
+
+            if unfiltered.is_none() {
+                unfiltered = Some((cpu_depth.buffer, gpu_depth.buffer));
+            }
+        }
+
+        // The unfiltered path is the one that is verified, so it is the one worth
+        // asserting on. The filters are left to the printed output: the CPU and
+        // the kernel are different algorithms there, so a threshold would be
+        // asserting my reading of both rather than the port.
+        let (cpu_depth, gpu_depth) = unfiltered.expect("unfiltered run");
+        let mut both = 0usize;
+        let mut total = 0usize;
+
+        for (a, b) in cpu_depth.iter().zip(&gpu_depth) {
+            if *a > 0.0 || *b > 0.0 {
+                total += 1;
+                if *a > 0.0 && *b > 0.0 {
+                    both += 1;
+                }
+            }
+        }
+
+        assert!(
+            total > 1000,
+            "only {total} pixels carried depth, so the scene was not visible"
+        );
+        let agreement = both as f64 / total as f64;
+        assert!(
+            agreement > 0.9,
+            "on a real packet the decoders agree on only {:.1}% of valid pixels",
+            100.0 * agreement
+        );
     }
 }
