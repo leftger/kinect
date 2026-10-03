@@ -5,8 +5,8 @@
 //! extracted as a triangle mesh.
 //!
 //! ```text
-//! scan live   [--frames N] [--out mesh.ply] [--voxel M] [--no-filter] [--no-color]
-//! scan record  --out capture.k2df [--frames N] [--no-filter] [--no-color]
+//! scan live   [--frames N] [--out mesh.ply] [--voxel M] [--no-filter] [--drain-color]
+//! scan record  --out capture.k2df [--frames N] [--no-filter] [--drain-color]
 //! scan replay  --in capture.k2df [--out mesh.ply] [--voxel M]
 //! ```
 //!
@@ -49,6 +49,9 @@ struct Options {
     input: Option<PathBuf>,
     tsdf: TsdfParams,
     filters: bool,
+    /// Read and discard the colour stream. Off by default: the scanner is
+    /// depth-only, and waiting for a colour packet costs more than half the frame
+    /// time, because that stream delivers at roughly a third of the depth rate.
     drain_color: bool,
     /// Decode depth frames on the GPU. Needs a build with the `gpu-decode` feature.
     gpu: bool,
@@ -66,7 +69,7 @@ impl Default for Options {
             input: None,
             tsdf: TsdfParams::default(),
             filters: true,
-            drain_color: true,
+            drain_color: false,
             gpu: false,
             loop_closure: false,
         }
@@ -101,7 +104,7 @@ async fn run() -> Result<(), Box<dyn Error>> {
                 };
             }
             "--no-filter" => options.filters = false,
-            "--no-color" => options.drain_color = false,
+            "--drain-color" => options.drain_color = true,
             "--loop-closure" => options.loop_closure = true,
             "--gpu" => options.gpu = true,
             "-h" | "--help" => {
@@ -139,8 +142,8 @@ fn print_usage() {
         "scan - handheld 3D scanner for the Kinect v2\n\
          \n\
          USAGE:\n\
-         \x20 scan live   [--frames N] [--out mesh.ply] [--voxel M] [--no-filter] [--no-color]\n\
-         \x20 scan record  --out capture.k2df [--frames N] [--no-filter] [--no-color]\n\
+         \x20 scan live   [--frames N] [--out mesh.ply] [--voxel M] [--no-filter] [--drain-color]\n\
+         \x20 scan record  --out capture.k2df [--frames N] [--no-filter] [--drain-color]\n\
          \x20 scan replay  --in capture.k2df [--out mesh.ply] [--voxel M] [--frames N]\n\
          \n\
          COMMANDS:\n\
@@ -159,7 +162,10 @@ fn print_usage() {
          \x20               truncation band to 4x this.\n\
          \x20 --no-filter   Disable the decoder's bilateral/edge filters: roughly\n\
          \x20               doubles frame rate, keeps more junk points.\n\
-         \x20 --no-color    Do not drain the colour stream (unused by the scanner).\n\
+         \x20 --drain-color Keep reading the colour stream. Off by default: the\n\
+         \x20               scanner never uses colour, and waiting for a colour\n\
+         \x20               packet costs more than half the frame time -- that\n\
+         \x20               stream delivers at about a third of the depth rate.\n\
          \x20 --gpu         Decode depth on the GPU. Needs a build with\n\
          \x20               `--features wgpu-decode` (Vulkan, preferred) or\n\
          \x20               `--features gpu-decode` (OpenCL). OpenCL does not work\n\

@@ -21,22 +21,30 @@ gaps. Read this section before the code.
 - Trajectory export, which is the quickest way to see how badly a scan drifted
 - Loop closure and pose-graph optimisation, wired and tested
 
+**Found by profiling, and fixed**
+
+- **The capture rate was capped by the colour stream.** The capture loop used to
+  read and discard a colour packet for every depth frame, on the reasoning that a
+  stream has to keep being drained or its transfers stop being resubmitted. The
+  colour stream delivers at about a third of the depth rate, so every frame
+  waited on it. Reading colour is now off by default and the `live` pipeline went
+  from 633 ms to 271 ms per frame over 100 frames.
+
+  It went unnoticed for a long time because it costs no CPU: it shows up purely
+  as waiting, and every earlier measurement had assumed the decode was the
+  expensive part. Building a GPU decoder to attack the decode is what disproved
+  that, which is the one useful thing that came out of that work.
+
 **Does not work, or has not been shown to**
 
-- **Capture rate is limited by something not yet identified.** A frame costs
-  roughly 760 ms end to end in the `live` pipeline. The depth decode is a small
-  part of that, which was established by writing a GPU decoder and measuring no
-  improvement. Profiling where the rest of the time goes is the highest-value
-  next step in this project.
 - **Drift is real.** On a 150-frame handheld capture the reconstructed trajectory
   covers 4.8 m of path and ends 2.15 m from where it started. Loop closure exists
   to correct exactly this, but it has never been exercised on a real loop: the
   test capture contains none.
-- **The GPU depth decoder is correct but buys no speed.** It reduces host CPU
-  time by 6x to 13x and does not move the wall clock. See
-  `crates/scan/src/wgpu_depth.rs` for the measurements.
-- Fusion is expensive and scales with the size of the model, about 168 ms per
-  frame at 1 cm voxels.
+- **The GPU depth decoder is correct but buys little.** About 6% off the wall
+  clock and a third off host CPU time. See `crates/scan/src/wgpu_depth.rs`.
+- **Fusion is now the largest remaining per-frame cost**, about 100 ms at 1 cm
+  voxels, and it scales with the size of the model. Tracking is about 35 ms.
 
 ## Requirements
 
@@ -68,8 +76,8 @@ before using the scanner, `cargo run --release -p probe`.
 ## Use
 
 ```
-scan live   [--frames N] [--out mesh.ply] [--voxel M] [--no-filter] [--no-color] [--gpu] [--loop-closure]
-scan record  --out capture.k2df [--frames N] [--no-filter] [--no-color] [--gpu]
+scan live   [--frames N] [--out mesh.ply] [--voxel M] [--no-filter] [--drain-color] [--gpu] [--loop-closure]
+scan record  --out capture.k2df [--frames N] [--no-filter] [--drain-color] [--gpu]
 scan replay  --in capture.k2df [--out mesh.ply] [--voxel M] [--frames N] [--gpu] [--loop-closure]
 ```
 
@@ -88,6 +96,9 @@ Useful options:
 - `--loop-closure` detects revisits and rebuilds the model from corrected poses.
   It buffers the frames to do that, about 850 KB each, so a 200-frame scan costs
   around 170 MB. It only helps a scan that returns somewhere it has already been.
+- `--drain-color` reads and discards the colour stream. Off by default, because
+  the scanner never uses colour and waiting for it costs more than half the frame
+  time. Turn it on only if you are extending the scanner to use colour.
 - `--gpu` decodes on the GPU. Needs a build with `--features wgpu-decode`
   (Vulkan) or `--features gpu-decode` (OpenCL); see below.
 
@@ -162,21 +173,21 @@ one packet to both:
 
 That residual is below the sensor's own noise, so it is not visible through it.
 
-What it did **not** do is make anything faster:
+What it buys is less than hoped:
 
-| 60 frames | wall | user CPU |
-| --- | --- | --- |
-| `record`, CPU decode | 18.1 s | 8.4 s |
-| `record`, Vulkan decode | 15.7 s | 1.4 s |
-| `live`, CPU decode | 45.4 s | 24.3 s |
-| `live`, Vulkan decode | 46.3 s | 18.2 s |
+| 100 frames, `live`, filters off | wall | per frame | user CPU |
+| --- | --- | --- | --- |
+| CPU decode | 25.6 s | 256 ms | 25.4 s |
+| Vulkan decode | 23.9 s | 239 ms | 16.7 s |
 
-The decode gets six to thirteen times cheaper on the host and the wall clock does
-not move. The premise it was built on, that the decode caps capture rate, came
-from a measurement taken with the filters on, where decode cost about 148 ms per
-frame. With them off it is a small part of a 760 ms frame. The port is kept
-because it is correct and documented, and because a cheap host is worth
-something if the freed cores are put to work on tracking and fusion.
+So roughly 6% off the wall clock, which is close to the run-to-run noise of these
+measurements, and a third off the host CPU time, which is not.
+
+The premise it was built on, that the decode caps capture rate, was wrong: the
+measurement that produced it was taken with the filters on, where the decode cost
+about 148 ms per frame. Measured now, decode is perhaps 50 ms of a 256 ms frame,
+and tracking plus fusion is 140 ms of it. Killing the decode entirely would buy
+about 20%, which is why the port is kept but is not the interesting problem.
 
 There are two driver diagnostics, both runnable without a sensor:
 
@@ -217,15 +228,14 @@ cargo test --release -p scan --features wgpu-decode -- --ignored --nocapture
 
 ## Known gaps
 
-1. **Find the actual bottleneck.** Roughly 760 ms per frame goes somewhere that
-   is not the depth decode. Nothing else should be optimised before this is
-   measured.
+1. **Reduce fusion cost**, now the largest single per-frame item at about
+   100 ms, ahead of tracking at 35 ms and decode at about 50 ms. It scales with
+   the size of the model, so it is also what makes large `--voxel 0.01` scans
+   slow rather than merely memory-hungry.
 2. **Exercise loop closure on a real loop.** It is implemented and tested
    against synthetic scans, but the property that has been verified is only that
    it does not damage a correct trajectory. A capture that walks out and returns
    to its start would show whether it removes drift.
-3. **Reduce fusion cost**, which scales with model size and dominates the
-   remaining CPU time at 1 cm voxels.
 4. **File the `undistort_depth` bug upstream**, since it affects anyone using the
    port on real hardware.
 5. **The GPU decoder does not pay off.** Either find it a use, for example
