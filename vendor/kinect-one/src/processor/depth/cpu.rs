@@ -1,0 +1,901 @@
+use std::{
+    error::Error,
+    f32::consts::{LOG10_2, LOG2_10, PI},
+    iter::repeat,
+};
+
+use crate::{
+    config::Config, data::P0Tables, processor::ProcessorTrait, settings::DepthProcessorParams,
+    DEPTH_HEIGHT, DEPTH_SIZE, DEPTH_WIDTH, LUT_SIZE,
+};
+
+use super::{DepthFrame, DepthPacket, DepthProcessorTrait, IrFrame};
+
+const INV_THREE: f32 = 1.0 / 3.0;
+const INV_NINE: f32 = 1.0 / 9.0;
+const INV_FIFTEEN: f32 = 1.0 / 15.0;
+
+const TWO_PI: f32 = 2.0 * PI;
+
+const PHASE_SCALE_0: f32 = 3.0 / TWO_PI;
+const PHASE_SCALE_1: f32 = 15.0 / TWO_PI;
+const PHASE_SCALE_2: f32 = 2.0 / TWO_PI;
+
+const CP_A: f32 = 0.826977;
+const CP_B: f32 = 0.110264;
+const CP_C: f32 = 0.551318;
+
+#[derive(Clone)]
+struct Mat<T: Clone + Copy> {
+    buffer: Vec<T>,
+    width: usize,
+}
+
+impl<T: Clone + Copy> Mat<T> {
+    fn new<U: Default + Clone + Copy>(width: usize, height: usize) -> Mat<U> {
+        Mat {
+            buffer: vec![Default::default(); width * height],
+            width,
+        }
+    }
+
+    fn from<U: Into<Vec<T>>>(width: usize, buffer: U) -> Mat<T> {
+        Mat {
+            buffer: buffer.into(),
+            width,
+        }
+    }
+
+    fn get(&self, x: usize, y: usize) -> T {
+        self.buffer[x + y * self.width]
+    }
+
+    fn get_mut(&mut self, x: usize, y: usize) -> &mut T {
+        &mut self.buffer[x + y * self.width]
+    }
+
+    fn copy_from_slice(&mut self, src: &[T]) {
+        for (index, value) in src.iter().copied().enumerate() {
+            self.buffer[index] = value;
+        }
+    }
+
+    fn horizontal_flip(&mut self) {
+        self.buffer = self
+            .buffer
+            .chunks_exact(self.width)
+            .rev()
+            .flatten()
+            .cloned()
+            .collect();
+    }
+}
+
+/// Cpu depth processor
+pub struct CpuDepthProcessor {
+    params: DepthProcessorParams,
+
+    x_table: Mat<f32>,
+    z_table: Mat<f32>,
+
+    lut11_to_16: Box<[i16; LUT_SIZE]>,
+
+    trig_table0: [Vec<f32>; 6],
+    trig_table1: [Vec<f32>; 6],
+    trig_table2: [Vec<f32>; 6],
+
+    enable_bilateral_filter: bool,
+    enable_edge_filter: bool,
+
+    flip_ptables: bool,
+}
+
+impl CpuDepthProcessor {
+    pub fn new() -> Result<Self, Box<dyn Error>> {
+        let mut processor = Self {
+            params: DepthProcessorParams::default(),
+            x_table: Mat::<f32>::new(DEPTH_WIDTH, DEPTH_HEIGHT),
+            z_table: Mat::<f32>::new(DEPTH_WIDTH, DEPTH_HEIGHT),
+            lut11_to_16: Box::new([0; LUT_SIZE]),
+            trig_table0: [
+                vec![0.0; DEPTH_SIZE],
+                vec![0.0; DEPTH_SIZE],
+                vec![0.0; DEPTH_SIZE],
+                vec![0.0; DEPTH_SIZE],
+                vec![0.0; DEPTH_SIZE],
+                vec![0.0; DEPTH_SIZE],
+            ],
+            trig_table1: [
+                vec![0.0; DEPTH_SIZE],
+                vec![0.0; DEPTH_SIZE],
+                vec![0.0; DEPTH_SIZE],
+                vec![0.0; DEPTH_SIZE],
+                vec![0.0; DEPTH_SIZE],
+                vec![0.0; DEPTH_SIZE],
+            ],
+            trig_table2: [
+                vec![0.0; DEPTH_SIZE],
+                vec![0.0; DEPTH_SIZE],
+                vec![0.0; DEPTH_SIZE],
+                vec![0.0; DEPTH_SIZE],
+                vec![0.0; DEPTH_SIZE],
+                vec![0.0; DEPTH_SIZE],
+            ],
+            enable_bilateral_filter: true,
+            enable_edge_filter: true,
+            flip_ptables: true,
+        };
+
+        processor.set_config(&Config::default())?;
+
+        Ok(processor)
+    }
+
+    fn decode_pixel_measurement(&self, data: &[u8], sub: usize, x: usize, y: usize) -> i16 {
+        if x < 1 || 510 < x || 423 < y {
+            return self.lut11_to_16[0];
+        }
+
+        let mut r1zi = ((x >> 2) + ((x & 0x3) << 7)) * 11; // Range 11..5610
+
+        // 298496 = 512 * 424 * 11 / 8 = number of bytes per sub image
+        let ptr: &[u16] = unsafe { std::mem::transmute(&data[298496 * sub..]) };
+        let i = if y < 212 { y + 212 } else { 423 - y };
+        let ptr = &ptr[352 * i..];
+
+        let r1yi = r1zi >> 4; // Range 0..350
+        r1zi = r1zi & 15;
+
+        let i1 = (ptr[r1yi] as usize) >> r1zi;
+        let i2 = (ptr[r1yi + 1] as usize) << (16 - r1zi);
+
+        return self.lut11_to_16[(i1 | i2) & 2047];
+    }
+
+    fn fill_trig_table(
+        phase_in_rad: &[f32; 3],
+        p0_table: &Mat<u16>,
+        trig_table: &mut [Vec<f32>; 6],
+    ) {
+        let p0_coef = -0.000031 * PI;
+
+        for y in 0..DEPTH_HEIGHT {
+            for x in 0..DEPTH_WIDTH {
+                let offset = y * DEPTH_WIDTH + x;
+                let p0 = (p0_table.get(x, y) as f32) * p0_coef;
+
+                let tmp0 = p0 + phase_in_rad[0];
+                let tmp1 = p0 + phase_in_rad[1];
+                let tmp2 = p0 + phase_in_rad[2];
+
+                trig_table[0][offset] = tmp0.cos();
+                trig_table[1][offset] = tmp1.cos();
+                trig_table[2][offset] = tmp2.cos();
+
+                trig_table[3][offset] = (-tmp0).sin();
+                trig_table[4][offset] = (-tmp1).sin();
+                trig_table[5][offset] = (-tmp2).sin();
+            }
+        }
+    }
+
+    fn process_measurement_triple(
+        &self,
+        trig_table: &[Vec<f32>; 6],
+        ab_multiplier_per_frq: f32,
+        x: usize,
+        y: usize,
+        m0: i32,
+        m1: i32,
+        m2: i32,
+        m_out: &mut [f32],
+    ) {
+        if self.z_table.get(x, y) > 0.0 {
+            if m0 == 32767 || m1 == 32767 || m2 == 32767 {
+                m_out[0] = 0.0;
+                m_out[1] = 0.0;
+                m_out[2] = 65535.0;
+            } else {
+                let offset = y * DEPTH_WIDTH + x;
+
+                // formula given in Patent US 8,587,771 B2
+                let ir_image_a = (trig_table[0][offset] * m0 as f32
+                    + trig_table[1][offset] * m1 as f32
+                    + trig_table[2][offset] * m2 as f32)
+                    * ab_multiplier_per_frq;
+                let ir_image_b = (trig_table[3][offset] * m0 as f32
+                    + trig_table[4][offset] * m1 as f32
+                    + trig_table[5][offset] * m2 as f32)
+                    * ab_multiplier_per_frq;
+
+                let ir_amplitude = (ir_image_a * ir_image_a + ir_image_b * ir_image_b).sqrt()
+                    * self.params.ab_multiplier;
+
+                m_out[0] = ir_image_a;
+                m_out[1] = ir_image_b;
+                m_out[2] = ir_amplitude;
+            }
+        } else {
+            m_out[0] = 0.0;
+            m_out[1] = 0.0;
+            m_out[2] = 0.0;
+        }
+    }
+
+    fn process_pixel_stage1(&self, x: usize, y: usize, data: &[u8], m_out: &mut [f32]) {
+        self.process_measurement_triple(
+            &self.trig_table0,
+            self.params.ab_multiplier_per_frq[0],
+            x,
+            y,
+            self.decode_pixel_measurement(data, 0, x, y) as i32,
+            self.decode_pixel_measurement(data, 1, x, y) as i32,
+            self.decode_pixel_measurement(data, 2, x, y) as i32,
+            &mut m_out[0..3],
+        );
+        self.process_measurement_triple(
+            &self.trig_table1,
+            self.params.ab_multiplier_per_frq[1],
+            x,
+            y,
+            self.decode_pixel_measurement(data, 3, x, y) as i32,
+            self.decode_pixel_measurement(data, 4, x, y) as i32,
+            self.decode_pixel_measurement(data, 5, x, y) as i32,
+            &mut m_out[3..6],
+        );
+        self.process_measurement_triple(
+            &self.trig_table2,
+            self.params.ab_multiplier_per_frq[2],
+            x,
+            y,
+            self.decode_pixel_measurement(data, 6, x, y) as i32,
+            self.decode_pixel_measurement(data, 7, x, y) as i32,
+            self.decode_pixel_measurement(data, 8, x, y) as i32,
+            &mut m_out[6..9],
+        );
+    }
+
+    fn filter_pixel_stage1(
+        &self,
+        x: usize,
+        y: usize,
+        m: &Mat<[f32; 9]>,
+        m_out: &mut [f32],
+    ) -> bool {
+        let m_ptr = m.get(x, y);
+
+        if x < 1 || y < 1 || x > 510 || y > 422 {
+            m_out.copy_from_slice(&m_ptr);
+            return true;
+        }
+
+        let mut bilateral_max_edge_test = true;
+        let threshold = ((self.params.joint_bilateral_ab_threshold
+            * self.params.joint_bilateral_ab_threshold)
+            / (self.params.ab_multiplier * self.params.ab_multiplier))
+            .max(0.0);
+
+        for offset in 0..3 {
+            let offset = offset * 3;
+            let m_ptr_0 = m_ptr[offset];
+            let m_ptr_1 = m_ptr[offset + 1];
+            let norm2 = m_ptr_0 * m_ptr_0 + m_ptr_1 * m_ptr_1;
+            let inv_norm = if norm2 > 0.0 {
+                norm2.sqrt().recip()
+            } else {
+                f32::INFINITY
+            };
+
+            let m_norm_x = m_ptr_0 * inv_norm;
+            let m_norm_y = m_ptr_1 * inv_norm;
+
+            let joint_bilateral_exp = if norm2 >= threshold {
+                self.params.joint_bilateral_exp
+            } else {
+                0.0
+            };
+
+            let mut weight_acc = self.params.gaussian_kernel[4];
+            let mut weighted_m_acc_x = self.params.gaussian_kernel[4] * m_ptr_0;
+            let mut weighted_m_acc_y = self.params.gaussian_kernel[4] * m_ptr_1;
+            let mut dist_acc = 0.0;
+
+            let bilateral_exp_factor = -1.442695 * joint_bilateral_exp;
+
+            let mut j = 0;
+
+            for yi in -1..=1 {
+                for xi in -1..=1 {
+                    if yi == 0 && xi == 0 {
+                        continue;
+                    }
+
+                    let other_m_ptr = m.get((x as isize + xi) as usize, (y as isize + yi) as usize);
+                    let other_m_0 = other_m_ptr[offset];
+                    let other_m_1 = other_m_ptr[offset + 1];
+                    let other_norm2 = other_m_0 * other_m_0 + other_m_1 * other_m_1;
+                    let other_inv_norm = if other_norm2 > 0.0 {
+                        other_norm2.sqrt().recip()
+                    } else {
+                        f32::INFINITY
+                    };
+
+                    let mut weight = 0.0;
+
+                    if other_norm2 >= threshold {
+                        let dist = (-(other_m_0 * other_inv_norm * m_norm_x
+                            + other_m_1 * other_inv_norm * m_norm_y)
+                            + 1.0)
+                            * 0.5;
+
+                        weight =
+                            self.params.gaussian_kernel[j] * (bilateral_exp_factor * dist).exp();
+                        dist_acc += dist;
+                    }
+
+                    weighted_m_acc_x += weight * other_m_0;
+                    weighted_m_acc_y += weight * other_m_1;
+
+                    weight_acc += weight;
+
+                    j += 1;
+                }
+            }
+
+            bilateral_max_edge_test &= dist_acc < self.params.joint_bilateral_max_edge;
+
+            let weight_recip = if weight_acc > 0.0 {
+                weight_acc.recip()
+            } else {
+                0.0
+            };
+
+            m_out[offset] = weighted_m_acc_x * weight_recip;
+            m_out[offset + 1] = weighted_m_acc_y * weight_recip;
+            m_out[offset + 2] = m_ptr[offset + 2];
+        }
+
+        bilateral_max_edge_test
+    }
+
+    fn transform_measurements(&self, m: &mut [f32]) {
+        let mut tmp0 = m[1].atan2(m[0]);
+
+        if tmp0 < 0.0 {
+            tmp0 += TWO_PI;
+        }
+
+        // phase
+        m[0] = if tmp0.is_nan() { 0.0 } else { tmp0 };
+        // ir amplitude
+        m[1] = (m[0] * m[0] + m[1] * m[1]).sqrt() * self.params.ab_multiplier;
+    }
+
+    fn process_pixel_stage2(&self, x: usize, y: usize, m: &mut [f32; 9]) -> (f32, f32, f32) {
+        self.transform_measurements(&mut m[0..3]);
+        self.transform_measurements(&mut m[3..6]);
+        self.transform_measurements(&mut m[6..9]);
+
+        let [m00, m01, m02, m10, m11, m12, m20, m21, m22] = &m;
+        let ir_sum = m01 + m11 + m21;
+        let ir_min = m01.min(*m11).min(*m21);
+
+        let mut phase =
+            if ir_min < self.params.individual_ab_threshold || ir_sum < self.params.ab_threshold {
+                0.0
+            } else {
+                let t0 = m00 * PHASE_SCALE_0;
+                let t1 = m10 * PHASE_SCALE_1;
+                let t2 = m20 * PHASE_SCALE_2;
+
+                let t5 = f32::floor((t1 - t0) * INV_THREE + 0.5) * 3.0 + t0;
+                let t3 = -t2 + t5;
+                let t4 = t3 * 2.0;
+
+                let mut t3 = t3 * if t4.is_sign_positive() { 0.5 } else { -0.5 };
+                t3 = (t3 - f32::floor(t3)) * if t4.is_sign_positive() { 2.0 } else { -2.0 };
+
+                let t3_abs = t3.abs();
+                let c2 = 0.5 < t3_abs && t3_abs < 1.5;
+
+                let t6 = if c2 { t5 + 15.0 } else { t5 };
+                let t7 = if c2 { t1 + 15.0 } else { t1 };
+
+                let mut t8 = (f32::floor((-t2 + t6) * 0.5 + 0.5) * 2.0 + t2) * 0.5;
+
+                let mut t6 = t6 * INV_THREE;
+                let mut t7 = t7 * INV_FIFTEEN;
+
+                let t9 = t8 + t6 + t7; // transformed phase measurements
+
+                t6 *= TWO_PI;
+                t7 *= TWO_PI;
+                t8 *= TWO_PI;
+
+                // some cross product
+                let t8_new = t7 * CP_A - t8 * CP_B;
+                let t6_new = t8 * CP_C - t6 * CP_A;
+                let t7_new = t6 * CP_B - t7 * CP_C;
+
+                let norm = t8_new * t8_new + t6_new * t6_new + t7_new * t7_new;
+
+                let mut ir_x = ((if self.params.ab_confidence_slope > 0.0 {
+                    ir_min
+                } else {
+                    m01.max(*m11).max(*m21)
+                }
+                .ln()
+                    * self.params.ab_confidence_slope
+                    * LOG10_2
+                    + self.params.ab_confidence_offset)
+                    * LOG2_10)
+                    .exp()
+                    .clamp(
+                        self.params.min_dealias_confidence,
+                        self.params.max_dealias_confidence,
+                    );
+                ir_x *= ir_x;
+
+                if t9 >= 0.0 && ir_x >= norm {
+                    t9 * INV_THREE
+                } else {
+                    0.0
+                }
+            };
+
+        if phase > 0.0 {
+            phase += self.params.phase_offset;
+        }
+
+        let depth_linear = self.z_table.get(x, y) * phase;
+        let max_depth = phase * self.params.unambiguous_dist * 2.0;
+
+        let depth = if depth_linear > 0.0 && max_depth > 0.0 {
+            (depth_linear
+                / (-depth_linear
+                    * ((self.x_table.get(x, y) * 90.0) / (max_depth * max_depth * 8192.0))
+                    + 1.0))
+                .max(0.0)
+        } else {
+            depth_linear
+        };
+
+        (
+            ((m02 + m12 + m22) * INV_THREE * self.params.ab_output_multiplier).min(65535.0),
+            depth,
+            ir_sum,
+        )
+    }
+
+    fn filter_pixel_stage2(
+        &self,
+        x: usize,
+        y: usize,
+        m: &mut Mat<[f32; 3]>, // Assuming m is a 2D vector of Vec<f32, 3>
+        max_edge_test_ok: bool,
+    ) -> f32 {
+        let depth_and_ir_sum = m.get(x, y);
+        let raw_depth = depth_and_ir_sum[0];
+        let ir_sum = depth_and_ir_sum[2];
+
+        let depth_out = if raw_depth >= self.params.min_depth && raw_depth <= self.params.max_depth
+        {
+            if x < 1 || y < 1 || x > 510 || y > 422 {
+                raw_depth
+            } else {
+                let mut ir_sum_acc = ir_sum;
+                let mut squared_ir_sum_acc = ir_sum * ir_sum;
+                let mut min_depth = raw_depth;
+                let mut max_depth = raw_depth;
+
+                for yi in -1..=1 {
+                    for xi in -1..=1 {
+                        if yi == 0 && xi == 0 {
+                            continue;
+                        }
+
+                        let other = m.get(x.saturating_add_signed(xi), y.saturating_add_signed(yi));
+
+                        ir_sum_acc += other[2];
+                        squared_ir_sum_acc += other[2] * other[2];
+
+                        if 0.0 < other[1] {
+                            min_depth = min_depth.min(other[1]);
+                            max_depth = max_depth.max(other[1]);
+                        }
+                    }
+                }
+
+                let tmp0 = ((squared_ir_sum_acc * 9.0 - ir_sum_acc * ir_sum_acc).sqrt()) * INV_NINE
+                    / (ir_sum_acc * INV_NINE).max(self.params.edge_ab_avg_min_value);
+
+                let abs_min_diff = (raw_depth - min_depth).abs();
+                let abs_max_diff = (raw_depth - max_depth).abs();
+
+                let avg_diff = (abs_min_diff + abs_max_diff) * 0.5;
+                let max_abs_diff = abs_min_diff.max(abs_max_diff);
+
+                let cond0 = raw_depth > 0.0
+                    && tmp0 >= self.params.edge_ab_std_dev_threshold
+                    && self.params.edge_close_delta_threshold < abs_min_diff
+                    && self.params.edge_far_delta_threshold < abs_max_diff
+                    && self.params.edge_max_delta_threshold < max_abs_diff
+                    && self.params.edge_avg_delta_threshold < avg_diff;
+
+                if cond0 || (max_edge_test_ok && self.params.max_edge_count < 0.0) {
+                    0.0
+                } else {
+                    raw_depth
+                }
+            }
+        } else {
+            0.0
+        };
+
+        // override raw depth
+        m.get_mut(x, y)[0] = depth_and_ir_sum[1];
+
+        depth_out
+    }
+}
+
+impl DepthProcessorTrait for CpuDepthProcessor {
+    fn set_config(&mut self, config: &Config) -> Result<(), Box<dyn Error>> {
+        self.params.min_depth = config.min_depth * 1000.0;
+        self.params.max_depth = config.max_depth * 1000.0;
+        self.enable_bilateral_filter = config.enable_bilateral_filter;
+        self.enable_edge_filter = config.enable_edge_aware_filter;
+
+        Ok(())
+    }
+
+    fn set_p0_tables(&mut self, p0_tables: &P0Tables) -> Result<(), Box<dyn Error>> {
+        let mut p0_table0 = Mat::from(DEPTH_WIDTH, p0_tables.p0_table0.to_vec());
+        let mut p0_table1 = Mat::from(DEPTH_WIDTH, p0_tables.p0_table1.to_vec());
+        let mut p0_table2 = Mat::from(DEPTH_WIDTH, p0_tables.p0_table2.to_vec());
+
+        if self.flip_ptables {
+            p0_table0.horizontal_flip();
+            p0_table1.horizontal_flip();
+            p0_table2.horizontal_flip();
+        }
+
+        Self::fill_trig_table(&self.params.phase_in_rad, &p0_table0, &mut self.trig_table0);
+        Self::fill_trig_table(&self.params.phase_in_rad, &p0_table1, &mut self.trig_table1);
+        Self::fill_trig_table(&self.params.phase_in_rad, &p0_table2, &mut self.trig_table2);
+
+        Ok(())
+    }
+
+    fn set_x_z_tables(
+        &mut self,
+        x_table: &[f32; DEPTH_SIZE],
+        z_table: &[f32; DEPTH_SIZE],
+    ) -> Result<(), Box<dyn Error>> {
+        self.x_table.copy_from_slice(x_table);
+        self.z_table.copy_from_slice(z_table);
+
+        Ok(())
+    }
+
+    fn set_lookup_table(&mut self, lut: &[i16; LUT_SIZE]) -> Result<(), Box<dyn Error>> {
+        self.lut11_to_16.copy_from_slice(lut);
+
+        Ok(())
+    }
+}
+
+impl ProcessorTrait<DepthPacket, (IrFrame, DepthFrame)> for CpuDepthProcessor {
+    async fn process(&self, input: DepthPacket) -> Result<(IrFrame, DepthFrame), Box<dyn Error>> {
+        let mut m: Mat<[f32; 9]> = Mat::<[f32; 9]>::new(DEPTH_WIDTH, DEPTH_HEIGHT);
+        let mut m_filtered: Mat<[f32; 9]> = Mat::<[f32; 9]>::new(DEPTH_WIDTH, DEPTH_HEIGHT);
+        let mut m_max_edge_test: Mat<bool> = Mat::<bool>::new(DEPTH_WIDTH, DEPTH_HEIGHT);
+
+        let indexes = (0..DEPTH_HEIGHT).flat_map(|y| (0..DEPTH_WIDTH).zip(repeat(y)));
+
+        #[cfg(not(feature = "parallel"))]
+        for (x, y) in indexes.clone() {
+            self.process_pixel_stage1(x, y, &input.buffer, m.get_mut(x, y));
+        }
+
+        #[cfg(feature = "parallel")]
+        depth_mat_iter(|x, y| {
+            let mut m_out = m.get(x, y);
+
+            self.process_pixel_stage1(x, y, &input.buffer, &mut m_out);
+
+            m_out
+        })
+        .for_each(|(x, y, m_out)| *m.get_mut(x, y) = m_out);
+
+        // bilateral filtering
+        let mut m_ptr = if self.enable_bilateral_filter {
+            #[cfg(not(feature = "parallel"))]
+            for (x, y) in indexes.clone() {
+                *m_max_edge_test.get_mut(x, y) =
+                    self.filter_pixel_stage1(x, y, &m, m_filtered.get_mut(x, y))
+            }
+
+            #[cfg(feature = "parallel")]
+            depth_mat_iter(|x, y| {
+                let mut m_out = m_filtered.get(x, y);
+
+                (self.filter_pixel_stage1(x, y, &m, &mut m_out), m_out)
+            })
+            .for_each(|(x, y, (max_edge_test, m_out))| {
+                *m_max_edge_test.get_mut(x, y) = max_edge_test;
+                *m_filtered.get_mut(x, y) = m_out;
+            });
+
+            m_filtered
+        } else {
+            m
+        };
+
+        let mut out_ir: Mat<f32> = Mat::<f32>::new(DEPTH_WIDTH, DEPTH_HEIGHT);
+        let mut out_depth: Mat<f32> = Mat::<f32>::new(DEPTH_WIDTH, DEPTH_HEIGHT);
+
+        if self.enable_edge_filter {
+            let mut depth_ir_sum: Mat<[f32; 3]> = Mat::<[f32; 3]>::new(DEPTH_WIDTH, DEPTH_HEIGHT);
+
+            #[cfg(not(feature = "parallel"))]
+            for (x, y) in indexes.clone() {
+                let (out_ir_value, raw_depth, ir_sum) =
+                    self.process_pixel_stage2(x, y, m_ptr.get_mut(x, y));
+
+                *out_ir.get_mut(x, 423 - y) = out_ir_value;
+
+                let depth_ir_sum_ptr = depth_ir_sum.get_mut(x, y);
+
+                depth_ir_sum_ptr[0] = raw_depth;
+                depth_ir_sum_ptr[1] = if m_max_edge_test.get(x, y) {
+                    raw_depth
+                } else {
+                    0.0
+                };
+                depth_ir_sum_ptr[2] = ir_sum;
+            }
+
+            #[cfg(feature = "parallel")]
+            depth_mat_iter(|x, y| {
+                let mut m_out = m_ptr.get(x, y);
+
+                (self.process_pixel_stage2(x, y, &mut m_out), m_out)
+            })
+            .for_each(|(x, y, ((out_ir_value, raw_depth, ir_sum), m_out))| {
+                *m_ptr.get_mut(x, y) = m_out;
+
+                *out_ir.get_mut(x, 423 - y) = out_ir_value;
+
+                let depth_ir_sum_ptr = depth_ir_sum.get_mut(x, y);
+
+                depth_ir_sum_ptr[0] = raw_depth;
+                depth_ir_sum_ptr[1] = if m_max_edge_test.get(x, y) {
+                    raw_depth
+                } else {
+                    0.0
+                };
+                depth_ir_sum_ptr[2] = ir_sum;
+            });
+
+            for (x, y) in indexes {
+                *out_depth.get_mut(x, 423 - y) =
+                    self.filter_pixel_stage2(x, y, &mut depth_ir_sum, m_max_edge_test.get(x, y));
+            }
+        } else {
+            #[cfg(feature = "parallel")]
+            depth_mat_iter(|x, y| {
+                let mut m_out = m_ptr.get(x, y);
+
+                (self.process_pixel_stage2(x, y, &mut m_out), m_out)
+            })
+            .for_each(|(x, y, ((out_ir_value, raw_depth, _), m_out))| {
+                *m_ptr.get_mut(x, y) = m_out;
+                *out_ir.get_mut(x, 423 - y) = out_ir_value;
+                *out_depth.get_mut(x, 423 - y) = raw_depth;
+            });
+        }
+
+        Ok((
+            IrFrame::from_packet(out_ir.buffer, &input),
+            DepthFrame::from_packet(out_depth.buffer, &input),
+        ))
+    }
+}
+
+#[cfg(feature = "parallel")]
+fn depth_mat_iter<T, F: Fn(usize, usize) -> T + Send + Sync + Copy>(
+    loop_callback: F,
+) -> std::iter::Flatten<
+    std::collections::linked_list::IntoIter<
+        Vec<<Vec<(usize, usize, T)> as rayon::iter::IntoParallelIterator>::Item>,
+    >,
+>
+where
+    Vec<(usize, usize, T)>: rayon::iter::IntoParallelIterator,
+{
+    use rayon::iter::{IntoParallelIterator, ParallelIterator};
+
+    (0..DEPTH_HEIGHT)
+        .into_par_iter()
+        .flat_map(|y| {
+            (0..DEPTH_WIDTH)
+                .map(|x| (x, y, loop_callback(x, y)))
+                .collect::<Vec<_>>()
+        })
+        .collect_vec_list()
+        .into_iter()
+        .flatten()
+}
+
+#[cfg(test)]
+mod determinism_tests {
+    //! LOCAL PATCH: guards the parallelised decode.
+    //!
+    //! The `parallel` feature swaps the decode's per-pixel loops for rayon-based
+    //! ones. Reordering independent per-pixel writes must not change the *result*,
+    //! and this test exists to prove that: it feeds the processor a fixed synthetic
+    //! packet and prints a hash of the decoded depth buffer.
+    //!
+    //! Run it in both configurations and compare `DEPTH_HASH`:
+    //!   cargo test -p kinect-one --no-default-features --features cpu_depth \
+    //!       -- --nocapture
+    //!   cargo test -p kinect-one --no-default-features --features cpu_depth,parallel \
+    //!       -- --nocapture
+    //!
+    //! Any change in the decoded pixels shows up as a different hash, because the
+    //! hash walks the buffer in pixel order (so thread scheduling cannot affect it).
+
+    use super::*;
+    use crate::data::IrParams;
+    use crate::processor::ProcessTrait;
+
+    /// Bytes in one depth sub-image: 512 * 424 * 11 / 8.
+    const SUB_IMAGE_BYTES: usize = 298_496;
+    /// The parser hands over a buffer of `SUB_IMAGE_BYTES * 10`; match it exactly.
+    const PACKET_BYTES: usize = SUB_IMAGE_BYTES * 10;
+
+    /// xorshift64: deterministic, so both builds see byte-identical input.
+    fn pseudo_random_buffer(len: usize) -> Vec<u8> {
+        let mut state: u64 = 0x243f_6a88_85a3_08d3;
+        let mut out = Vec::with_capacity(len);
+
+        for _ in 0..len {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            out.push((state >> 24) as u8);
+        }
+
+        out
+    }
+
+    /// FNV-1a over the depth values' bit patterns, in pixel order.
+    fn hash(buffer: &[f32]) -> u64 {
+        let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+        for d in buffer {
+            for byte in d.to_bits().to_le_bytes() {
+                hash ^= byte as u64;
+                hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+            }
+        }
+        hash
+    }
+
+    /// The decode path never awaits, so a no-op waker is enough to drive it.
+    fn block_on<F: std::future::Future>(future: F) -> F::Output {
+        use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+
+        fn noop(_: *const ()) {}
+        fn clone(_: *const ()) -> RawWaker {
+            RawWaker::new(std::ptr::null(), &VTABLE)
+        }
+        static VTABLE: RawWakerVTable = RawWakerVTable::new(clone, noop, noop, noop);
+
+        let waker = unsafe { Waker::from_raw(RawWaker::new(std::ptr::null(), &VTABLE)) };
+        let mut cx = Context::from_waker(&waker);
+        let mut future = std::pin::pin!(future);
+
+        loop {
+            match future.as_mut().poll(&mut cx) {
+                Poll::Ready(value) => return value,
+                Poll::Pending => panic!("the CPU decode path should never yield"),
+            }
+        }
+    }
+
+    fn processor() -> CpuDepthProcessor {
+        let mut processor = CpuDepthProcessor::new().expect("processor");
+
+        processor
+            .set_p0_tables(&P0Tables::default())
+            .expect("p0 tables");
+        processor
+            .set_ir_params(&IrParams {
+                // Realistic Kinect v2 values, so the derived tables are non-trivial.
+                fx: 367.13,
+                fy: 367.13,
+                cx: 261.08,
+                cy: 211.21,
+                k1: 0.0,
+                k2: 0.0,
+                k3: 0.0,
+                p1: 0.0,
+                p2: 0.0,
+            })
+            .expect("ir params");
+        processor
+            .set_config(&Config::default())
+            .expect("config");
+
+        processor
+    }
+
+    #[test]
+    fn decode_output_is_deterministic() {
+        let processor = processor();
+        let packet = DepthPacket {
+            sequence: 1,
+            timestamp: 1,
+            buffer: pseudo_random_buffer(PACKET_BYTES),
+        };
+
+        let (_ir, depth) = block_on(packet.process(&processor)).expect("decode");
+
+        assert_eq!(depth.buffer.len(), DEPTH_SIZE);
+        println!("DEPTH_HASH={:016x}", hash(&depth.buffer));
+    }
+
+    /// The same decode must also be stable across repeated runs in one process,
+    /// which catches any accidental dependence on thread interleaving.
+    #[test]
+    fn decode_output_is_stable_across_repeats() {
+        let processor = processor();
+        let buffer = pseudo_random_buffer(PACKET_BYTES);
+
+        let mut hashes = Vec::new();
+        for _ in 0..4 {
+            let packet = DepthPacket {
+                sequence: 1,
+                timestamp: 1,
+                buffer: buffer.clone(),
+            };
+            let (_ir, depth) = block_on(packet.process(&processor)).expect("decode");
+            hashes.push(hash(&depth.buffer));
+        }
+
+        assert!(
+            hashes.windows(2).all(|w| w[0] == w[1]),
+            "decode is not stable across repeats: {hashes:016x?}"
+        );
+    }
+
+    /// Wall-clock floor for one decode of the fixed packet.
+    ///
+    /// Compare the *minimum* across configurations. This laptop throttles hard
+    /// (a 15 W Broadwell-U), and repeated runs drift by 2x, so the minimum over
+    /// several iterations is the only number close to full speed.
+    #[test]
+    #[ignore = "measurement, run explicitly with --ignored"]
+    fn decode_timing() {
+        let processor = processor();
+        let buffer = pseudo_random_buffer(PACKET_BYTES);
+
+        let mut samples = Vec::new();
+        for _ in 0..15 {
+            let packet = DepthPacket {
+                sequence: 1,
+                timestamp: 1,
+                buffer: buffer.clone(),
+            };
+
+            let started = std::time::Instant::now();
+            let (_ir, _depth) = block_on(packet.process(&processor)).expect("decode");
+            samples.push(started.elapsed().as_secs_f64() * 1000.0);
+        }
+
+        samples.sort_by(f64::total_cmp);
+        println!("DECODE_MIN_MS={:.1}", samples[0]);
+        println!("DECODE_MEDIAN_MS={:.1}", samples[samples.len() / 2]);
+    }
+}

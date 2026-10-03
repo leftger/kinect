@@ -1,0 +1,33 @@
+[package]
+name = "probe"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Bring-up probe: verify the Kinect v2 streams depth frames on this machine."
+
+[[bin]]
+name = "probe"
+path = "src/main.rs"
+
+[dependencies]
+# Vendored copy of the pure-Rust libfreenect2 port (MIT, see vendor/kinect-one).
+#
+# Vendored rather than taken from git because the upstream crate is a
+# single-author project with no release cadence, and we need a local fix: the
+# port dropped upstream's out-of-image check in `undistort_depth`, so a border
+# pixel whose distortion lands one row past the edge indexes out of bounds and
+# panics on real frames.
+#
+# A second change to the depth decode's inner loops was measured at ~1% and
+# reverted, so the only functional difference from upstream is that fix plus a
+# re-export of `Opened`. The revision we vendored is 24c6dc0.
+#
+# `default-features = false` is load-bearing: the crate's own defaults enable
+# opencl, fev/winit, mozjpeg and turbojpeg, which need an OpenCL ICD and system
+# libraries this machine does not have.
+kinect-one = { path = "../../vendor/kinect-one", default-features = false, features = [
+    "parallel",
+    "cpu_depth",
+    "zune_color",
+] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }

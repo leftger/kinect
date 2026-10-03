@@ -1,0 +1,10 @@
+[package]
+name = "geom"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Driver-independent 3D geometry for the scanner: spatial index, normals, ICP odometry, TSDF fusion, surface extraction."
+
+[dependencies]
+nalgebra = "0.35"
+rayon = "1"

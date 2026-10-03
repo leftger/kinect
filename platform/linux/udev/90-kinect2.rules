@@ -1,0 +1,21 @@
+# Kinect v2 (Xbox One Kinect / Kinect for Windows v2) - non-root USB access.
+#
+# The depth and colour streams are read from the sensor's vendor-specific USB
+# interfaces via usbfs. Those device nodes default to root:root 0644, so an
+# unprivileged process gets EACCES (errno 13) when opening the device.
+#
+# Install:
+#   sudo cp platform/linux/udev/90-kinect2.rules /etc/udev/rules.d/
+#   sudo udevadm control --reload-rules
+#   sudo udevadm trigger
+# then unplug and replug the sensor.
+#
+# (`usuario` is already a member of `plugdev`; GROUP= makes the rule work for
+#  members of that group, MODE= keeps it working for everything else.)
+
+# Kinect for Xbox One (the common 045e:02c4)
+SUBSYSTEM=="usb", ATTR{idVendor}=="045e", ATTR{idProduct}=="02c4", MODE="0666", GROUP="plugdev"
+
+# Kinect for Windows v2 (045e:02d8 / 045e:02d9)
+SUBSYSTEM=="usb", ATTR{idVendor}=="045e", ATTR{idProduct}=="02d8", MODE="0666", GROUP="plugdev"
+SUBSYSTEM=="usb", ATTR{idVendor}=="045e", ATTR{idProduct}=="02d9", MODE="0666", GROUP="plugdev"

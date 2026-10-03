@@ -1,0 +1,7 @@
+/target
+/out
+
+# Scan output. The CLI defaults land in the working directory when --out is
+# omitted, and a single capture is ~850 KB per frame.
+*.k2df
+*.ply

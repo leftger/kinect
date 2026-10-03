@@ -1,0 +1,4 @@
+Vendored from https://github.com/Aytixel/kinect-one
+Revision: 24c6dc0
+
+Local changes are marked with `LOCAL PATCH` comments.

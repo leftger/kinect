@@ -1,0 +1,42 @@
+[package]
+name = "scan"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Handheld 3D scanner for the Kinect v2: depth odometry plus TSDF surface reconstruction."
+
+[[bin]]
+name = "scan"
+path = "src/main.rs"
+
+[dependencies]
+geom = { path = "../geom" }
+kinect-one = { path = "../../vendor/kinect-one", default-features = false, features = [
+    "parallel",
+    "cpu_depth",
+    "zune_color",
+] }
+nalgebra = "0.35"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+
+# Only needed to enumerate OpenCL platforms and pick a device for `gpu-decode`.
+ocl = { version = "0.19.7", optional = true }
+
+[dev-dependencies]
+# Used only by `examples/vk_check.rs`, to answer whether Vulkan compute executes
+# on this GPU. A dev-dependency so the scanner's own tree stays unaffected.
+wgpu = "25"
+pollster = "1"
+
+[features]
+# Decode depth frames on the GPU via the vendored libfreenect2 OpenCL kernels.
+#
+# Off by default because it needs an OpenCL ICD at *runtime* (`mesa-opencl-icd`
+# provides Rusticl for Intel GPUs) and the loader's dev symlink at *build* time
+# (`ocl-icd-opencl-dev`), neither of which is a given on a stock machine.
+#
+# The decode is the one stage that already had a GPU implementation upstream, and
+# it is also the stage that caps how fast frames can be captured at all -- 5.3 fps
+# on the CPU here. Faster capture means smaller motion between frames, which helps
+# the odometry rather than just saving time.
+gpu-decode = ["dep:ocl", "kinect-one/opencl_depth"]
