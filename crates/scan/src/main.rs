@@ -164,8 +164,9 @@ fn print_usage() {
          \x20               `--features wgpu-decode` (Vulkan, preferred) or\n\
          \x20               `--features gpu-decode` (OpenCL). OpenCL does not work\n\
          \x20               on this GPU -- Rusticl runs no kernels at all, see\n\
-         \x20               examples/ocl_check.rs. The decode is what\n\
-         \x20               caps capture rate, so this mainly buys denser frames.\n\
+         \x20               examples/ocl_check.rs. It cuts host CPU time 6-13x\n\
+         \x20               but measured no faster wall clock, so it is not a\n\
+         \x20               speed-up -- the decode is not the bottleneck.\n\
          \x20 --loop-closure  Detect revisits, redistribute the accumulated drift\n\
          \x20               over the whole trajectory, and rebuild the model from\n\
          \x20               the corrected poses. Costs memory: frames are kept\n\
