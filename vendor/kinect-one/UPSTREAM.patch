@@ -1,7 +1,7 @@
-diff --color -ruN a/src/lib.rs b/src/lib.rs
---- a/src/lib.rs	2026-10-03 02:04:27.869103191 -0700
-+++ b/src/lib.rs	2026-10-03 02:04:27.874493735 -0700
-@@ -11,7 +11,11 @@
+diff -ruN a/src/lib.rs b/src/lib.rs
+--- a/src/lib.rs	2026-10-03 02:31:35.753598185 -0700
++++ b/src/lib.rs	2026-10-03 02:21:59.466440813 -0700
+@@ -11,7 +11,19 @@
  use packet::{ColorPacket, DepthPacket};
  use thiserror::Error;
  
@@ -11,12 +11,20 @@ diff --color -ruN a/src/lib.rs b/src/lib.rs
 +// re-exported the `Device` wrapper, leaving the state parameter unnameable
 +// outside the crate.
 +pub use device::{Device, DeviceEnumerator, DeviceInfo, Opened};
++
++// LOCAL PATCH: export `DepthProcessorParams`. The process parameters are the
++// constants every depth decoder is built from -- the OpenCL processor passes
++// them to its kernel build, and the WGSL port needs them for the same reason.
++// The `settings` module is private, so without this a caller cannot name the
++// type at all. `DepthProcessorParams::default()` is what the OpenCL processor
++// itself uses.
++pub use settings::DepthProcessorParams;
  
  const USB_TIMEOUT: Duration = Duration::from_secs(2);
  
-diff --color -ruN a/src/processor/depth/cpu.rs b/src/processor/depth/cpu.rs
---- a/src/processor/depth/cpu.rs	2026-10-03 02:04:27.869505584 -0700
-+++ b/src/processor/depth/cpu.rs	2026-10-03 02:04:27.875284836 -0700
+diff -ruN a/src/processor/depth/cpu.rs b/src/processor/depth/cpu.rs
+--- a/src/processor/depth/cpu.rs	2026-10-03 02:31:35.754201817 -0700
++++ b/src/processor/depth/cpu.rs	2026-10-02 21:33:22.204273131 -0700
 @@ -727,3 +727,175 @@
          .into_iter()
          .flatten()
@@ -193,9 +201,9 @@ diff --color -ruN a/src/processor/depth/cpu.rs b/src/processor/depth/cpu.rs
 +        println!("DECODE_MEDIAN_MS={:.1}", samples[samples.len() / 2]);
 +    }
 +}
-diff --color -ruN a/src/processor/depth/opencl.rs b/src/processor/depth/opencl.rs
---- a/src/processor/depth/opencl.rs	2026-10-03 02:04:27.869585790 -0700
-+++ b/src/processor/depth/opencl.rs	2026-10-03 02:04:27.875394175 -0700
+diff -ruN a/src/processor/depth/opencl.rs b/src/processor/depth/opencl.rs
+--- a/src/processor/depth/opencl.rs	2026-10-03 02:31:35.754523415 -0700
++++ b/src/processor/depth/opencl.rs	2026-10-03 01:44:40.870485645 -0700
 @@ -234,6 +234,16 @@
                  .len(DEPTH_SIZE)
                  .build()?,
@@ -213,9 +221,9 @@ diff --color -ruN a/src/processor/depth/opencl.rs b/src/processor/depth/opencl.r
          let kernels = Kernels {
              process_pixel_stage1_kernel: pro_que
                  .kernel_builder("processPixelStage1")
-diff --color -ruN a/src/processor/registration.rs b/src/processor/registration.rs
---- a/src/processor/registration.rs	2026-10-03 02:04:27.869809470 -0700
-+++ b/src/processor/registration.rs	2026-10-03 02:04:27.875622290 -0700
+diff -ruN a/src/processor/registration.rs b/src/processor/registration.rs
+--- a/src/processor/registration.rs	2026-10-03 02:31:35.754925669 -0700
++++ b/src/processor/registration.rs	2026-10-02 21:27:07.762802718 -0700
 @@ -15,6 +15,13 @@
  const DEPTH_Q: f32 = 0.01;
  const COLOR_Q: f32 = 0.002199;

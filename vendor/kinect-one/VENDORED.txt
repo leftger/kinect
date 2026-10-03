@@ -22,6 +22,13 @@ against that revision is in UPSTREAM.patch. Four files differ:
       attempt to reshape the decode's inner loops measured about 1% and was
       reverted rather than carried.
 
+  src/lib.rs (second change)
+      Also export `DepthProcessorParams`. The process parameters are the
+      constants every decoder is built from -- the OpenCL processor passes them
+      to its kernel build, and the WGSL port needs them for the same reason. The
+      `settings` module is private, so without this the type cannot be named from
+      outside the crate at all.
+
   src/processor/depth/opencl.rs
       Comment only, recording that the kernel global work size comes from
       `ProQue::dims` and is deliberately not set at the kernel builders. No code

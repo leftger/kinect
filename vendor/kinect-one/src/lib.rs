@@ -17,6 +17,14 @@ use thiserror::Error;
 // outside the crate.
 pub use device::{Device, DeviceEnumerator, DeviceInfo, Opened};
 
+// LOCAL PATCH: export `DepthProcessorParams`. The process parameters are the
+// constants every depth decoder is built from -- the OpenCL processor passes
+// them to its kernel build, and the WGSL port needs them for the same reason.
+// The `settings` module is private, so without this a caller cannot name the
+// type at all. `DepthProcessorParams::default()` is what the OpenCL processor
+// itself uses.
+pub use settings::DepthProcessorParams;
+
 const USB_TIMEOUT: Duration = Duration::from_secs(2);
 
 pub const DEPTH_WIDTH: usize = 512;

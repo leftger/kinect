@@ -19,6 +19,8 @@ mod loop_closure;
 mod odometry;
 mod recording;
 mod scanner;
+#[cfg(feature = "wgpu-decode")]
+mod wgpu_depth;
 
 use std::error::Error;
 use std::path::PathBuf;

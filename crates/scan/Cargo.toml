@@ -22,11 +22,9 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
 # Only needed to enumerate OpenCL platforms and pick a device for `gpu-decode`.
 ocl = { version = "0.19.7", optional = true }
 
-[dev-dependencies]
-# Used only by `examples/vk_check.rs`, to answer whether Vulkan compute executes
-# on this GPU. A dev-dependency so the scanner's own tree stays unaffected.
-wgpu = "25"
-pollster = "1"
+# Drives the WGSL port of the decoder for `wgpu-decode`.
+wgpu = { version = "25", optional = true }
+pollster = { version = "1", optional = true }
 
 [features]
 # Decode depth frames on the GPU via the vendored libfreenect2 OpenCL kernels.
@@ -35,8 +33,29 @@ pollster = "1"
 # provides Rusticl for Intel GPUs) and the loader's dev symlink at *build* time
 # (`ocl-icd-opencl-dev`), neither of which is a given on a stock machine.
 #
-# The decode is the one stage that already had a GPU implementation upstream, and
-# it is also the stage that caps how fast frames can be captured at all -- 5.3 fps
-# on the CPU here. Faster capture means smaller motion between frames, which helps
-# the odometry rather than just saving time.
+# Kept for completeness, but note it is unusable on this machine: Rusticl
+# enumerates a device and then silently never executes a kernel. See
+# `examples/ocl_check.rs`.
 gpu-decode = ["dep:ocl", "kinect-one/opencl_depth"]
+
+# Decode depth frames on the GPU via the WGSL port of the same four kernels,
+# driven by wgpu. Preferred over `gpu-decode` where both are enabled, because
+# Vulkan compute does work here (see `examples/vk_check.rs`) where Rusticl does
+# not.
+#
+# The decode is the stage that caps how fast frames can be captured at all --
+# 5.3 fps on the CPU. Faster capture means smaller motion between frames, which
+# helps the odometry rather than just saving time.
+wgpu-decode = ["dep:wgpu", "dep:pollster"]
+
+# The Vulkan diagnostics need wgpu, which is optional, so they are only built
+# when the feature is on. `required-features` is cleaner than cfg-guarding each
+# example's contents, and it makes `cargo run --example` fail with an
+# explanation instead of a missing-main error.
+[[example]]
+name = "vk_check"
+required-features = ["wgpu-decode"]
+
+[[example]]
+name = "vk_decode"
+required-features = ["wgpu-decode"]

@@ -10,6 +10,8 @@ use kinect_one::processor::depth::{
 };
 #[cfg(feature = "gpu-decode")]
 use kinect_one::processor::depth::OpenCLDepthProcessor;
+#[cfg(feature = "wgpu-decode")]
+use crate::wgpu_depth::WgpuDepthProcessor;
 use kinect_one::processor::{ProcessTrait, ProcessorTrait, Registration};
 use kinect_one::{
     Device, DeviceEnumerator, Opened, DEPTH_HEIGHT, DEPTH_SIZE, DEPTH_WIDTH, LUT_SIZE,
@@ -35,6 +37,8 @@ enum DepthBackend {
     Cpu(CpuDepthProcessor),
     #[cfg(feature = "gpu-decode")]
     Gpu(OpenCLDepthProcessor),
+    #[cfg(feature = "wgpu-decode")]
+    Wgpu(WgpuDepthProcessor),
 }
 
 impl DepthProcessorTrait for DepthBackend {
@@ -43,6 +47,8 @@ impl DepthProcessorTrait for DepthBackend {
             Self::Cpu(processor) => processor.set_config(config),
             #[cfg(feature = "gpu-decode")]
             Self::Gpu(processor) => processor.set_config(config),
+            #[cfg(feature = "wgpu-decode")]
+            Self::Wgpu(processor) => processor.set_config(config),
         }
     }
 
@@ -51,6 +57,8 @@ impl DepthProcessorTrait for DepthBackend {
             Self::Cpu(processor) => processor.set_p0_tables(p0_tables),
             #[cfg(feature = "gpu-decode")]
             Self::Gpu(processor) => processor.set_p0_tables(p0_tables),
+            #[cfg(feature = "wgpu-decode")]
+            Self::Wgpu(processor) => processor.set_p0_tables(p0_tables),
         }
     }
 
@@ -63,6 +71,8 @@ impl DepthProcessorTrait for DepthBackend {
             Self::Cpu(processor) => processor.set_x_z_tables(x_table, z_table),
             #[cfg(feature = "gpu-decode")]
             Self::Gpu(processor) => processor.set_x_z_tables(x_table, z_table),
+            #[cfg(feature = "wgpu-decode")]
+            Self::Wgpu(processor) => processor.set_x_z_tables(x_table, z_table),
         }
     }
 
@@ -71,6 +81,8 @@ impl DepthProcessorTrait for DepthBackend {
             Self::Cpu(processor) => processor.set_lookup_table(lut),
             #[cfg(feature = "gpu-decode")]
             Self::Gpu(processor) => processor.set_lookup_table(lut),
+            #[cfg(feature = "wgpu-decode")]
+            Self::Wgpu(processor) => processor.set_lookup_table(lut),
         }
     }
 }
@@ -81,6 +93,8 @@ impl ProcessorTrait<DepthPacket, (IrFrame, DepthFrame)> for DepthBackend {
             Self::Cpu(processor) => processor.process(input).await,
             #[cfg(feature = "gpu-decode")]
             Self::Gpu(processor) => processor.process(input).await,
+            #[cfg(feature = "wgpu-decode")]
+            Self::Wgpu(processor) => processor.process(input).await,
         }
     }
 }
@@ -131,32 +145,36 @@ fn opencl_device() -> Result<ocl::Device, Box<dyn Error>> {
     fallback.ok_or_else(|| "OpenCL platforms are present but expose no devices".into())
 }
 
-#[cfg(feature = "gpu-decode")]
 fn build_backend(use_gpu: bool) -> Result<DepthBackend, Box<dyn Error>> {
-    if use_gpu {
+    if !use_gpu {
+        return Ok(DepthBackend::Cpu(
+            CpuDepthProcessor::new().map_err(|e| format!("creating CPU depth processor: {e}"))?,
+        ));
+    }
+
+    // Preference order is deliberate. Vulkan works on this GPU; Rusticl does
+    // not, despite enumerating a device and accepting every buffer -- it simply
+    // never executes a kernel. See examples/ocl_check.rs and vk_check.rs.
+    #[cfg(feature = "wgpu-decode")]
+    {
+        let processor = WgpuDepthProcessor::new()
+            .map_err(|e| format!("creating the Vulkan depth processor: {e}"))?;
+        return Ok(DepthBackend::Wgpu(processor));
+    }
+
+    #[cfg(all(feature = "gpu-decode", not(feature = "wgpu-decode")))]
+    {
         let processor = OpenCLDepthProcessor::new(opencl_device()?)
             .map_err(|e| format!("creating OpenCL depth processor: {e}"))?;
         return Ok(DepthBackend::Gpu(processor));
     }
 
-    Ok(DepthBackend::Cpu(
-        CpuDepthProcessor::new().map_err(|e| format!("creating CPU depth processor: {e}"))?,
-    ))
-}
-
-#[cfg(not(feature = "gpu-decode"))]
-fn build_backend(use_gpu: bool) -> Result<DepthBackend, Box<dyn Error>> {
-    if use_gpu {
-        return Err(
-            "this binary was built without the GPU decoder; rebuild with \
-             `cargo build --release --features gpu-decode`"
-                .into(),
-        );
+    #[cfg(all(not(feature = "gpu-decode"), not(feature = "wgpu-decode")))]
+    {
+        Err("this binary has no GPU decoder; rebuild with `--features wgpu-decode` \
+             (Vulkan) or `--features gpu-decode` (OpenCL)"
+            .into())
     }
-
-    Ok(DepthBackend::Cpu(
-        CpuDepthProcessor::new().map_err(|e| format!("creating CPU depth processor: {e}"))?,
-    ))
 }
 
 impl Capture {
