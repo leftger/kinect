@@ -420,8 +420,13 @@ impl Scanner {
         mesh
     }
 
+    /// The frames that contributed colour, for the live preview.
+    pub fn color_views(&self) -> &[ColorView] {
+        &self.color_views
+    }
+
     /// How many frames contributed colour. Zero when texturing is off.
-    pub fn color_views(&self) -> usize {
+    pub fn color_view_count(&self) -> usize {
         self.color_views.len()
     }
 

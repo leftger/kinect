@@ -100,6 +100,10 @@ Useful options:
 - `--drain-color` reads and discards the colour stream. Off by default, because
   the scanner never uses colour and waiting for it costs more than half the frame
   time. Turn it on only if you are extending the scanner to use colour.
+- `--viewer` opens a live window showing the scan as it builds: the reconstruction
+  so far, the frame count, the tracked position and the model size. Needs a build
+  with `--features viewer` and a display. Closing the window stops the scan, and
+  the mesh is written as usual.
 - `--gpu` decodes on the GPU. Needs a build with `--features wgpu-decode`
   (Vulkan) or `--features gpu-decode` (OpenCL); see below.
 

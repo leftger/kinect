@@ -19,6 +19,8 @@ mod loop_closure;
 mod odometry;
 mod recording;
 mod scanner;
+#[cfg(feature = "viewer")]
+mod viewer;
 #[cfg(feature = "wgpu-decode")]
 mod wgpu_depth;
 
@@ -43,6 +45,7 @@ async fn main() -> ExitCode {
     }
 }
 
+#[derive(Clone)]
 struct Options {
     frames: Option<usize>,
     out: Option<PathBuf>,
@@ -61,6 +64,8 @@ struct Options {
     loop_closure: bool,
     /// Capture colour and paint it onto the mesh.
     color: bool,
+    /// Open a live window showing the scan as it builds.
+    viewer: bool,
 }
 
 impl Default for Options {
@@ -75,6 +80,7 @@ impl Default for Options {
             gpu: false,
             loop_closure: false,
             color: false,
+            viewer: false,
         }
     }
 }
@@ -108,6 +114,7 @@ async fn run() -> Result<(), Box<dyn Error>> {
             }
             "--no-filter" => options.filters = false,
             "--color" => options.color = true,
+            "--viewer" => options.viewer = true,
             "--loop-closure" => options.loop_closure = true,
             "--gpu" => options.gpu = true,
             "-h" | "--help" => {
@@ -189,6 +196,31 @@ fn print_usage() {
 }
 
 async fn live(options: &Options) -> Result<(), Box<dyn Error>> {
+    if options.viewer {
+        #[cfg(feature = "viewer")]
+        return viewer::run(options);
+
+        #[cfg(not(feature = "viewer"))]
+        return Err("this build has no viewer; rebuild with `--features viewer`".into());
+    }
+
+    let mut scanner = run_live(options, |_, _| true).await?;
+    close_loops(&mut scanner, options);
+    finish(&scanner, options)
+}
+
+/// The live capture loop, shared by the plain path and the viewer window.
+///
+/// `on_frame` runs after each frame is integrated and returns whether to keep
+/// going. The plain path ignores it; the viewer uses it to hand the scan thread's
+/// latest picture to the GUI, and to stop when the window closes.
+pub(crate) async fn run_live<F>(
+    options: &Options,
+    mut on_frame: F,
+) -> Result<Scanner, Box<dyn Error>>
+where
+    F: FnMut(usize, &Scanner) -> bool,
+{
     let frames = options.frames.unwrap_or(DEFAULT_FRAMES);
 
     let mut capture =
@@ -218,11 +250,15 @@ async fn live(options: &Options) -> Result<(), Box<dyn Error>> {
             .map(|captured| (captured.rgb.as_slice(), captured.depth.as_slice()));
         let report = scanner.add_frame_with_color(&frame, width, height, color);
         print_progress(index, &report);
+
+        if !on_frame(index, &scanner) {
+            println!("[scan] stopped after {index} frames");
+            break;
+        }
     }
 
     capture.stop().await?;
-    close_loops(&mut scanner, options);
-    finish(&scanner, options)
+    Ok(scanner)
 }
 
 async fn record(options: &Options) -> Result<(), Box<dyn Error>> {
@@ -396,7 +432,7 @@ fn print_progress(index: usize, report: &FrameReport) {
     );
 }
 
-fn finish(scanner: &Scanner, options: &Options) -> Result<(), Box<dyn Error>> {
+pub(crate) fn finish(scanner: &Scanner, options: &Options) -> Result<(), Box<dyn Error>> {
     println!();
     println!(
         "[scan] frames: {} (fused {}, skipped {})",
@@ -411,10 +447,10 @@ fn finish(scanner: &Scanner, options: &Options) -> Result<(), Box<dyn Error>> {
         scanner.total_tracking().as_secs_f64() * 1000.0 / frames,
         scanner.total_fusion().as_secs_f64() * 1000.0 / frames,
     );
-    if scanner.color_views() > 0 {
+    if scanner.color_view_count() > 0 {
         println!(
             "[scan] colour: {} views used to texture the mesh",
-            scanner.color_views()
+            scanner.color_view_count()
         );
     }
     println!(
