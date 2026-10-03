@@ -27,7 +27,8 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use geom::tsdf::TsdfParams;
-use scanner::{FrameReport, Scanner, ScannerConfig};
+use loop_closure::LoopClosureConfig;
+use scanner::{ClosureReport, FrameReport, Scanner, ScannerConfig};
 
 const DEFAULT_FRAMES: usize = 60;
 
@@ -51,6 +52,10 @@ struct Options {
     drain_color: bool,
     /// Decode depth frames on the GPU. Needs a build with the `gpu-decode` feature.
     gpu: bool,
+    /// Detect revisits and redistribute the accumulated error over the whole
+    /// trajectory. Costs memory: the frames have to be kept so the model can be
+    /// rebuilt once the poses move.
+    loop_closure: bool,
 }
 
 impl Default for Options {
@@ -63,6 +68,7 @@ impl Default for Options {
             filters: true,
             drain_color: true,
             gpu: false,
+            loop_closure: false,
         }
     }
 }
@@ -96,6 +102,7 @@ async fn run() -> Result<(), Box<dyn Error>> {
             }
             "--no-filter" => options.filters = false,
             "--no-color" => options.drain_color = false,
+            "--loop-closure" => options.loop_closure = true,
             "--gpu" => options.gpu = true,
             "-h" | "--help" => {
                 print_usage();
@@ -153,10 +160,18 @@ fn print_usage() {
          \x20 --no-filter   Disable the decoder's bilateral/edge filters: roughly\n\
          \x20               doubles frame rate, keeps more junk points.\n\
          \x20 --no-color    Do not drain the colour stream (unused by the scanner).\n\
-         \x20 --gpu         Decode depth on the GPU via OpenCL. Needs a build with\n\
-         \x20               `--features gpu-decode` and an OpenCL driver\n\
-         \x20               (`sudo apt install mesa-opencl-icd`). The decode is what\n\
+         \x20 --gpu         Decode depth on the GPU. Needs a build with\n\
+         \x20               `--features wgpu-decode` (Vulkan, preferred) or\n\
+         \x20               `--features gpu-decode` (OpenCL). OpenCL does not work\n\
+         \x20               on this GPU -- Rusticl runs no kernels at all, see\n\
+         \x20               examples/ocl_check.rs. The decode is what\n\
          \x20               caps capture rate, so this mainly buys denser frames.\n\
+         \x20 --loop-closure  Detect revisits, redistribute the accumulated drift\n\
+         \x20               over the whole trajectory, and rebuild the model from\n\
+         \x20               the corrected poses. Costs memory: frames are kept\n\
+         \x20               (about 850 KB each) so the model can be rebuilt once\n\
+         \x20               the poses move. Only helps a scan that returns\n\
+         \x20               somewhere it has already been.\n\
          \n\
          A trajectory PLY is written alongside the mesh as <out>.trajectory.ply,\n\
          which is the quickest way to see how badly the pose has drifted."
@@ -186,6 +201,7 @@ async fn live(options: &Options) -> Result<(), Box<dyn Error>> {
     }
 
     capture.stop().await?;
+    close_loops(&mut scanner, options);
     finish(&scanner, options)
 }
 
@@ -259,14 +275,71 @@ fn replay(options: &Options) -> Result<(), Box<dyn Error>> {
         print_progress(index + 1, &report);
     }
 
+    close_loops(&mut scanner, options);
     finish(&scanner, options)
 }
 
 fn scanner_config(options: &Options) -> ScannerConfig {
     ScannerConfig {
         tsdf: options.tsdf,
+        loop_closure: options
+            .loop_closure
+            .then(LoopClosureConfig::default),
         ..ScannerConfig::default()
     }
+}
+
+/// Run loop closure and report it. Called between the last frame and the
+/// summary, because it can change the model `finish` is about to write out.
+fn close_loops(scanner: &mut Scanner, options: &Options) {
+    if !options.loop_closure {
+        return;
+    }
+
+    let report = scanner.close_loops();
+
+    if report.loop_edges == 0 {
+        println!(
+            "loop closure: no revisits verified over {} frames, trajectory unchanged",
+            report.nodes
+        );
+        return;
+    }
+
+    println!(
+        "loop closure: {} revisits over {} frames, cost {:.3} -> {:.3} in {} iterations",
+        report.loop_edges,
+        report.nodes,
+        report.cost_before,
+        report.cost_after,
+        report.iterations
+    );
+    println!(
+        "  largest pose change {:.1} cm, {:.1} degrees",
+        report.max_correction * 100.0,
+        report.max_rotation.to_degrees()
+    );
+
+    if report.refused {
+        println!(
+            "  REFUSED: beyond the {:.0} m / {:.0} degree limit, so the model was \
+             left as odometry built it",
+            scanner_limits_metres(),
+            scanner_limits_degrees()
+        );
+    } else if report.rebuilt {
+        println!("  model rebuilt from the corrected poses");
+    } else {
+        println!("  nothing to apply");
+    }
+}
+
+fn scanner_limits_metres() -> f32 {
+    scanner::MAX_CORRECTION_METRES
+}
+
+fn scanner_limits_degrees() -> f32 {
+    scanner::MAX_CORRECTION_RADIANS.to_degrees()
 }
 
 fn print_progress(index: usize, report: &FrameReport) {

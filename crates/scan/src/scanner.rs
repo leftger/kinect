@@ -2,10 +2,12 @@
 
 use geom::mesh::Mesh;
 use geom::tsdf::{IntegrationStats, TsdfParams, TsdfVolume};
+use geom::pose_graph::{PoseGraph, PoseGraphParams};
 use geom::{DepthImage, Intrinsics};
 use nalgebra::{Isometry3, Vector3};
 use std::time::{Duration, Instant};
 
+use crate::loop_closure::{LoopClosureConfig, LoopFinder};
 use crate::odometry::{Odometry, OdometryConfig, TrackReport};
 
 #[derive(Clone, Debug)]
@@ -18,6 +20,10 @@ pub struct ScannerConfig {
     /// The acceptance thresholds live here, not duplicated on this struct, so
     /// there is exactly one place that decides whether a pose is trustworthy.
     pub odometry: OdometryConfig,
+    /// Revisit detection. `None` disables it and, more importantly, skips
+    /// buffering the frames -- which is the memory cost of being able to correct
+    /// them after the fact.
+    pub loop_closure: Option<LoopClosureConfig>,
 }
 
 impl Default for ScannerConfig {
@@ -29,6 +35,7 @@ impl Default for ScannerConfig {
             depth_max: 4.5,
             tsdf: TsdfParams::default(),
             odometry: OdometryConfig::default(),
+            loop_closure: None,
         }
     }
 }
@@ -42,6 +49,53 @@ pub struct FrameReport {
     pub integration: Option<IntegrationStats>,
     pub blocks: usize,
     pub allocated_bytes: usize,
+}
+
+/// A frame kept so the model can be rebuilt once the poses are corrected.
+///
+/// Rebuilding needs the measurements again. The TSDF was integrated with the
+/// drifted poses, so correcting them invalidates the volume outright rather than
+/// nudging it -- there is no way to move geometry that has already been fused.
+/// This is the memory cost of loop closure, and the reason it is opt-in.
+struct KeptFrame {
+    depth: Vec<f32>,
+    /// Whether this frame was fused the first time round. A rebuild has to make
+    /// the same choice, or the model gains geometry the tracker refused.
+    fused: bool,
+}
+
+/// The most any single pose may be moved by loop closure before the whole
+/// correction is discarded.
+///
+/// A pose graph will fold a map in half to satisfy one wrong edge, and a wrong
+/// edge is exactly what a false revisit produces. The ICP verification in
+/// `LoopFinder` and the robust kernel are the primary defences; this is the
+/// backstop, set well above the drift a real handheld scan accumulates.
+pub const MAX_CORRECTION_METRES: f32 = 2.0;
+
+/// The equivalent backstop for rotation, in radians (about 29 degrees).
+pub const MAX_CORRECTION_RADIANS: f32 = 0.5;
+
+/// What loop closure did.
+#[derive(Clone, Copy, Debug)]
+pub struct ClosureReport {
+    pub nodes: usize,
+    pub odometry_edges: usize,
+    pub loop_edges: usize,
+    pub cost_before: f64,
+    pub cost_after: f64,
+    pub iterations: usize,
+    pub converged: bool,
+    /// Largest pose change the optimisation asked for, in metres.
+    pub max_correction: f32,
+    /// Largest rotation change, in radians. Guarded separately: a pose can be
+    /// badly rotated while its translation barely moves.
+    pub max_rotation: f32,
+    /// Set when the correction exceeded `MAX_CORRECTION_METRES` and was thrown
+    /// away. The trajectory and the model are then exactly as odometry left them.
+    pub refused: bool,
+    /// Whether the volume was actually rebuilt with corrected poses.
+    pub rebuilt: bool,
 }
 
 /// Run frames through odometry and fuse the well-tracked ones.
@@ -60,6 +114,16 @@ pub struct Scanner {
     /// fail in completely different ways, so they are measured separately.
     total_tracking: Duration,
     total_fusion: Duration,
+
+    /// Pose-graph nodes, one per frame in arrival order. Consecutive poses
+    /// already encode the odometry measurement: the tracked pose *is* the
+    /// accumulation, so the relative motion is just `T[i]^-1 * T[i+1]`.
+    poses: Vec<Isometry3<f32>>,
+    /// Frames retained so the model can be rebuilt; parallel to `poses`.
+    kept: Vec<KeptFrame>,
+    loops: Option<LoopFinder>,
+    dimensions: Option<(usize, usize)>,
+    closure: Option<ClosureReport>,
 }
 
 impl Scanner {
@@ -73,6 +137,7 @@ impl Scanner {
             ..config.tsdf
         });
         let odometry = Odometry::new(intrinsics, config.odometry.clone());
+        let loops = config.loop_closure.map(LoopFinder::new);
 
         Self {
             intrinsics,
@@ -86,6 +151,11 @@ impl Scanner {
             points: Vec::new(),
             total_tracking: Duration::ZERO,
             total_fusion: Duration::ZERO,
+            poses: Vec::new(),
+            kept: Vec::new(),
+            loops,
+            dimensions: None,
+            closure: None,
         }
     }
 
@@ -139,6 +209,25 @@ impl Scanner {
             None
         };
 
+        self.poses.push(track.pose);
+        self.dimensions.get_or_insert((width, height));
+
+        // Offer this frame as somewhere the sensor might return to. The cloud is
+        // the one already back-projected for fusion, so the extra cost is the
+        // voxel hashing and, when a candidate turns up, one ICP alignment.
+        if let Some(finder) = self.loops.as_mut() {
+            if fuse {
+                finder.consider(self.frames, track.pose, &self.points);
+            }
+        }
+
+        if self.loops.is_some() {
+            self.kept.push(KeptFrame {
+                depth: depth_metres.to_vec(),
+                fused: fuse,
+            });
+        }
+
         self.frames += 1;
 
         FrameReport {
@@ -148,6 +237,144 @@ impl Scanner {
             blocks: self.volume.block_count(),
             allocated_bytes: self.volume.allocated_bytes(),
         }
+    }
+
+    /// Optimise the trajectory against the revisits that were verified, and
+    /// rebuild the model if the correction is worth having.
+    ///
+    /// Call once, after the last frame. A no-op when loop closure is disabled, or
+    /// when no revisit survived verification.
+    pub fn close_loops(&mut self) -> ClosureReport {
+        let loop_edges = self
+            .loops
+            .as_ref()
+            .map(|finder| finder.edges())
+            .unwrap_or_default();
+
+        let nodes = self.poses.len();
+        let odometry_edges = nodes.saturating_sub(1);
+
+        let nothing = ClosureReport {
+            nodes,
+            odometry_edges,
+            loop_edges: loop_edges.len(),
+            cost_before: 0.0,
+            cost_after: 0.0,
+            iterations: 0,
+            converged: true,
+            max_correction: 0.0,
+            max_rotation: 0.0,
+            refused: false,
+            rebuilt: false,
+        };
+
+        // With no revisit there is nothing to redistribute, so the odometry
+        // trajectory stands unaltered.
+        if nodes < 2 || loop_edges.is_empty() {
+            self.closure = Some(nothing);
+            return nothing;
+        }
+
+        let mut graph = PoseGraph::new(self.poses[0]);
+        for pose in &self.poses[1..] {
+            graph.add_node(*pose);
+        }
+
+        // The odometry edges are free: the tracked pose is the accumulation, so
+        // the measurement between neighbours is already encoded in the poses.
+        for index in 0..nodes - 1 {
+            let measurement = self.poses[index].inverse() * self.poses[index + 1];
+            graph.add_edge(index, index + 1, measurement, 1.0);
+        }
+        for edge in &loop_edges {
+            graph.add_edge(edge.from, edge.to, edge.measurement, edge.weight);
+        }
+
+        let optimised = graph.optimize(&PoseGraphParams::default());
+
+        let mut max_correction = 0.0f32;
+        let mut max_rotation = 0.0f32;
+        for (before, after) in self.poses.iter().zip(graph.nodes()) {
+            let delta = before.inverse() * after;
+            max_correction = max_correction.max(delta.translation.vector.norm());
+            max_rotation = max_rotation.max(delta.rotation.angle());
+        }
+
+        let mut closure = ClosureReport {
+            nodes,
+            odometry_edges,
+            loop_edges: loop_edges.len(),
+            cost_before: optimised.cost_before,
+            cost_after: optimised.cost_after,
+            iterations: optimised.iterations,
+            converged: optimised.converged,
+            max_correction,
+            max_rotation,
+            refused: false,
+            rebuilt: false,
+        };
+
+        // Simplicity beats quiet corruption. If the graph wants to move a pose
+        // further than the odometry could plausibly be wrong, believe the
+        // odometry and leave the model alone.
+        if max_correction > MAX_CORRECTION_METRES || max_rotation > MAX_CORRECTION_RADIANS {
+            closure.refused = true;
+            self.closure = Some(closure);
+            return closure;
+        }
+
+        self.poses = graph.nodes().to_vec();
+        self.rebuild();
+        closure.rebuilt = true;
+
+        self.closure = Some(closure);
+        closure
+    }
+
+    /// Re-integrate every kept frame with the corrected poses.
+    ///
+    /// A fresh volume, because geometry already fused at the old poses cannot be
+    /// moved -- only discarded and laid down again.
+    fn rebuild(&mut self) {
+        let Some((width, height)) = self.dimensions else {
+            return;
+        };
+        let intrinsics = self.intrinsics;
+
+        self.volume = TsdfVolume::new(TsdfParams {
+            min_depth: self.config.depth_min,
+            max_depth: self.config.depth_max,
+            ..self.config.tsdf
+        });
+        self.trajectory.clear();
+
+        let mut fused = 0;
+        for index in 0..self.kept.len() {
+            if !self.kept[index].fused {
+                continue;
+            }
+
+            let pose = self.poses[index];
+            let image = DepthImage::new(width, height, &self.kept[index].depth);
+            self.volume.integrate(&image, &intrinsics, &pose);
+            self.trajectory.push(pose.translation.vector);
+            fused += 1;
+        }
+
+        self.fused = fused;
+    }
+
+    /// What loop closure did, once `close_loops` has run.
+    pub fn closure(&self) -> Option<&ClosureReport> {
+        self.closure.as_ref()
+    }
+
+    /// How many revisits were verified, whether or not they were used.
+    pub fn loops(&self) -> usize {
+        self.loops
+            .as_ref()
+            .map(|finder| finder.loops().len())
+            .unwrap_or(0)
     }
 
     pub fn mesh(&self) -> Mesh {
@@ -278,6 +505,27 @@ mod tests {
         frame
     }
 
+    /// A scanner with revisit detection on, and a small temporal guard: the
+    /// synthetic scans here are only a handful of frames long, so the default
+    /// gap of 40 frames would reject every candidate and test nothing.
+    fn scanner_with_loops() -> Scanner {
+        Scanner::new(
+            intrinsics(),
+            ScannerConfig {
+                tsdf: TsdfParams {
+                    voxel_size: 0.04,
+                    truncation: 0.16,
+                    ..TsdfParams::default()
+                },
+                loop_closure: Some(LoopClosureConfig {
+                    min_index_gap: 2,
+                    ..LoopClosureConfig::default()
+                }),
+                ..ScannerConfig::default()
+            },
+        )
+    }
+
     fn scanner() -> Scanner {
         Scanner::new(
             intrinsics(),
@@ -371,5 +619,69 @@ mod tests {
         }));
 
         assert!(result.is_err(), "mismatched dimensions must be rejected");
+    }
+
+    #[test]
+    fn loop_closure_does_not_damage_a_consistent_scan() {
+        // A stationary scan: every frame is a revisit of every earlier one, so
+        // the finder has plenty to verify while the pose graph has nothing that
+        // needs correcting.
+        //
+        // The property under test is that a *correct* trajectory survives the
+        // machinery untouched. That is the one that matters, because the failure
+        // mode of a pose graph is not failing to correct -- it is happily folding
+        // the map in half to satisfy a wrong edge.
+        let mut scanner = scanner_with_loops();
+        let frame = room_frame(WIDTH, HEIGHT, &intrinsics());
+
+        for _ in 0..6 {
+            scanner.add_frame(&frame, WIDTH, HEIGHT);
+        }
+
+        assert!(
+            scanner.loops() > 0,
+            "no revisits were verified, so nothing is being tested"
+        );
+
+        let report = scanner.close_loops();
+
+        assert!(report.loop_edges > 0, "no loop edge reached the graph");
+        assert!(
+            !report.refused,
+            "a consistent scan was refused: moved {:.3} m",
+            report.max_correction
+        );
+        assert!(report.rebuilt, "the model was not rebuilt");
+        assert!(
+            report.max_correction < 0.02,
+            "loop closure moved an already-correct scan by {:.3} m",
+            report.max_correction
+        );
+        assert!(
+            report.cost_after <= report.cost_before,
+            "optimisation increased the cost"
+        );
+
+        // A rebuild throws the volume away and lays it down again, so it has to
+        // actually produce a model rather than an empty one.
+        assert!(!scanner.mesh().is_empty(), "the rebuild produced no surface");
+        assert_eq!(scanner.fused(), 6, "the rebuild dropped frames");
+    }
+
+    #[test]
+    fn loop_closure_is_off_by_default_and_costs_nothing() {
+        let mut scanner = scanner();
+        let frame = room_frame(WIDTH, HEIGHT, &intrinsics());
+
+        for _ in 0..3 {
+            scanner.add_frame(&frame, WIDTH, HEIGHT);
+        }
+
+        let report = scanner.close_loops();
+
+        assert_eq!(report.loop_edges, 0);
+        assert!(!report.rebuilt);
+        assert_eq!(scanner.loops(), 0);
+        assert_eq!(scanner.fused(), 3);
     }
 }
