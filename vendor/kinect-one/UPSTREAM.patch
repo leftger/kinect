@@ -1,0 +1,295 @@
+diff --color -ruN a/src/lib.rs b/src/lib.rs
+--- a/src/lib.rs	2026-10-03 02:04:27.869103191 -0700
++++ b/src/lib.rs	2026-10-03 02:04:27.874493735 -0700
+@@ -11,7 +11,11 @@
+ use packet::{ColorPacket, DepthPacket};
+ use thiserror::Error;
+ 
+-pub use device::{Device, DeviceEnumerator, DeviceInfo};
++// LOCAL PATCH: also export `Opened`. `Device<Opened>` is the type every caller
++// has to name (e.g. to hold an open device in a struct), but the port only
++// re-exported the `Device` wrapper, leaving the state parameter unnameable
++// outside the crate.
++pub use device::{Device, DeviceEnumerator, DeviceInfo, Opened};
+ 
+ const USB_TIMEOUT: Duration = Duration::from_secs(2);
+ 
+diff --color -ruN a/src/processor/depth/cpu.rs b/src/processor/depth/cpu.rs
+--- a/src/processor/depth/cpu.rs	2026-10-03 02:04:27.869505584 -0700
++++ b/src/processor/depth/cpu.rs	2026-10-03 02:04:27.875284836 -0700
+@@ -727,3 +727,175 @@
+         .into_iter()
+         .flatten()
+ }
++
++#[cfg(test)]
++mod determinism_tests {
++    //! LOCAL PATCH: guards the parallelised decode.
++    //!
++    //! The `parallel` feature swaps the decode's per-pixel loops for rayon-based
++    //! ones. Reordering independent per-pixel writes must not change the *result*,
++    //! and this test exists to prove that: it feeds the processor a fixed synthetic
++    //! packet and prints a hash of the decoded depth buffer.
++    //!
++    //! Run it in both configurations and compare `DEPTH_HASH`:
++    //!   cargo test -p kinect-one --no-default-features --features cpu_depth \
++    //!       -- --nocapture
++    //!   cargo test -p kinect-one --no-default-features --features cpu_depth,parallel \
++    //!       -- --nocapture
++    //!
++    //! Any change in the decoded pixels shows up as a different hash, because the
++    //! hash walks the buffer in pixel order (so thread scheduling cannot affect it).
++
++    use super::*;
++    use crate::data::IrParams;
++    use crate::processor::ProcessTrait;
++
++    /// Bytes in one depth sub-image: 512 * 424 * 11 / 8.
++    const SUB_IMAGE_BYTES: usize = 298_496;
++    /// The parser hands over a buffer of `SUB_IMAGE_BYTES * 10`; match it exactly.
++    const PACKET_BYTES: usize = SUB_IMAGE_BYTES * 10;
++
++    /// xorshift64: deterministic, so both builds see byte-identical input.
++    fn pseudo_random_buffer(len: usize) -> Vec<u8> {
++        let mut state: u64 = 0x243f_6a88_85a3_08d3;
++        let mut out = Vec::with_capacity(len);
++
++        for _ in 0..len {
++            state ^= state << 13;
++            state ^= state >> 7;
++            state ^= state << 17;
++            out.push((state >> 24) as u8);
++        }
++
++        out
++    }
++
++    /// FNV-1a over the depth values' bit patterns, in pixel order.
++    fn hash(buffer: &[f32]) -> u64 {
++        let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
++        for d in buffer {
++            for byte in d.to_bits().to_le_bytes() {
++                hash ^= byte as u64;
++                hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
++            }
++        }
++        hash
++    }
++
++    /// The decode path never awaits, so a no-op waker is enough to drive it.
++    fn block_on<F: std::future::Future>(future: F) -> F::Output {
++        use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
++
++        fn noop(_: *const ()) {}
++        fn clone(_: *const ()) -> RawWaker {
++            RawWaker::new(std::ptr::null(), &VTABLE)
++        }
++        static VTABLE: RawWakerVTable = RawWakerVTable::new(clone, noop, noop, noop);
++
++        let waker = unsafe { Waker::from_raw(RawWaker::new(std::ptr::null(), &VTABLE)) };
++        let mut cx = Context::from_waker(&waker);
++        let mut future = std::pin::pin!(future);
++
++        loop {
++            match future.as_mut().poll(&mut cx) {
++                Poll::Ready(value) => return value,
++                Poll::Pending => panic!("the CPU decode path should never yield"),
++            }
++        }
++    }
++
++    fn processor() -> CpuDepthProcessor {
++        let mut processor = CpuDepthProcessor::new().expect("processor");
++
++        processor
++            .set_p0_tables(&P0Tables::default())
++            .expect("p0 tables");
++        processor
++            .set_ir_params(&IrParams {
++                // Realistic Kinect v2 values, so the derived tables are non-trivial.
++                fx: 367.13,
++                fy: 367.13,
++                cx: 261.08,
++                cy: 211.21,
++                k1: 0.0,
++                k2: 0.0,
++                k3: 0.0,
++                p1: 0.0,
++                p2: 0.0,
++            })
++            .expect("ir params");
++        processor
++            .set_config(&Config::default())
++            .expect("config");
++
++        processor
++    }
++
++    #[test]
++    fn decode_output_is_deterministic() {
++        let processor = processor();
++        let packet = DepthPacket {
++            sequence: 1,
++            timestamp: 1,
++            buffer: pseudo_random_buffer(PACKET_BYTES),
++        };
++
++        let (_ir, depth) = block_on(packet.process(&processor)).expect("decode");
++
++        assert_eq!(depth.buffer.len(), DEPTH_SIZE);
++        println!("DEPTH_HASH={:016x}", hash(&depth.buffer));
++    }
++
++    /// The same decode must also be stable across repeated runs in one process,
++    /// which catches any accidental dependence on thread interleaving.
++    #[test]
++    fn decode_output_is_stable_across_repeats() {
++        let processor = processor();
++        let buffer = pseudo_random_buffer(PACKET_BYTES);
++
++        let mut hashes = Vec::new();
++        for _ in 0..4 {
++            let packet = DepthPacket {
++                sequence: 1,
++                timestamp: 1,
++                buffer: buffer.clone(),
++            };
++            let (_ir, depth) = block_on(packet.process(&processor)).expect("decode");
++            hashes.push(hash(&depth.buffer));
++        }
++
++        assert!(
++            hashes.windows(2).all(|w| w[0] == w[1]),
++            "decode is not stable across repeats: {hashes:016x?}"
++        );
++    }
++
++    /// Wall-clock floor for one decode of the fixed packet.
++    ///
++    /// Compare the *minimum* across configurations. This laptop throttles hard
++    /// (a 15 W Broadwell-U), and repeated runs drift by 2x, so the minimum over
++    /// several iterations is the only number close to full speed.
++    #[test]
++    #[ignore = "measurement, run explicitly with --ignored"]
++    fn decode_timing() {
++        let processor = processor();
++        let buffer = pseudo_random_buffer(PACKET_BYTES);
++
++        let mut samples = Vec::new();
++        for _ in 0..15 {
++            let packet = DepthPacket {
++                sequence: 1,
++                timestamp: 1,
++                buffer: buffer.clone(),
++            };
++
++            let started = std::time::Instant::now();
++            let (_ir, _depth) = block_on(packet.process(&processor)).expect("decode");
++            samples.push(started.elapsed().as_secs_f64() * 1000.0);
++        }
++
++        samples.sort_by(f64::total_cmp);
++        println!("DECODE_MIN_MS={:.1}", samples[0]);
++        println!("DECODE_MEDIAN_MS={:.1}", samples[samples.len() / 2]);
++    }
++}
+diff --color -ruN a/src/processor/depth/opencl.rs b/src/processor/depth/opencl.rs
+--- a/src/processor/depth/opencl.rs	2026-10-03 02:04:27.869585790 -0700
++++ b/src/processor/depth/opencl.rs	2026-10-03 02:04:27.875394175 -0700
+@@ -234,6 +234,16 @@
+                 .len(DEPTH_SIZE)
+                 .build()?,
+         };
++        // NOTE: no global work size is set here on purpose, and it is not missing.
++        // `ProQue::builder().dims(DEPTH_SIZE)` above stores the dims, and
++        // `ProQue::kernel_builder` passes them on via `global_work_size`, so every
++        // kernel built here already launches one work item per pixel. All four
++        // index by `get_global_id(0)` over a flat DEPTH_SIZE array, which matches.
++        //
++        // (If this path ever appears to produce nothing but zeros, the work size is
++        // *not* the suspect. Check the tables instead: the stage-1 kernel treats a
++        // pixel as invalid when `0.0 >= z_table[i]`, so an un-uploaded z_table makes
++        // every pixel invalid and every output stays zero.)
+         let kernels = Kernels {
+             process_pixel_stage1_kernel: pro_que
+                 .kernel_builder("processPixelStage1")
+diff --color -ruN a/src/processor/registration.rs b/src/processor/registration.rs
+--- a/src/processor/registration.rs	2026-10-03 02:04:27.869809470 -0700
++++ b/src/processor/registration.rs	2026-10-03 02:04:27.875622290 -0700
+@@ -15,6 +15,13 @@
+ const DEPTH_Q: f32 = 0.01;
+ const COLOR_Q: f32 = 0.002199;
+ 
++/// LOCAL PATCH: sentinel stored in `distort_map` for an output pixel whose
++/// source falls outside the raw image. Upstream libfreenect2 uses `-1` for this
++/// and writes depth 0 in `apply()`. Upstream's Rust port dropped the check and
++/// indexed the frame directly, which panics once the distortion pushes a border
++/// pixel's rounded coordinate one row/column past the edge.
++const DISTORT_MAP_OUTSIDE: usize = usize::MAX;
++
+ /// Registration will only work contiguous color space
+ pub struct Registration {
+     /// Depth camera parameters.
+@@ -46,12 +53,23 @@
+ 
+                 // compute the dirstored coordinate for current pixel
+                 let (mx, my) = self.distort(x, y);
+-                // rounding the values and check if the pixel is inside the image
+-                let ix = (mx + 0.5) as u32;
+-                let iy = (my + 0.5) as u32;
++                // LOCAL PATCH: round towards zero, as upstream does with
++                // `(int)(v + 0.5f)`, and record out-of-image sources as a
++                // sentinel instead of forming an out-of-bounds index.
++                let ix = (mx + 0.5).trunc();
++                let iy = (my + 0.5).trunc();
++
++                let inside = ix >= 0.0
++                    && iy >= 0.0
++                    && ix < DEPTH_WIDTH as f32
++                    && iy < DEPTH_HEIGHT as f32;
+ 
+                 // computing the index from the coordianted for faster access to the data
+-                self.distort_map[offset] = iy as usize * DEPTH_WIDTH + ix as usize;
++                self.distort_map[offset] = if inside {
++                    iy as usize * DEPTH_WIDTH + ix as usize
++                } else {
++                    DISTORT_MAP_OUTSIDE
++                };
+ 
+                 // compute the depth to color mapping entries for the current pixel
+                 let (rx, ry) = self.depth_to_color(x as f32, y as f32);
+@@ -117,6 +135,14 @@
+             // getting index of distorted depth pixel
+             let index = self.distort_map[i];
+ 
++            // LOCAL PATCH: an out-of-image source pixel carries no depth.
++            // Upstream writes 0 for these, and depth 0 is treated as invalid.
++            if index == DISTORT_MAP_OUTSIDE {
++                undistorted_frame.buffer.push(0.0);
++                depth_to_c_off.push(None);
++                continue;
++            }
++
+             // getting depth value for current pixel
+             let z = depth_frame.buffer[index];
+ 
+@@ -212,10 +238,15 @@
+         // iterating over all pixels from undistorted depth and registered color image
+         // the four maps have the same structure as the images, so their pointers are increased each iteration as well
+         for i in 0..DEPTH_SIZE {
+-            // get depth value for current pixel
+-            undistorted_frame
+-                .buffer
+-                .push(depth_frame.buffer[self.distort_map[i]]);
++            // LOCAL PATCH: a source pixel outside the raw image carries no depth.
++            let source = self.distort_map[i];
++            undistorted_frame.buffer.push(
++                if source == DISTORT_MAP_OUTSIDE || source >= depth_frame.buffer.len() {
++                    0.0
++                } else {
++                    depth_frame.buffer[source]
++                },
++            );
+         }
+ 
+         undistorted_frame

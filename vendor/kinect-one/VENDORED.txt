@@ -1,4 +1,45 @@
 Vendored from https://github.com/Aytixel/kinect-one
 Revision: 24c6dc0
 
-Local changes are marked with `LOCAL PATCH` comments.
+Local changes are marked with `LOCAL PATCH` comments, and the complete diff
+against that revision is in UPSTREAM.patch. Four files differ:
+
+  src/lib.rs
+      Re-export `Opened`. `Device<Opened>` is the type every caller has to name
+      in order to hold an open device, but the port only re-exported the
+      `Device` wrapper, leaving the state parameter unnameable outside the crate.
+
+  src/processor/registration.rs
+      Restore upstream libfreenect2's out-of-image bounds check in
+      `fill_depth_to_color_map`. Upstream records -1 for a border pixel whose
+      distortion lands outside the raw image, and writes depth 0 for it; the port
+      dropped the check and indexed the frame directly, which panics on real
+      frames. This is a genuine upstream bug, not a local preference.
+
+  src/processor/depth/cpu.rs
+      An additive `#[cfg(test)]` module only, proving the parallel decode is
+      bit-exact against the sequential one. No functional change: an earlier
+      attempt to reshape the decode's inner loops measured about 1% and was
+      reverted rather than carried.
+
+  src/processor/depth/opencl.rs
+      Comment only, recording that the kernel global work size comes from
+      `ProQue::dims` and is deliberately not set at the kernel builders. No code
+      change. Kept because that path produces silent all-zero output when it
+      fails, and the work size is the first thing one suspects.
+
+UPSTREAM.patch resolves with `-p1` from a directory containing `src/`.
+
+Regenerating it, or rebasing onto a newer upstream:
+
+    git clone https://github.com/Aytixel/kinect-one /tmp/k1
+    git -C /tmp/k1 checkout 24c6dc0
+    mkdir -p /tmp/pg/a /tmp/pg/b
+    cp -r /tmp/k1/src /tmp/pg/a/src                 # pristine
+    cp -r <this-crate>/src /tmp/pg/b/src            # vendored, patched
+    (cd /tmp/pg && diff -ruN a b) > UPSTREAM.patch
+
+Checking that the vendored copy really is upstream plus only these changes:
+
+    cp -r /tmp/k1/src /tmp/verify/src
+    (cd /tmp/verify && patch -p1 < UPSTREAM.patch && diff -rq src <this-crate>/src)
