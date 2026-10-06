@@ -106,6 +106,7 @@ Useful options:
   the mesh is written as usual.
 - `--gpu` decodes on the GPU. Needs a build with `--features wgpu-decode`
   (Vulkan) or `--features gpu-decode` (OpenCL); see below.
+- `--mirror` keeps the raw sensor mirror orientation instead of flipping X (un-mirrored by default).
 
 A trajectory PLY is written alongside the mesh as `<out>.trajectory.ply`.
 

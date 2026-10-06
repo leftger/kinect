@@ -30,6 +30,7 @@ use std::process::ExitCode;
 
 use geom::tsdf::TsdfParams;
 use loop_closure::LoopClosureConfig;
+use nalgebra::Vector3;
 use scanner::{ClosureReport, FrameReport, Scanner, ScannerConfig};
 
 const DEFAULT_FRAMES: usize = 60;
@@ -66,6 +67,9 @@ struct Options {
     color: bool,
     /// Open a live window showing the scan as it builds.
     viewer: bool,
+    /// Un-mirror the reconstruction horizontally so real-world left and right match.
+    /// True by default: the Kinect v2 sensor reads out mirrored frames.
+    unmirror: bool,
 }
 
 impl Default for Options {
@@ -81,6 +85,7 @@ impl Default for Options {
             loop_closure: false,
             color: false,
             viewer: false,
+            unmirror: true,
         }
     }
 }
@@ -88,6 +93,11 @@ impl Default for Options {
 async fn run() -> Result<(), Box<dyn Error>> {
     let mut args = std::env::args().skip(1);
     let command = args.next().unwrap_or_default();
+
+    if command == "-h" || command == "--help" {
+        print_usage();
+        return Ok(());
+    }
 
     let mut options = Options::default();
 
@@ -114,9 +124,12 @@ async fn run() -> Result<(), Box<dyn Error>> {
             }
             "--no-filter" => options.filters = false,
             "--color" => options.color = true,
+            "--drain-color" => options.drain_color = true,
             "--viewer" => options.viewer = true,
             "--loop-closure" => options.loop_closure = true,
             "--gpu" => options.gpu = true,
+            "--mirror" => options.unmirror = false,
+            "--no-mirror" | "--unmirror" => options.unmirror = true,
             "-h" | "--help" => {
                 print_usage();
                 return Ok(());
@@ -189,6 +202,8 @@ fn print_usage() {
          \x20               (about 850 KB each) so the model can be rebuilt once\n\
          \x20               the poses move. Only helps a scan that returns\n\
          \x20               somewhere it has already been.\n\
+         \x20 --mirror       Keep the raw sensor mirror orientation instead of flipping\n\
+         \x20                X to match real-world coordinates (un-mirrored by default).\n\
          \n\
          A trajectory PLY is written alongside the mesh as <out>.trajectory.ply,\n\
          which is the quickest way to see how badly the pose has drifted."
@@ -476,11 +491,15 @@ pub(crate) fn finish(scanner: &Scanner, options: &Options) -> Result<(), Box<dyn
         .unwrap_or_else(|| PathBuf::from("scan.ply"));
 
     println!("[scan] extracting surface ...");
-    let mesh = scanner.mesh();
+    let mut mesh = scanner.mesh();
 
     if mesh.is_empty() {
         println!("[scan] no surface extracted - was anything in range?");
         return Ok(());
+    }
+
+    if options.unmirror {
+        mesh.flip_x();
     }
 
     if let Some((min, max)) = mesh.bounds() {
@@ -498,11 +517,20 @@ pub(crate) fn finish(scanner: &Scanner, options: &Options) -> Result<(), Box<dyn
     println!("[scan] wrote {}", out.display());
 
     let trajectory = out.with_extension("trajectory.ply");
-    geom::mesh::save_points_ply(&trajectory, scanner.trajectory())?;
+    let trajectory_points: Vec<Vector3<f32>> = if options.unmirror {
+        scanner
+            .trajectory()
+            .iter()
+            .map(|p| Vector3::new(-p.x, p.y, p.z))
+            .collect()
+    } else {
+        scanner.trajectory().to_vec()
+    };
+    geom::mesh::save_points_ply(&trajectory, &trajectory_points)?;
     println!(
         "[scan] wrote {} ({} camera positions)",
         trajectory.display(),
-        scanner.trajectory().len()
+        trajectory_points.len()
     );
 
     Ok(())

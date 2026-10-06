@@ -60,6 +60,20 @@ impl Mesh {
         (a + b + c) / 3.0
     }
 
+    /// Invert the horizontal axis and reverse face winding.
+    ///
+    /// The Kinect v2 sensor reads out mirrored frames. Negating the X coordinate
+    /// un-mirrors the reconstruction, while reversing triangle vertex winding
+    /// ([a, b, c] -> [a, c, b]) keeps surface normals pointing outward.
+    pub fn flip_x(&mut self) {
+        for v in &mut self.vertices {
+            v.x = -v.x;
+        }
+        for tri in &mut self.triangles {
+            tri.swap(1, 2);
+        }
+    }
+
     pub fn save_ply(&self, path: &Path) -> io::Result<()> {
         let file = File::create(path)?;
         let mut writer = BufWriter::new(file);
@@ -218,5 +232,22 @@ mod tests {
 
         assert!(header.contains("element vertex 2"));
         assert_eq!(buffer.len() - header_end, 2 * 12);
+    }
+
+    #[test]
+    fn flip_x_negates_x_and_preserves_outward_normals() {
+        let mut mesh = tetrahedron();
+        let normal_before = mesh.triangle_normal(&mesh.triangles[0]);
+        // Triangle 0 has normal pointing with some x, y, z component.
+        mesh.flip_x();
+
+        // X coordinate of vertices should be negated
+        assert_eq!(mesh.vertices[1].x, -1.0);
+
+        // Triangle 0's normal should have negated x, but same y and z
+        let normal_after = mesh.triangle_normal(&mesh.triangles[0]);
+        assert!((normal_after.x - (-normal_before.x)).abs() < 1e-6);
+        assert!((normal_after.y - normal_before.y).abs() < 1e-6);
+        assert!((normal_after.z - normal_before.z).abs() < 1e-6);
     }
 }
