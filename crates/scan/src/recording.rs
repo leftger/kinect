@@ -6,6 +6,9 @@
 //! *processed* depth frames (not the raw USB packets) gives byte-identical input
 //! and is ~3x smaller than the raw packets while still exercising all the
 //! geometry.
+//!
+//! Colour is not in the file. `--color` is live-only; replaying a `.k2df`
+//! reconstructs geometry and has no views to paint.
 
 use std::fs::File;
 use std::io::{self, BufReader, BufWriter, Read, Write};

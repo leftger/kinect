@@ -7,4 +7,7 @@ description = "Driver-independent 3D geometry for the scanner: spatial index, no
 
 [dependencies]
 nalgebra = "0.35"
+# Compressed PNG for texture atlases. Pinned to 0.17, whose MSRV is within
+# this workspace's Rust 1.85.
+png = "0.17"
 rayon = "1"

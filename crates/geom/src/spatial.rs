@@ -36,7 +36,10 @@ impl VoxelHash {
 
         let mut buckets: HashMap<Cell, Vec<u32>> = HashMap::new();
         for (index, point) in points.iter().enumerate() {
-            buckets.entry(cell_of(point, cell)).or_default().push(index as u32);
+            buckets
+                .entry(cell_of(point, cell))
+                .or_default()
+                .push(index as u32);
         }
 
         Self { cell, buckets }
@@ -167,7 +170,9 @@ mod tests {
         let hash = VoxelHash::build(0.25, &points);
         let query = Vector3::new(0.4, -0.2, 0.03);
 
-        let (index, distance) = hash.nearest_within(&points, &query, 0.5).expect("nearby point");
+        let (index, distance) = hash
+            .nearest_within(&points, &query, 0.5)
+            .expect("nearby point");
 
         let brute = points
             .iter()
@@ -182,6 +187,8 @@ mod tests {
     fn returns_none_when_nothing_in_range() {
         let points = vec![Vector3::new(10.0, 10.0, 10.0)];
         let hash = VoxelHash::build(0.5, &points);
-        assert!(hash.nearest_within(&points, &Vector3::zeros(), 1.0).is_none());
+        assert!(hash
+            .nearest_within(&points, &Vector3::zeros(), 1.0)
+            .is_none());
     }
 }

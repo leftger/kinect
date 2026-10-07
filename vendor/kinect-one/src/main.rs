@@ -8,13 +8,11 @@ use kinect_one::{
     },
     DeviceEnumerator, PacketSync, DEPTH_HEIGHT, DEPTH_SIZE, DEPTH_WIDTH,
 };
-use mozjpeg::Compress;
+use mozjpeg::{Compress, DctMethod};
 use ocl::{Device, Platform};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
-    env_logger::init();
-
     let mut device = DeviceEnumerator::open_default(true).await?;
 
     println!("Starting");
@@ -26,7 +24,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
     registration.set_ir_params(device.get_ir_params());
     registration.set_color_params(device.get_color_params());
 
-    let color_processor = MozColorProcessor::new(ColorSpace::RGB, false, false);
+    let color_processor =
+        MozColorProcessor::new(ColorSpace::RGB, false, false, DctMethod::IntegerSlow);
     let mut depth_processor = OpenCLDepthProcessor::new(Device::first(Platform::first()?)?)?;
 
     depth_processor.set_p0_tables(device.get_p0_tables())?;

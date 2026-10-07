@@ -93,6 +93,12 @@ impl Splatter {
                         continue;
                     }
 
+                    // An unregistered pixel is stored as black. Skip it, or the
+                    // preview paints holes the colour camera never saw.
+                    if view.valid.get(index).copied().unwrap_or(0) == 0 {
+                        continue;
+                    }
+
                     let offset = index * 3;
                     if offset + 2 >= view.color.len() {
                         continue;
@@ -217,10 +223,11 @@ pub fn run(options: &Options) -> Result<(), Box<dyn Error>> {
             }));
 
             match scanned {
-                // The window closing ends the scan, so write out whatever was
-                // reconstructed rather than discarding it.
-                Ok(scanner) => {
-                    if let Err(e) = crate::finish(&scanner, &options) {
+                // The window closing ends the scan, so close loops and write
+                // out whatever was reconstructed rather than discarding it.
+                // `finish_scan` is the same ending the plain live path uses.
+                Ok(mut scanner) => {
+                    if let Err(e) = crate::finish_scan(&mut scanner, &options) {
                         *failure.lock().unwrap() = Some(e.to_string());
                     }
                 }
@@ -373,6 +380,12 @@ mod tests {
                 cx: 4.0,
                 cy: 4.0,
             },
+            valid: vec![1; width * height],
+            exposure: 1.0,
+            gain: 1.0,
+            gamma: 1.0,
+            frame_index: 0,
+            tracking_quality: 1.0,
         }
     }
 
@@ -424,6 +437,20 @@ mod tests {
         let rgba = splatter.render(&behind);
         let painted = rgba.chunks_exact(4).filter(|p| p[3] == 255).count();
         assert_eq!(painted, 0, "{painted} points behind the camera were drawn");
+    }
+
+    #[test]
+    fn an_unregistered_pixel_is_not_drawn() {
+        let mut view = view();
+        // 8x8, so clearing the first row drops eight samples at stride 1.
+        for index in 0..view.width {
+            view.valid[index] = 0;
+        }
+
+        let mut splatter = Splatter::new(32, 32);
+        splatter.absorb(&[view], 1);
+
+        assert_eq!(splatter.point_count(), 64 - 8);
     }
 
     #[test]

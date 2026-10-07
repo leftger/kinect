@@ -11,15 +11,21 @@
 //! 3. [`icp`] — point-to-plane alignment, i.e. the odometry.
 //! 4. [`projective`] — the fast correspondence strategy the odometry uses.
 //! 5. [`tsdf`] — fused truncated signed distance field with surface extraction.
-//! 6. [`mesh`] — triangle mesh output.
+//! 6. [`mesh`] — triangle mesh, including binary PLY.
+//! 7. [`texturing`] — atlas built from the colour views.
+//! 8. [`export`] — write that mesh as PLY, OBJ, glTF or GLB.
+//! 9. [`png`] — the compressed RGB image those textured formats embed or sit beside.
 
 pub mod coloring;
+pub mod export;
 pub mod icp;
 pub mod mesh;
 pub mod normals;
+pub mod png;
 pub mod pose_graph;
 pub mod projective;
 pub mod spatial;
+pub mod texturing;
 pub mod tsdf;
 pub mod voxel;
 
@@ -156,7 +162,11 @@ mod tests {
     fn project_inverts_back_project() {
         let k = intrinsics();
 
-        for &(u, v, d) in &[(0.0f32, 0.0f32, 1.0f32), (511.5, 423.5, 3.2), (100.0, 300.0, 0.7)] {
+        for &(u, v, d) in &[
+            (0.0f32, 0.0f32, 1.0f32),
+            (511.5, 423.5, 3.2),
+            (100.0, 300.0, 0.7),
+        ] {
             let point = k.back_project(u, v, d);
             let (pu, pv) = k.project(&point).expect("in front of camera");
             assert!((pu - u).abs() < 1e-3, "{pu} vs {u}");
@@ -166,7 +176,9 @@ mod tests {
 
     #[test]
     fn project_rejects_points_behind_the_camera() {
-        assert!(intrinsics().project(&Vector3::new(0.0, 0.0, -1.0)).is_none());
+        assert!(intrinsics()
+            .project(&Vector3::new(0.0, 0.0, -1.0))
+            .is_none());
         assert!(intrinsics().project(&Vector3::new(0.0, 0.0, 0.0)).is_none());
     }
 
@@ -184,10 +196,16 @@ mod tests {
     fn transform_point_matches_manual_rotation() {
         let transform = Isometry3::from_parts(
             nalgebra::Translation3::new(1.0, 2.0, 3.0),
-            nalgebra::UnitQuaternion::from_axis_angle(&Vector3::z_axis(), std::f32::consts::FRAC_PI_2),
+            nalgebra::UnitQuaternion::from_axis_angle(
+                &Vector3::z_axis(),
+                std::f32::consts::FRAC_PI_2,
+            ),
         );
 
         let moved = transform_point(&transform, &Vector3::new(1.0, 0.0, 0.0));
-        assert!((moved - Vector3::new(1.0, 3.0, 3.0)).norm() < 1e-6, "{moved:?}");
+        assert!(
+            (moved - Vector3::new(1.0, 3.0, 3.0)).norm() < 1e-6,
+            "{moved:?}"
+        );
     }
 }

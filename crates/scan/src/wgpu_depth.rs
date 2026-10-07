@@ -244,7 +244,7 @@ impl WgpuDepthProcessor {
             required_limits: limits,
             ..Default::default()
         }))
-            .map_err(|error| format!("creating the GPU device: {error}"))?;
+        .map_err(|error| format!("creating the GPU device: {error}"))?;
 
         let storage = wgpu::BufferUsages::STORAGE
             | wgpu::BufferUsages::COPY_DST

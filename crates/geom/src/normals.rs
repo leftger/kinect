@@ -106,10 +106,7 @@ mod tests {
         // Viewpoint above the patch: normals should point at it, i.e. +z.
         let normals = estimate(&points, 0.06, MIN_NEIGHBOURS, &Vector3::new(0.0, 0.0, 1.0));
 
-        let interior: Vec<_> = normals
-            .iter()
-            .filter(|n| n.norm_squared() > 0.0)
-            .collect();
+        let interior: Vec<_> = normals.iter().filter(|n| n.norm_squared() > 0.0).collect();
 
         assert!(interior.len() > 400, "expected most points to get a normal");
 
@@ -131,7 +128,10 @@ mod tests {
         // Find a point that got a normal in both.
         for (a, b) in from_above.iter().zip(from_below.iter()) {
             if a.norm_squared() > 0.0 && b.norm_squared() > 0.0 {
-                assert!((a + b).norm() < 1e-3, "expected opposite signs, got {a:?} {b:?}");
+                assert!(
+                    (a + b).norm() < 1e-3,
+                    "expected opposite signs, got {a:?} {b:?}"
+                );
                 return;
             }
         }

@@ -20,7 +20,7 @@ gaps. Read this section before the code.
 - TSDF fusion and triangle-mesh extraction, written as binary PLY
 - Trajectory export, which is the quickest way to see how badly a scan drifted
 - Loop closure and pose-graph optimisation, wired and tested
-- Optional colour, registered onto the mesh as per-vertex PLY colours
+- Optional live colour, painted onto the mesh as per-vertex PLY colour or as a texture atlas (OBJ, glTF, or a single GLB)
 
 **Found by profiling, and fixed**
 
@@ -98,12 +98,14 @@ before using the scanner, `cargo run --release -p probe`.
 target/release/scan live --gpu --frames 300 --out scan.ply
 ```
 
-Add `--color` to paint the mesh.
+Add `--color` to paint a live mesh. `--out scan.ply` keeps per-vertex colour; `--out room.obj`, `room.gltf`, or `room.glb` writes a texture atlas.
 
 ## Use
 
 ```
-scan live   [--frames N] [--out mesh.ply] [--voxel M] [--no-filter] [--color] [--gpu] [--loop-closure] [--viewer]
+scan live   [--frames N] [--out mesh.ply] [--voxel M] [--no-filter] [--color]
+            [--color-mode best|blend|average] [--color-depth-tolerance M]
+            [--gpu] [--loop-closure] [--viewer]
 scan record  --out capture.k2df [--frames N] [--no-filter] [--drain-color] [--gpu]
 scan replay  --in capture.k2df [--out mesh.ply] [--voxel M] [--frames N] [--loop-closure]
 ```
@@ -122,12 +124,25 @@ Useful options:
   faster and keeps more junk points.
 - `--frames N` is how many frames to capture or replay. The default is 60.
 - `--loop-closure` detects revisits and rebuilds the model from corrected poses.
-  It buffers the frames to do that, about 850 KB each, so a 200-frame scan costs
-  around 170 MB. It only helps a scan that returns somewhere it has already been.
+  On a live colour scan the colour views move onto those poses before the mesh
+  is painted. The rebuild keeps every depth frame, about 850 KB each, so a
+  200-frame scan holds around 170 MB of depth. Each colour view is separate:
+  about 1.66 MiB, and about 1 GiB at 600 views. It only helps a scan that
+  returns somewhere it has already been.
 - `--color` captures the colour stream during `live` and paints the finished
-  mesh. Off by default, because that stream is slower than depth.
-- `--drain-color` applies to `record`. It reads and discards colour packets so
-  the pipe stays drained, without writing them into the recording.
+  mesh. Off by default, because that stream is slower than depth. It does not
+  apply to `replay`: a `.k2df` recording is depth only, so there is no colour
+  to paint. `--drain-color` on `record` reads and discards colour packets and
+  still does not store them.
+- `--color-mode` is `best` (the default), `blend`, or `average`. It sets
+  per-vertex PLY colour. A texture atlas gives each triangle one best source
+  view. See [Colour](#colour).
+- `--color-depth-tolerance M` is how far, in metres, a vertex may disagree with
+  a view's measured depth and still be painted. The default is `0.02`. It must
+  be greater than zero.
+- `--out` selects the file by extension. `.ply` is per-vertex colour. `.obj`
+  also writes a sibling `.mtl` and `.png`. `.gltf` also writes a sibling `.bin`
+  and `.png`. `.glb` is the geometry and the PNG in one file.
 - `--viewer` opens a live window showing the scan as it builds: the reconstruction
   so far, the frame count, the tracked position and the model size. Needs a build
   with `--features viewer` and a display. The window backend in that feature is
@@ -148,7 +163,7 @@ depth frame from USB
   -> decode            raw packet to metres          (vendored libfreenect2 port)
   -> odometry          pose relative to the last frame
   -> TSDF fusion       integrate into a voxel-hashed volume
-  -> mesh extraction   naive surface nets, binary PLY
+  -> mesh extraction   naive surface nets, then PLY, OBJ, glTF, or GLB
 ```
 
 **Odometry** uses projective data association: each point in the current frame is
@@ -170,28 +185,111 @@ cleaner quads at the cost of some detail.
 
 ## Colour
 
-`--color` captures the colour stream and paints it onto the finished mesh, written
-as per-vertex `uchar red/green/blue` properties that MeshLab, CloudCompare and
-Blender read.
+`--color` is live-only. It captures the colour stream, registers each frame into
+the depth camera's grid, and paints the finished mesh from those views. A
+`.k2df` recording stores processed depth and nothing else, so `record`,
+`--drain-color`, and `replay` cannot paint. Passing `--color` to `replay` says
+so and then reconstructs the depth.
 
-The colour is registered into the *depth* camera's grid as each frame arrives
-(`Registration::undistort_depth_and_color`), so a view is a 512x424 RGB image plus
-the undistorted depth from the same frame. That registration is what makes the
-rest simple: projecting a vertex needs only the depth intrinsics, and the view's
-own depth is directly usable as an occlusion test, which is the same test the
-projective odometry already does.
+```
+scan live --color --frames 300 --out scan.ply
+scan live --color --color-mode blend --color-depth-tolerance 0.03 --out scan.ply
+scan live --color --loop-closure --out room.obj
+scan live --color --out room.glb
+scan live --color --out room.gltf
+scan replay --in capture.k2df --out mesh.ply
+```
 
-A vertex is only painted by a view whose measured depth agrees with how far away
-the vertex actually is. Without that, a vertex on a far wall seen through a
-doorway from some other pose would be painted with whatever is in front of it.
-Every view that passes contributes, so the finished model is smoother than any
-single frame.
+The colour is registered as each frame arrives
+(`Registration::undistort_depth_and_color`), so a view is a 512x424 RGB image
+plus the undistorted depth and the registration mask from the same frame.
+That is about 1.66 MiB per kept view, about 1 GiB at 600 views, on top of the
+depth frames loop closure retains (about 850 KB each). Projecting a vertex needs
+only the depth intrinsics, and the view's own depth is the occlusion test, the same
+one projective odometry already does. A sample is kept only when that depth
+agrees with the vertex, the registration mask says the pixel was copied, the
+sample clears the image margin, and a known normal faces the camera. Without
+the depth test, a vertex on a far wall seen through a doorway would be painted
+with whatever is in front of it.
 
-PLY has no texture coordinates in its core format, so this is per-vertex colour
-rather than a texture atlas. Unlike fused colour it costs no extra volume and
-lets every frame that saw a surface contribute, not only the frames that arrived
-while that surface was being integrated. A real texture atlas would mean
-outputting OBJ or glTF instead.
+Samples that survive are scored:
+
+```
+score = incidence × centrality × proximity × agreement × tracking
+```
+
+`incidence` is how squarely the camera looks at the surface. `centrality`
+prefers the middle of the frame. `proximity` prefers a nearer camera.
+`agreement` is how much of the depth tolerance is left. `tracking` is the
+inlier ratio of that frame.
+
+`--color-mode` chooses the per-vertex PLY colour. The default is `best`.
+
+- `best` keeps the single highest score, after a per-view exposure correction
+  applied in linear light.
+- `blend` mixes the top three scores in linear light, weighted by those scores,
+  with the same exposure correction.
+- `average` is the earlier painter: an equal mean of every visible sample in
+  the stored byte values. It does not apply the exposure correction. The
+  visibility test is unchanged.
+
+`.obj`, `.gltf`, and `.glb` write a texture atlas. An atlas assigns each
+triangle to the one source view that passes the visibility test on all three
+corners and on the triangle centroid, and that has the best score. `blend` and
+`average` apply to per-vertex PLY colour.
+
+The exposure correction is one scalar per view, estimated from vertices that
+view shares with the best-observed view. It is not a model of the colour
+camera's exposure, gain, or gamma; those values are kept for diagnostics. A
+correction needs several consistent overlaps, ignores near-black samples, and
+is clamped.
+
+`--color-depth-tolerance` defaults to 2 cm (`0.02`). That is about the depth
+noise at typical range, and it still allows a vertex that sits between voxels.
+The earlier painter used 5 cm, which let colour through thin structure. The
+value has to be greater than zero: too tight and nothing is visible, too loose
+and colour bleeds through walls.
+
+Colour is not fused into the volume. That costs no extra voxels, and once the
+model is final every accepted view that saw a surface can contribute, not only
+the frames that arrived while that surface was being integrated. A frame the
+tracker rejects is not kept: its pose was never used to build the model, so its
+colour is not used to paint it. The end-of-scan line reports how many colour
+views were kept against how many were dropped with rejected frames.
+
+**Loop closure moves the colour with the poses.** Views are stored at the
+odometry pose of the frame they came from. When a correction is accepted, the
+volume is rebuilt and each view is rewritten to the corrected pose of its
+frame (`frame_index` into the trajectory) before anything is painted. A refused
+correction leaves both the model and the views where odometry put them.
+Painting from the old poses after the mesh had moved would colour the surface
+from the wrong camera.
+
+**The extension picks the file.** `.ply` has no texture coordinates in its core
+format, so it stays per-vertex `uchar red/green/blue`, which MeshLab,
+CloudCompare, and Blender read, and that is the colour `--color-mode` controls.
+`.obj`, `.gltf`, and `.glb` carry a texture atlas. A triangle is given to the
+one view that passes the test on all three corners and on the centroid, and
+that has the best score. Charts are the bounding boxes of those faces,
+shelf-packed with a replicated gutter, and never larger than 8192 on a side.
+If the native charts would overflow that square they are downscaled together.
+
+| `--out` | files |
+| --- | --- |
+| `scan.ply` | per-vertex colour in that file |
+| `room.obj` | `room.obj`, `room.mtl`, `room.png` |
+| `room.gltf` | `room.gltf`, `room.bin`, `room.png` |
+| `room.glb` | one binary GLB, geometry and PNG inside it |
+
+An uncompressed PNG of an 8192 atlas would be about 192 MB, most of it the flat
+fallback colour around the charts. The PNG is deflate-compressed so that empty
+region collapses. The end-of-scan line for an atlas reports its size, how many
+triangles were painted, and the unpainted remainder. A PLY reports how many
+vertices were painted and how many samples contributed to each.
+
+The atlas is built in the volume's frame and only then mirrored, so positions,
+normals, and winding flip together and the texture coordinates stay on the
+image that was just painted.
 
 **It costs capture rate.** The colour stream delivers at about a third of the
 depth rate. On the Linux machine this was first measured on, waiting for a
@@ -295,7 +393,8 @@ cargo run --release -p scan --example vk_check    --features wgpu-decode
 ```
 crates/geom         driver-independent geometry: voxel hashing, normals,
                     point-to-plane ICP, projective association, TSDF, surface
-                    nets, PLY output, pose-graph optimisation
+                    nets, colouring, texture atlases, PLY/OBJ/glTF/GLB output,
+                    pose-graph optimisation
 crates/scan         the scanner: capture, recording, odometry, fusion, CLI
 crates/probe        bring-up probe: confirms the sensor streams on this machine
 vendor/kinect-one   vendored libfreenect2 port, with patches
@@ -308,7 +407,7 @@ platform/linux      udev rule
 cargo test -p geom -p scan
 ```
 
-54 tests. The geometry is tested against synthetic scenes and known transforms
+133 tests. The geometry is tested against synthetic scenes and known transforms
 rather than against recorded data, so the suite runs without a sensor.
 
 Two tests need hardware and are ignored by default:
@@ -330,9 +429,9 @@ cargo test --release -p scan --features wgpu-decode -- --ignored --nocapture
    against synthetic scans, but the property that has been verified is only that
    it does not damage a correct trajectory. A capture that walks out and returns
    to its start would show whether it removes drift.
-4. **File the `undistort_depth` bug upstream**, since it affects anyone using the
+3. **File the `undistort_depth` bug upstream**, since it affects anyone using the
    port on real hardware.
-5. **The GPU decoder frees the CPU and does not shorten the scan.** Either find
+4. **The GPU decoder frees the CPU and does not shorten the scan.** Either find
    a use for the spare cores, or accept the wall-clock result above.
 
 ## Licence

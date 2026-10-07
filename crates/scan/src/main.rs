@@ -5,14 +5,17 @@
 //! extracted as a triangle mesh.
 //!
 //! ```text
-//! scan live   [--frames N] [--out mesh.ply] [--voxel M] [--no-filter] [--drain-color]
-//! scan record  --out capture.k2df [--frames N] [--no-filter] [--drain-color]
-//! scan replay  --in capture.k2df [--out mesh.ply] [--voxel M]
+//! scan live   [--frames N] [--out mesh.ply] [--voxel M] [--no-filter] [--color]
+//!             [--color-mode best|blend|average] [--color-depth-tolerance M]
+//!             [--gpu] [--loop-closure] [--viewer]
+//! scan record  --out capture.k2df [--frames N] [--no-filter] [--drain-color] [--gpu]
+//! scan replay  --in capture.k2df [--out mesh.ply] [--voxel M] [--frames N] [--loop-closure]
 //! ```
 //!
 //! `record` and `replay` exist so that odometry can be tuned against
 //! byte-identical input instead of a live sensor: the scene changes between live
-//! runs, so two parameter sets never see the same data.
+//! runs, so two parameter sets never see the same data. A `.k2df` file stores
+//! depth only, so `--color` paints a live scan and does nothing on replay.
 
 mod capture;
 mod loop_closure;
@@ -28,10 +31,13 @@ use std::error::Error;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
+use geom::coloring::{ColorMode, ColoringParams, ColoringReport};
+use geom::export::{self, MeshFormat};
+use geom::texturing::TexturingReport;
 use geom::tsdf::TsdfParams;
 use loop_closure::LoopClosureConfig;
 use nalgebra::Vector3;
-use scanner::{ClosureReport, FrameReport, Scanner, ScannerConfig};
+use scanner::{ExportMesh, FrameColor, FrameReport, Scanner, ScannerConfig};
 
 const DEFAULT_FRAMES: usize = 60;
 
@@ -46,7 +52,7 @@ async fn main() -> ExitCode {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 struct Options {
     frames: Option<usize>,
     out: Option<PathBuf>,
@@ -60,11 +66,19 @@ struct Options {
     /// Decode depth frames on the GPU. Needs a build with the `gpu-decode` feature.
     gpu: bool,
     /// Detect revisits and redistribute the accumulated error over the whole
-    /// trajectory. Costs memory: the frames have to be kept so the model can be
-    /// rebuilt once the poses move.
+    /// trajectory. Costs memory: each depth frame is kept (about 850 KB) so
+    /// the model can be rebuilt, and each colour view is about 1.66 MiB
+    /// (about 1 GiB at 600 views).
     loop_closure: bool,
     /// Capture colour and paint it onto the mesh.
     color: bool,
+    /// Per-vertex PLY colour. `best` unless `--color-mode` says otherwise.
+    /// `.obj`, `.gltf`, and `.glb` still assign each triangle to one best
+    /// source view.
+    color_mode: ColorMode,
+    /// How far a vertex may disagree with a view's depth and still be painted,
+    /// in metres. Default 0.02.
+    color_depth_tolerance: f32,
     /// Open a live window showing the scan as it builds.
     viewer: bool,
     /// Un-mirror the reconstruction horizontally so real-world left and right match.
@@ -84,20 +98,51 @@ impl Default for Options {
             gpu: false,
             loop_closure: false,
             color: false,
+            color_mode: ColoringParams::default().mode,
+            color_depth_tolerance: ColoringParams::default().depth_tolerance,
             viewer: false,
             unmirror: true,
         }
     }
 }
 
+#[derive(Debug)]
+enum Command {
+    Live,
+    Record,
+    Replay,
+    Help,
+}
+
 async fn run() -> Result<(), Box<dyn Error>> {
-    let mut args = std::env::args().skip(1);
+    let (command, options) = parse_args(std::env::args().skip(1))?;
+    match command {
+        Command::Live => live(&options).await,
+        Command::Record => record(&options).await,
+        Command::Replay => replay(&options),
+        Command::Help => {
+            print_usage();
+            Ok(())
+        }
+    }
+}
+
+fn parse_args(
+    args: impl IntoIterator<Item = String>,
+) -> Result<(Command, Options), Box<dyn Error>> {
+    let mut args = args.into_iter();
     let command = args.next().unwrap_or_default();
 
-    if command == "-h" || command == "--help" {
-        print_usage();
-        return Ok(());
+    if command == "-h" || command == "--help" || command.is_empty() || command == "help" {
+        return Ok((Command::Help, Options::default()));
     }
+
+    let command = match command.as_str() {
+        "live" => Command::Live,
+        "record" => Command::Record,
+        "replay" => Command::Replay,
+        other => return Err(format!("unknown command `{other}` (try --help)").into()),
+    };
 
     let mut options = Options::default();
 
@@ -124,31 +169,42 @@ async fn run() -> Result<(), Box<dyn Error>> {
             }
             "--no-filter" => options.filters = false,
             "--color" => options.color = true,
+            "--color-mode" => {
+                options.color_mode = parse_color_mode(&next_value(&mut args, "--color-mode")?)?;
+            }
+            "--color-depth-tolerance" => {
+                let tolerance: f32 = next_value(&mut args, "--color-depth-tolerance")?.parse()?;
+                if !(tolerance.is_finite() && tolerance > 0.0) {
+                    return Err(
+                        "--color-depth-tolerance must be a finite number greater than 0".into(),
+                    );
+                }
+                options.color_depth_tolerance = tolerance;
+            }
             "--drain-color" => options.drain_color = true,
             "--viewer" => options.viewer = true,
             "--loop-closure" => options.loop_closure = true,
             "--gpu" => options.gpu = true,
             "--mirror" => options.unmirror = false,
             "--no-mirror" | "--unmirror" => options.unmirror = true,
-            "-h" | "--help" => {
-                print_usage();
-                return Ok(());
-            }
+            "-h" | "--help" => return Ok((Command::Help, options)),
             other => {
                 return Err(format!("unrecognised argument `{other}` (try --help)").into());
             }
         }
     }
 
-    match command.as_str() {
-        "live" => live(&options).await,
-        "record" => record(&options).await,
-        "replay" => replay(&options),
-        "" | "help" => {
-            print_usage();
-            Ok(())
+    Ok((command, options))
+}
+
+fn parse_color_mode(value: &str) -> Result<ColorMode, Box<dyn Error>> {
+    match value {
+        "best" => Ok(ColorMode::Best),
+        "blend" => Ok(ColorMode::Blend),
+        "average" => Ok(ColorMode::Average),
+        other => {
+            Err(format!("--color-mode must be best, blend, or average (got `{other}`)").into())
         }
-        other => Err(format!("unknown command `{other}` (try --help)").into()),
     }
 }
 
@@ -161,13 +217,20 @@ fn next_value(
 }
 
 fn print_usage() {
-    println!(
+    println!("{}", usage_text());
+}
+
+fn usage_text() -> String {
+    format!(
         "scan - handheld 3D scanner for the Kinect v2\n\
          \n\
          USAGE:\n\
-         \x20 scan live   [--frames N] [--out mesh.ply] [--voxel M] [--no-filter] [--color] [--gpu]\n\
+         \x20 scan live   [--frames N] [--out mesh.ply] [--voxel M] [--no-filter] [--color]\n\
+         \x20             [--color-mode best|blend|average] [--color-depth-tolerance M]\n\
+         \x20             [--gpu] [--loop-closure] [--viewer]\n\
          \x20 scan record  --out capture.k2df [--frames N] [--no-filter] [--drain-color] [--gpu]\n\
          \x20 scan replay  --in capture.k2df [--out mesh.ply] [--voxel M] [--frames N]\n\
+         \x20             [--loop-closure]\n\
          \n\
          COMMANDS:\n\
          \x20 live     Capture from the sensor and reconstruct as you go.\n\
@@ -179,16 +242,32 @@ fn print_usage() {
          \x20               With replay: how many recorded frames to process. A\n\
          \x20               recording is deterministic, so a prefix of it is a\n\
          \x20               repeatable test case.\n\
-         \x20 --out FILE    Output mesh (default scan.ply).\n\
-         \x20 --in FILE     Recording to replay.\n\
+         \x20 --out FILE    Output mesh (default scan.ply). The extension selects\n\
+         \x20               the format: .ply (per-vertex colour), .obj (plus .mtl\n\
+         \x20               and .png), .gltf (plus .bin and .png), or .glb (one file).\n\
+         \x20 --in FILE     Recording to replay. A .k2df file is depth only.\n\
          \x20 --voxel M     TSDF voxel size in metres (default 0.01). Sets the\n\
          \x20               truncation band to 4x this.\n\
          \x20 --no-filter   Disable the decoder's bilateral/edge filters: roughly\n\
          \x20               doubles frame rate, keeps more junk points.\n\
          \x20 --color       On live: capture colour and paint the mesh. Off by\n\
          \x20               default. The colour stream is slower than depth.\n\
+         \x20               Replay cannot paint: the recording has no colour.\n\
+         \x20 --color-mode MODE\n\
+         \x20               Per-vertex PLY colour: best (default), blend, or\n\
+         \x20               average. best keeps the highest-scoring visible\n\
+         \x20               sample. blend weights the top three in linear light.\n\
+         \x20               average is an equal mean of the stored bytes and\n\
+         \x20               skips exposure correction. All three use the same\n\
+         \x20               visibility test. An .obj, .gltf, or .glb atlas gives\n\
+         \x20               each triangle the one source view that sees it best.\n\
+         \x20 --color-depth-tolerance M\n\
+         \x20               How far a vertex may disagree with a view's depth, in\n\
+         \x20               metres, and still be painted (default 0.02). Must be\n\
+         \x20               greater than 0.\n\
          \x20 --drain-color On record: read and discard colour packets. Does not\n\
-         \x20               apply to live; use --color there.\n\
+         \x20               apply to live; use --color there. The packets are not\n\
+         \x20               written into the .k2df file.\n\
          \x20 --gpu         Decode depth on the GPU during live and record.\n\
          \x20               Needs `--features wgpu-decode` (Metal on macOS,\n\
          \x20               Vulkan on Linux). OpenCL (`--features gpu-decode`)\n\
@@ -196,10 +275,12 @@ fn print_usage() {
          \x20               drops sharply; a live scan does not finish sooner.\n\
          \x20 --loop-closure  Detect revisits, redistribute the accumulated drift\n\
          \x20               over the whole trajectory, and rebuild the model from\n\
-         \x20               the corrected poses. Costs memory: frames are kept\n\
-         \x20               (about 850 KB each) so the model can be rebuilt once\n\
-         \x20               the poses move. Only helps a scan that returns\n\
-         \x20               somewhere it has already been.\n\
+         \x20               the corrected poses. Colour views move onto those\n\
+         \x20               poses before the mesh is painted. Costs memory: each\n\
+         \x20               depth frame is kept (about 850 KB) so the model can\n\
+         \x20               be rebuilt, and each colour view is about 1.66 MiB\n\
+         \x20               (about 1 GiB at 600 views). Only helps a scan that\n\
+         \x20               returns somewhere it has already been.\n\
          \x20 --viewer      Open a live window. Needs `--features viewer` and a\n\
          \x20               display. Closing the window stops the scan.\n\
          \x20 --mirror      Keep the raw sensor mirror orientation instead of flipping\n\
@@ -207,7 +288,7 @@ fn print_usage() {
          \n\
          A trajectory PLY is written alongside the mesh as <out>.trajectory.ply,\n\
          which is the quickest way to see how badly the pose has drifted."
-    );
+    )
 }
 
 async fn live(options: &Options) -> Result<(), Box<dyn Error>> {
@@ -220,8 +301,7 @@ async fn live(options: &Options) -> Result<(), Box<dyn Error>> {
     }
 
     let mut scanner = run_live(options, |_, _| true).await?;
-    close_loops(&mut scanner, options);
-    finish(&scanner, options)
+    finish_scan(&mut scanner, options)
 }
 
 /// The live capture loop, shared by the plain path and the viewer window.
@@ -259,9 +339,14 @@ where
 
         // Both come from `capture`, and the scanner needs them together to pair
         // them with one pose.
-        let color = capture
-            .color()
-            .map(|captured| (captured.rgb.as_slice(), captured.depth.as_slice()));
+        let color = capture.color().map(|captured| FrameColor {
+            rgb: captured.rgb.as_slice(),
+            depth: captured.depth.as_slice(),
+            valid: captured.valid.as_slice(),
+            exposure: captured.exposure,
+            gain: captured.gain,
+            gamma: captured.gamma,
+        });
         let report = scanner.add_frame_with_color(&frame, width, height, color);
         print_progress(index, &report);
 
@@ -329,6 +414,11 @@ fn replay(options: &Options) -> Result<(), Box<dyn Error>> {
         recording.intrinsics.cx,
         recording.intrinsics.cy
     );
+    if options.color {
+        println!(
+            "[scan] --color is live-only; a .k2df recording stores depth frames and has no colour to paint"
+        );
+    }
 
     let mut scanner = Scanner::new(recording.intrinsics, scanner_config(options));
 
@@ -342,16 +432,27 @@ fn replay(options: &Options) -> Result<(), Box<dyn Error>> {
         print_progress(index + 1, &report);
     }
 
-    close_loops(&mut scanner, options);
-    finish(&scanner, options)
+    finish_scan(&mut scanner, options)
 }
 
 fn scanner_config(options: &Options) -> ScannerConfig {
     ScannerConfig {
         tsdf: options.tsdf,
         loop_closure: options.loop_closure.then(LoopClosureConfig::default),
+        coloring: ColoringParams {
+            mode: options.color_mode,
+            depth_tolerance: options.color_depth_tolerance,
+            ..ColoringParams::default()
+        },
         ..ScannerConfig::default()
     }
+}
+
+/// Close loops, then write the mesh. Live, replay, and the viewer window all
+/// end here, so closing the window still corrects the trajectory before export.
+pub(crate) fn finish_scan(scanner: &mut Scanner, options: &Options) -> Result<(), Box<dyn Error>> {
+    close_loops(scanner, options);
+    finish(scanner, options)
 }
 
 /// Run loop closure and report it. Called between the last frame and the
@@ -437,6 +538,76 @@ fn print_progress(index: usize, report: &FrameReport) {
     );
 }
 
+fn print_mesh_extent(vertices: usize, triangles: usize, min: Vector3<f32>, max: Vector3<f32>) {
+    println!(
+        "[scan] mesh: {} vertices, {} triangles, extent {:.2} x {:.2} x {:.2} m",
+        vertices,
+        triangles,
+        max.x - min.x,
+        max.y - min.y,
+        max.z - min.z
+    );
+}
+
+fn print_color_views(scanner: &Scanner) {
+    let kept = scanner.color_view_count();
+    let supplied = scanner.color_supplied();
+    if kept == 0 && supplied == 0 {
+        return;
+    }
+    println!(
+        "{}",
+        format_color_views(kept, scanner.color_dropped(), scanner.rejected())
+    );
+}
+
+fn format_color_views(kept: usize, dropped: usize, rejected: usize) -> String {
+    format!(
+        "[scan] colour: {kept} views kept, {dropped} dropped with rejected frames ({rejected} frames rejected)"
+    )
+}
+
+fn format_paint(report: &ColoringReport) -> String {
+    format!(
+        "[scan] paint: {}/{} vertices painted ({:.1}%), {:.1} samples per painted vertex",
+        report.painted(),
+        report.vertices,
+        report.coverage() * 100.0,
+        report.mean_samples(),
+    )
+}
+
+fn format_atlas(report: &TexturingReport) -> String {
+    let scale = if report.downscaled {
+        ", downscaled"
+    } else {
+        ""
+    };
+    format!(
+        "[scan] atlas: {}x{}, {} charts, {}/{} triangles painted ({:.1}%), {} unobserved{}",
+        report.atlas_width,
+        report.atlas_height,
+        report.charts,
+        report.painted(),
+        report.triangles,
+        report.coverage() * 100.0,
+        report.unobserved,
+        scale,
+    )
+}
+
+fn position_bounds(positions: &[Vector3<f32>]) -> Option<(Vector3<f32>, Vector3<f32>)> {
+    let mut iter = positions.iter();
+    let first = *iter.next()?;
+    let mut min = first;
+    let mut max = first;
+    for position in iter {
+        min = min.inf(position);
+        max = max.sup(position);
+    }
+    Some((min, max))
+}
+
 pub(crate) fn finish(scanner: &Scanner, options: &Options) -> Result<(), Box<dyn Error>> {
     println!();
     println!(
@@ -452,12 +623,7 @@ pub(crate) fn finish(scanner: &Scanner, options: &Options) -> Result<(), Box<dyn
         scanner.total_tracking().as_secs_f64() * 1000.0 / frames,
         scanner.total_fusion().as_secs_f64() * 1000.0 / frames,
     );
-    if scanner.color_view_count() > 0 {
-        println!(
-            "[scan] colour: {} views used to texture the mesh",
-            scanner.color_view_count()
-        );
-    }
+    print_color_views(scanner);
     println!(
         "[scan] TSDF: {} blocks, {:.1} MB",
         scanner.block_count(),
@@ -479,31 +645,43 @@ pub(crate) fn finish(scanner: &Scanner, options: &Options) -> Result<(), Box<dyn
         .out
         .clone()
         .unwrap_or_else(|| PathBuf::from("scan.ply"));
+    let format = MeshFormat::from_path(&out)?;
 
     println!("[scan] extracting surface ...");
-    let mut mesh = scanner.mesh();
-
-    if mesh.is_empty() {
+    // The atlas is built in the volume's frame. Mirroring happens inside
+    // `export_mesh`, after that, so positions, normals and winding all flip
+    // and the texture coordinates stay on the image that was just painted.
+    let Some(exported) = scanner.export_mesh(options.unmirror, format.uses_texture_atlas()) else {
         println!("[scan] no surface extracted - was anything in range?");
         return Ok(());
+    };
+
+    match &exported {
+        ExportMesh::Geometry(mesh, coloring) => {
+            if let Some((min, max)) = mesh.bounds() {
+                print_mesh_extent(mesh.vertex_count(), mesh.triangle_count(), min, max);
+            }
+            if let Some(report) = coloring {
+                println!("{}", format_paint(report));
+            }
+        }
+        ExportMesh::Atlas(textured, report) => {
+            if let Some((min, max)) = position_bounds(&textured.positions) {
+                print_mesh_extent(
+                    textured.positions.len(),
+                    textured.triangle_count(),
+                    min,
+                    max,
+                );
+            }
+            println!("{}", format_atlas(report));
+        }
     }
 
-    if options.unmirror {
-        mesh.flip_x();
+    match exported {
+        ExportMesh::Geometry(mesh, _) => export::save_mesh(&mesh, &out)?,
+        ExportMesh::Atlas(textured, _) => export::save_textured(&textured, &out)?,
     }
-
-    if let Some((min, max)) = mesh.bounds() {
-        println!(
-            "[scan] mesh: {} vertices, {} triangles, extent {:.2} x {:.2} x {:.2} m",
-            mesh.vertex_count(),
-            mesh.triangle_count(),
-            max.x - min.x,
-            max.y - min.y,
-            max.z - min.z
-        );
-    }
-
-    mesh.save_ply(&out)?;
     println!("[scan] wrote {}", out.display());
 
     let trajectory = out.with_extension("trajectory.ply");
@@ -524,4 +702,169 @@ pub(crate) fn finish(scanner: &Scanner, options: &Options) -> Result<(), Box<dyn
     );
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use geom::Intrinsics;
+
+    #[test]
+    fn finish_names_an_unsupported_extension() {
+        let scanner = Scanner::new(
+            Intrinsics {
+                fx: 1.0,
+                fy: 1.0,
+                cx: 0.0,
+                cy: 0.0,
+            },
+            ScannerConfig::default(),
+        );
+        let mut options = Options::default();
+        options.out = Some(PathBuf::from("not-a-mesh.stl"));
+        let error = finish(&scanner, &options).expect_err("stl");
+        let message = error.to_string();
+        assert!(message.contains("\".stl\""), "{message}");
+        assert!(
+            message.contains(".ply") && message.contains(".glb"),
+            "{message}"
+        );
+    }
+
+    fn words(args: &[&str]) -> Vec<String> {
+        args.iter().map(|arg| (*arg).to_string()).collect()
+    }
+
+    #[test]
+    fn usage_lists_the_color_controls_and_the_mesh_extensions() {
+        let usage = usage_text();
+        assert!(usage.contains("--color-mode best|blend|average"), "{usage}");
+        assert!(
+            usage.contains("Per-vertex PLY colour"),
+            "help should say --color-mode is the PLY painter: {usage}"
+        );
+        assert!(
+            usage.contains("one source view that sees it best"),
+            "help should say atlases pick one view per triangle: {usage}"
+        );
+        assert!(usage.contains("1.66 MiB"), "{usage}");
+        assert!(usage.contains("850 KB"), "{usage}");
+        assert!(usage.contains("--color-depth-tolerance M"), "{usage}");
+        assert!(usage.contains("default 0.02"), "{usage}");
+        assert!(usage.contains(".mtl"), "{usage}");
+        assert!(usage.contains(".bin"), "{usage}");
+        assert!(usage.contains(".glb"), "{usage}");
+        assert!(usage.contains("depth only"), "{usage}");
+    }
+
+    #[test]
+    fn color_flags_default_to_best_and_two_centimetres_and_reach_the_config() {
+        let (command, options) = parse_args(words(&["live", "--color"])).expect("parse");
+        assert!(matches!(command, Command::Live));
+        assert!(options.color);
+        let config = scanner_config(&options);
+        assert_eq!(config.coloring.mode, ColorMode::Best);
+        assert!((config.coloring.depth_tolerance - 0.02).abs() < 1e-6);
+        assert_eq!(config.coloring.fallback, ColoringParams::default().fallback);
+
+        let (_, blend) = parse_args(words(&[
+            "live",
+            "--color-mode",
+            "blend",
+            "--color-depth-tolerance",
+            "0.04",
+        ]))
+        .expect("parse");
+        let config = scanner_config(&blend);
+        assert_eq!(config.coloring.mode, ColorMode::Blend);
+        assert!((config.coloring.depth_tolerance - 0.04).abs() < 1e-6);
+        assert_eq!(
+            config.coloring.image_margin,
+            ColoringParams::default().image_margin
+        );
+
+        let (_, average) =
+            parse_args(words(&["replay", "--color-mode", "average"])).expect("parse");
+        assert_eq!(scanner_config(&average).coloring.mode, ColorMode::Average);
+    }
+
+    #[test]
+    fn bad_color_flags_are_rejected() {
+        let mode = parse_args(words(&["live", "--color-mode", "Best"])).expect_err("case");
+        assert!(
+            mode.to_string().contains("best, blend, or average"),
+            "{mode}"
+        );
+
+        let missing = parse_args(words(&["live", "--color-mode"])).expect_err("missing");
+        assert!(missing.to_string().contains("needs a value"), "{missing}");
+
+        for value in ["0", "-0.01", "nan", "inf"] {
+            let error =
+                parse_args(words(&["live", "--color-depth-tolerance", value])).expect_err(value);
+            assert!(
+                error.to_string().contains("greater than 0"),
+                "{value}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn end_of_scan_lines_report_kept_views_and_coverage() {
+        let views = format_color_views(12, 3, 3);
+        assert!(views.contains("12 views kept"), "{views}");
+        assert!(views.contains("3 dropped"), "{views}");
+        assert!(views.contains("3 frames rejected"), "{views}");
+
+        let paint = format_paint(&ColoringReport {
+            vertices: 10,
+            unobserved: 4,
+            samples: 12,
+            exposure_scales: vec![1.0],
+        });
+        assert!(paint.contains("6/10"), "{paint}");
+        assert!(paint.contains("60.0%"), "{paint}");
+        assert!(paint.contains("2.0 samples"), "{paint}");
+
+        let atlas = format_atlas(&TexturingReport {
+            triangles: 8,
+            unobserved: 2,
+            charts: 3,
+            atlas_width: 64,
+            atlas_height: 32,
+            downscaled: true,
+            exposure_scales: Vec::new(),
+        });
+        assert!(atlas.contains("64x32"), "{atlas}");
+        assert!(atlas.contains("6/8"), "{atlas}");
+        assert!(atlas.contains("75.0%"), "{atlas}");
+        assert!(atlas.contains("2 unobserved"), "{atlas}");
+        assert!(atlas.contains("downscaled"), "{atlas}");
+    }
+
+    #[test]
+    fn finish_scan_closes_loops_before_an_empty_mesh_returns() {
+        // No surface, so `finish` returns before it writes a file. Closure is
+        // recorded only when loop closure actually ran, which has to happen
+        // first: the viewer, live, and replay paths all end in `finish_scan`.
+        let intrinsics = Intrinsics {
+            fx: 1.0,
+            fy: 1.0,
+            cx: 0.0,
+            cy: 0.0,
+        };
+
+        let mut closed = Scanner::new(intrinsics, ScannerConfig::default());
+        let mut with_loops = Options::default();
+        with_loops.loop_closure = true;
+        finish_scan(&mut closed, &with_loops).expect("empty scan");
+        assert!(
+            closed.closure().is_some(),
+            "finish_scan returned without closing loops"
+        );
+
+        let mut left = Scanner::new(intrinsics, ScannerConfig::default());
+        finish_scan(&mut left, &Options::default()).expect("empty scan");
+        assert!(left.closure().is_none());
+    }
 }

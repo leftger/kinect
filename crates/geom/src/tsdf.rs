@@ -313,7 +313,11 @@ impl TsdfVolume {
         // Pass 2: for each grid edge with a sign change, join the four cubes
         // around it. This is what turns isolated vertices into a surface.
         let push_quad = |mesh: &mut Mesh, quad: [u32; 4], flip: bool| {
-            let [a, b, c, d] = if flip { [quad[3], quad[2], quad[1], quad[0]] } else { quad };
+            let [a, b, c, d] = if flip {
+                [quad[3], quad[2], quad[1], quad[0]]
+            } else {
+                quad
+            };
             mesh.triangles.push([a, b, c]);
             mesh.triangles.push([a, c, d]);
         };
@@ -412,9 +416,18 @@ impl TsdfVolume {
 
         // Average the crossings on the 12 cube edges.
         const EDGES: [(usize, usize); 12] = [
-            (0, 1), (2, 3), (4, 5), (6, 7), // along x
-            (0, 2), (1, 3), (4, 6), (5, 7), // along y
-            (0, 4), (1, 5), (2, 6), (3, 7), // along z
+            (0, 1),
+            (2, 3),
+            (4, 5),
+            (6, 7), // along x
+            (0, 2),
+            (1, 3),
+            (4, 6),
+            (5, 7), // along y
+            (0, 4),
+            (1, 5),
+            (2, 6),
+            (3, 7), // along z
         ];
 
         let mut sum = Vector3::zeros();
@@ -462,10 +475,7 @@ fn corner_offset(corner: usize) -> Vector3<f32> {
     )
 }
 
-fn lookup(
-    vertices: &HashMap<[i32; 3], u32>,
-    cubes: &[[i32; 3]; 4],
-) -> Option<[u32; 4]> {
+fn lookup(vertices: &HashMap<[i32; 3], u32>, cubes: &[[i32; 3]; 4]) -> Option<[u32; 4]> {
     Some([
         *vertices.get(&cubes[0])?,
         *vertices.get(&cubes[1])?,
@@ -576,7 +586,11 @@ mod tests {
         // Two noisy observations either side of 1.0 m.
         for offset in [0.008f32, -0.008] {
             let depth = vec![1.0 + offset; width * height];
-            volume.integrate(&DepthImage::new(width, height, &depth), &intrinsics, &Isometry3::identity());
+            volume.integrate(
+                &DepthImage::new(width, height, &depth),
+                &intrinsics,
+                &Isometry3::identity(),
+            );
         }
 
         let mesh = volume.extract_mesh();
@@ -614,11 +628,17 @@ mod tests {
             ),
             Isometry3::from_parts(
                 Translation3::new(0.0, -2.0 * center.z, center.z),
-                nalgebra::UnitQuaternion::from_axis_angle(&Vector3::x_axis(), std::f32::consts::FRAC_PI_2),
+                nalgebra::UnitQuaternion::from_axis_angle(
+                    &Vector3::x_axis(),
+                    std::f32::consts::FRAC_PI_2,
+                ),
             ),
             Isometry3::from_parts(
                 Translation3::new(0.0, 2.0 * center.z, center.z),
-                nalgebra::UnitQuaternion::from_axis_angle(&Vector3::x_axis(), -std::f32::consts::FRAC_PI_2),
+                nalgebra::UnitQuaternion::from_axis_angle(
+                    &Vector3::x_axis(),
+                    -std::f32::consts::FRAC_PI_2,
+                ),
             ),
         ];
 
@@ -630,7 +650,11 @@ mod tests {
         }
 
         let mesh = volume.extract_mesh();
-        assert!(mesh.triangle_count() > 1000, "expected a dense sphere, got {}", mesh.triangle_count());
+        assert!(
+            mesh.triangle_count() > 1000,
+            "expected a dense sphere, got {}",
+            mesh.triangle_count()
+        );
 
         // Every triangle should face away from the sphere centre.
         let mut outward = 0;

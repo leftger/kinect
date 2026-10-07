@@ -1,8 +1,9 @@
 //! The scan pipeline: depth frame -> odometry -> TSDF fusion.
 
-use geom::coloring::{colorize, ColorView, ColoringParams};
+use geom::coloring::{colorize, ColorMode, ColorView, ColoringParams, ColoringReport};
 use geom::mesh::Mesh;
 use geom::pose_graph::{PoseGraph, PoseGraphParams};
+use geom::texturing::{texture, TexturedMesh, TexturingParams, TexturingReport};
 use geom::tsdf::{IntegrationStats, TsdfParams, TsdfVolume};
 use geom::{DepthImage, Intrinsics};
 use nalgebra::{Isometry3, Vector3};
@@ -25,6 +26,12 @@ pub struct ScannerConfig {
     /// buffering the frames -- which is the memory cost of being able to correct
     /// them after the fact.
     pub loop_closure: Option<LoopClosureConfig>,
+    /// Per-vertex PLY colour. `live` copies `--color-mode` and
+    /// `--color-depth-tolerance` onto `mode` and `depth_tolerance`. The other
+    /// fields stay at [`ColoringParams::default`] (best sample, 2 cm). Atlas
+    /// export uses the same visibility rules and assigns each triangle to one
+    /// best source view.
+    pub coloring: ColoringParams,
 }
 
 impl Default for ScannerConfig {
@@ -37,6 +44,7 @@ impl Default for ScannerConfig {
             tsdf: TsdfParams::default(),
             odometry: OdometryConfig::default(),
             loop_closure: None,
+            coloring: ColoringParams::default(),
         }
     }
 }
@@ -57,7 +65,9 @@ pub struct FrameReport {
 /// Rebuilding needs the measurements again. The TSDF was integrated with the
 /// drifted poses, so correcting them invalidates the volume outright rather than
 /// nudging it -- there is no way to move geometry that has already been fused.
-/// This is the memory cost of loop closure, and the reason it is opt-in.
+/// The retained cost is the depth buffer, about 850 KB at 512×424. Colour
+/// views are stored separately at about 1.66 MiB each. This is why loop
+/// closure is opt-in.
 struct KeptFrame {
     depth: Vec<f32>,
     /// Whether this frame was fused the first time round. A rebuild has to make
@@ -99,6 +109,32 @@ pub struct ClosureReport {
     pub rebuilt: bool,
 }
 
+/// Colour for one frame, already registered into the depth grid.
+///
+/// Borrowed because the capture that produced it still owns the buffers. The
+/// scanner copies what it keeps.
+pub struct FrameColor<'a> {
+    /// RGB, `width * height * 3`.
+    pub rgb: &'a [u8],
+    /// Undistorted depth in metres, same grid as `rgb`.
+    pub depth: &'a [f32],
+    /// One byte per depth pixel. Non-zero where `rgb` was copied by registration.
+    pub valid: &'a [u8],
+    pub exposure: f32,
+    pub gain: f32,
+    pub gamma: f32,
+}
+
+/// What [`Scanner::export_mesh`] decided to write.
+pub enum ExportMesh {
+    /// Positions, normals and, for PLY, per-vertex colour. No atlas.
+    ///
+    /// The report is present when colour views were painted onto the mesh.
+    Geometry(Mesh, Option<ColoringReport>),
+    /// Atlas mesh. The mirror, when requested, has already been applied.
+    Atlas(TexturedMesh, TexturingReport),
+}
+
 /// Run frames through odometry and fuse the well-tracked ones.
 pub struct Scanner {
     intrinsics: Intrinsics,
@@ -123,9 +159,13 @@ pub struct Scanner {
     /// Frames retained so the model can be rebuilt; parallel to `poses`.
     kept: Vec<KeptFrame>,
     loops: Option<LoopFinder>,
-    /// Colour from the frames that saw the surface, for texturing the mesh.
+    /// Colour from the frames that were fused. A rejected frame did not
+    /// contribute geometry, so its colour is not kept either. After an accepted
+    /// loop closure each view's pose is the corrected pose of its frame.
     color_views: Vec<ColorView>,
-    coloring: ColoringParams,
+    /// Frames that arrived with a colour buffer, including ones the tracker
+    /// rejected. [`Self::color_view_count`] is the subset that was kept.
+    color_supplied: usize,
     dimensions: Option<(usize, usize)>,
     closure: Option<ClosureReport>,
 }
@@ -159,7 +199,7 @@ impl Scanner {
             kept: Vec::new(),
             loops,
             color_views: Vec::new(),
-            coloring: ColoringParams::default(),
+            color_supplied: 0,
             dimensions: None,
             closure: None,
         }
@@ -174,15 +214,16 @@ impl Scanner {
 
     /// As `add_frame`, but also keeping this frame's colour for texturing.
     ///
-    /// `color` is the registered colour and the undistorted depth from the same
-    /// frame; the pose is not needed because it is the pose this frame is about
-    /// to be tracked to.
+    /// `color` is the registered colour, its validity mask and the undistorted
+    /// depth from the same frame, plus the colour camera's exposure settings.
+    /// The pose is not passed in: it is the pose this frame is about to be
+    /// tracked to. Colour is kept only when the frame is fused.
     pub fn add_frame_with_color(
         &mut self,
         depth_metres: &[f32],
         width: usize,
         height: usize,
-        color: Option<(&[u8], &[f32])>,
+        color: Option<FrameColor<'_>>,
     ) -> FrameReport {
         let intrinsics = self.intrinsics;
         let image = DepthImage::new(width, height, depth_metres);
@@ -233,15 +274,28 @@ impl Scanner {
         self.poses.push(track.pose);
         self.dimensions.get_or_insert((width, height));
 
-        if let Some((rgb, depth)) = color {
-            self.color_views.push(ColorView {
-                color: rgb.to_vec(),
-                width,
-                height,
-                depth: depth.to_vec(),
-                pose: track.pose,
-                intrinsics,
-            });
+        // Same rule as fusion: the first frame, or a pose the tracker accepted.
+        // A rejected frame's colour would paint the model from a pose that was
+        // never used to build it. It is still counted, so the summary can say
+        // how many colour frames were dropped with the rejected pose.
+        if let Some(color) = color {
+            self.color_supplied += 1;
+            if fuse {
+                self.color_views.push(ColorView {
+                    color: color.rgb.to_vec(),
+                    width,
+                    height,
+                    depth: color.depth.to_vec(),
+                    pose: track.pose,
+                    intrinsics,
+                    valid: color.valid.to_vec(),
+                    exposure: color.exposure,
+                    gain: color.gain,
+                    gamma: color.gamma,
+                    frame_index: self.frames,
+                    tracking_quality: track.inlier_ratio,
+                });
+            }
         }
 
         // Offer this frame as somewhere the sensor might return to. The cloud is
@@ -357,6 +411,9 @@ impl Scanner {
 
         self.poses = graph.nodes().to_vec();
         self.rebuild();
+        // The views were stored at the odometry poses. The volume was just
+        // rebuilt at the corrected ones, so the colour has to follow.
+        self.update_color_view_poses();
         closure.rebuilt = true;
 
         self.closure = Some(closure);
@@ -396,6 +453,18 @@ impl Scanner {
         self.fused = fused;
     }
 
+    /// Point each kept colour view at the corrected pose of the frame it came from.
+    ///
+    /// Views are stored only for fused frames, so they are not parallel to
+    /// `poses`. `frame_index` is the arrival index, which is.
+    fn update_color_view_poses(&mut self) {
+        for view in &mut self.color_views {
+            if let Some(pose) = self.poses.get(view.frame_index).copied() {
+                view.pose = pose;
+            }
+        }
+    }
+
     /// What loop closure did, once `close_loops` has run.
     pub fn closure(&self) -> Option<&ClosureReport> {
         self.closure.as_ref()
@@ -410,14 +479,73 @@ impl Scanner {
     }
 
     pub fn mesh(&self) -> Mesh {
-        let mut mesh = self.volume.extract_mesh();
+        self.painted_mesh().0
+    }
 
-        if !self.color_views.is_empty() {
-            let (colors, _report) = colorize(&mesh.vertices, &self.color_views, &self.coloring);
-            mesh.colors = Some(colors);
+    /// The extracted mesh, plus the painter's report when colour views exist.
+    fn painted_mesh(&self) -> (Mesh, Option<ColoringReport>) {
+        let mut mesh = self.volume.extract_mesh();
+        if self.color_views.is_empty() {
+            return (mesh, None);
         }
 
-        mesh
+        let normals = mesh.vertex_normals();
+        let (colors, report) = colorize(
+            &mesh.vertices,
+            &normals,
+            &self.color_views,
+            &self.config.coloring,
+        );
+        mesh.colors = Some(colors);
+        (mesh, Some(report))
+    }
+
+    /// Atlas for the colour views, in the volume's own frame.
+    ///
+    /// `None` when texturing is off or the volume has no surface. The result is
+    /// not mirrored: views were captured in this frame, so a caller that wants
+    /// real-world left and right has to [`TexturedMesh::flip_x`] afterwards.
+    /// [`export_mesh`] does that, and only after the atlas exists.
+    pub fn textured_mesh(&self) -> Option<(TexturedMesh, TexturingReport)> {
+        if self.color_views.is_empty() {
+            return None;
+        }
+        let mesh = self.volume.extract_mesh();
+        if mesh.is_empty() {
+            return None;
+        }
+        let params = TexturingParams {
+            coloring: self.config.coloring,
+            ..TexturingParams::default()
+        };
+        Some(texture(&mesh, &self.color_views, &params))
+    }
+
+    /// The mesh `finish` writes, with the mirror applied after texturing.
+    ///
+    /// `atlas` is how the chosen file carries colour. An atlas is built from
+    /// the unflipped surface and only then mirrored, so positions, normals and
+    /// winding move together while the UVs stay pointed at the image that was
+    /// just painted. PLY passes `atlas: false` and keeps per-vertex colour.
+    /// With no colour views the result is geometry either way.
+    pub fn export_mesh(&self, unmirror: bool, atlas: bool) -> Option<ExportMesh> {
+        if atlas {
+            if let Some((mut textured, report)) = self.textured_mesh() {
+                if unmirror {
+                    textured.flip_x();
+                }
+                return Some(ExportMesh::Atlas(textured, report));
+            }
+        }
+
+        let (mut mesh, coloring) = self.painted_mesh();
+        if mesh.is_empty() {
+            return None;
+        }
+        if unmirror {
+            mesh.flip_x();
+        }
+        Some(ExportMesh::Geometry(mesh, coloring))
     }
 
     /// The frames that contributed colour, for the live preview.
@@ -428,6 +556,16 @@ impl Scanner {
     /// How many frames contributed colour. Zero when texturing is off.
     pub fn color_view_count(&self) -> usize {
         self.color_views.len()
+    }
+
+    /// How many frames arrived with a colour buffer, kept or not.
+    pub fn color_supplied(&self) -> usize {
+        self.color_supplied
+    }
+
+    /// Colour buffers that were not kept because the frame was rejected.
+    pub fn color_dropped(&self) -> usize {
+        self.color_supplied.saturating_sub(self.color_views.len())
     }
 
     pub fn trajectory(&self) -> &[Vector3<f32>] {
@@ -735,5 +873,307 @@ mod tests {
         assert!(!report.rebuilt);
         assert_eq!(scanner.loops(), 0);
         assert_eq!(scanner.fused(), 3);
+    }
+
+    fn frame_color<'a>(
+        rgb: &'a [u8],
+        depth: &'a [f32],
+        valid: &'a [u8],
+        exposure: f32,
+    ) -> FrameColor<'a> {
+        FrameColor {
+            rgb,
+            depth,
+            valid,
+            exposure,
+            gain: 1.5,
+            gamma: 2.2,
+        }
+    }
+
+    #[test]
+    fn colour_is_kept_only_for_fused_frames_and_records_where_it_came_from() {
+        let mut scanner = scanner();
+        let room = room_frame(WIDTH, HEIGHT, &intrinsics());
+        let pixels = WIDTH * HEIGHT;
+        let rgb = vec![40u8; pixels * 3];
+        let color_depth = vec![2.0f32; pixels];
+        let mut valid = vec![1u8; pixels];
+        valid[0] = 0;
+
+        let first = scanner.add_frame_with_color(
+            &room,
+            WIDTH,
+            HEIGHT,
+            Some(frame_color(&rgb, &color_depth, &valid, 0.01)),
+        );
+        assert!(first.integration.is_some());
+        assert_eq!(scanner.color_view_count(), 1);
+        assert_eq!(scanner.color_views()[0].frame_index, 0);
+        assert!(
+            (scanner.color_views()[0].tracking_quality - first.track.inlier_ratio).abs() < 1e-6
+        );
+        assert!((scanner.color_views()[0].tracking_quality - 1.0).abs() < 1e-6);
+        assert_eq!(scanner.color_views()[0].exposure, 0.01);
+        assert_eq!(scanner.color_views()[0].gain, 1.5);
+        assert_eq!(scanner.color_views()[0].gamma, 2.2);
+        assert_eq!(scanner.color_views()[0].valid[0], 0);
+        assert_eq!(scanner.color_views()[0].valid[1], 1);
+
+        // Nothing in view: the tracker refuses it, and so does the colour log.
+        let empty = vec![f32::NAN; pixels];
+        let rejected = scanner.add_frame_with_color(
+            &empty,
+            WIDTH,
+            HEIGHT,
+            Some(frame_color(&rgb, &color_depth, &valid, 0.5)),
+        );
+        assert!(rejected.integration.is_none());
+        assert!(!rejected.track.accepted);
+        assert_eq!(scanner.color_view_count(), 1);
+        assert_eq!(scanner.color_supplied(), 2);
+        assert_eq!(scanner.color_dropped(), 1);
+        assert_eq!(scanner.rejected(), 1);
+
+        let third = scanner.add_frame_with_color(
+            &room,
+            WIDTH,
+            HEIGHT,
+            Some(frame_color(&rgb, &color_depth, &valid, 0.02)),
+        );
+        assert!(
+            third.track.accepted,
+            "the room should match the first frame"
+        );
+        assert_eq!(scanner.color_view_count(), 2);
+        assert_eq!(scanner.fused(), 2);
+        assert_eq!(scanner.color_views()[1].frame_index, 2);
+        assert!(
+            (scanner.color_views()[1].tracking_quality - third.track.inlier_ratio).abs() < 1e-6
+        );
+        assert_eq!(scanner.color_views()[1].exposure, 0.02);
+        assert_eq!(scanner.color_supplied(), 3);
+        assert_eq!(scanner.color_dropped(), 1);
+    }
+
+    #[test]
+    fn an_accepted_loop_closure_moves_colour_views_onto_the_corrected_poses() {
+        let mut scanner = scanner_with_loops();
+        let room = room_frame(WIDTH, HEIGHT, &intrinsics());
+        let pixels = WIDTH * HEIGHT;
+        let rgb = vec![10u8; pixels * 3];
+        let color_depth = vec![2.0f32; pixels];
+        let valid = vec![1u8; pixels];
+
+        for _ in 0..6 {
+            scanner.add_frame_with_color(
+                &room,
+                WIDTH,
+                HEIGHT,
+                Some(frame_color(&rgb, &color_depth, &valid, 0.01)),
+            );
+        }
+
+        assert!(scanner.loops() > 0, "no revisits were verified");
+        assert_eq!(scanner.color_view_count(), 6);
+
+        // A stale pose, as if colour were still sitting where odometry left a
+        // frame that the graph has since moved. Closing the loops has to
+        // overwrite it; leaving it would paint the mesh from the wrong camera.
+        scanner.color_views[0].pose = nalgebra::Isometry3::from_parts(
+            nalgebra::Translation3::new(5.0, 0.0, 0.0),
+            nalgebra::UnitQuaternion::identity(),
+        );
+
+        let report = scanner.close_loops();
+        assert!(report.rebuilt, "the correction was not applied");
+        assert!(!report.refused);
+
+        for view in scanner.color_views() {
+            let corrected = scanner.poses[view.frame_index];
+            let delta = view.pose.inverse() * corrected;
+            assert!(
+                delta.translation.vector.norm() < 1e-5,
+                "view {} stayed at {:?}, corrected pose is {:?}",
+                view.frame_index,
+                view.pose.translation.vector,
+                corrected.translation.vector
+            );
+        }
+        assert!(
+            scanner.color_views()[0].pose.translation.vector.norm() < 0.05,
+            "the sabotaged view was not replaced"
+        );
+    }
+
+    #[test]
+    fn scanner_config_defaults_to_best_colour_and_two_centimetres() {
+        let coloring = ScannerConfig::default().coloring;
+        assert_eq!(coloring.mode, ColorMode::Best);
+        assert!((coloring.depth_tolerance - 0.02).abs() < 1e-6);
+    }
+
+    #[test]
+    fn coloring_params_on_the_config_reach_the_mesh() {
+        // The mask is empty, so every vertex is unobserved and must come back
+        // as the fallback this config asked for. That is the whole check: the
+        // painter ran with `ScannerConfig::coloring`, not with a private default.
+        let mut scanner = Scanner::new(
+            intrinsics(),
+            ScannerConfig {
+                coloring: ColoringParams {
+                    fallback: [9, 8, 7],
+                    ..ColoringParams::default()
+                },
+                tsdf: TsdfParams {
+                    voxel_size: 0.04,
+                    truncation: 0.16,
+                    ..TsdfParams::default()
+                },
+                ..ScannerConfig::default()
+            },
+        );
+        let room = room_frame(WIDTH, HEIGHT, &intrinsics());
+        let pixels = WIDTH * HEIGHT;
+        let rgb = vec![40u8; pixels * 3];
+        let color_depth = vec![2.0f32; pixels];
+        let valid = vec![0u8; pixels];
+
+        scanner.add_frame_with_color(
+            &room,
+            WIDTH,
+            HEIGHT,
+            Some(frame_color(&rgb, &color_depth, &valid, 0.01)),
+        );
+
+        let colors = scanner.mesh().colors.expect("a colour view was kept");
+        assert!(!colors.is_empty(), "the room produced no vertices");
+        assert!(
+            colors.iter().all(|color| *color == [9, 8, 7]),
+            "mesh colour ignored ColoringParams on the config"
+        );
+    }
+
+    #[test]
+    fn colour_view_poses_stay_when_loop_closure_does_nothing() {
+        // No revisit detector, so close_loops has nothing to apply and must not
+        // rewrite the poses the views were captured with.
+        let mut scanner = scanner();
+        let room = room_frame(WIDTH, HEIGHT, &intrinsics());
+        let pixels = WIDTH * HEIGHT;
+        let rgb = vec![10u8; pixels * 3];
+        let color_depth = vec![2.0f32; pixels];
+        let valid = vec![1u8; pixels];
+
+        scanner.add_frame_with_color(
+            &room,
+            WIDTH,
+            HEIGHT,
+            Some(frame_color(&rgb, &color_depth, &valid, 0.01)),
+        );
+        scanner.add_frame_with_color(
+            &room,
+            WIDTH,
+            HEIGHT,
+            Some(frame_color(&rgb, &color_depth, &valid, 0.01)),
+        );
+
+        let stale = nalgebra::Isometry3::from_parts(
+            nalgebra::Translation3::new(5.0, 0.0, 0.0),
+            nalgebra::UnitQuaternion::identity(),
+        );
+        scanner.color_views[0].pose = stale;
+
+        let report = scanner.close_loops();
+        assert!(!report.rebuilt);
+        assert!(
+            (scanner.color_views()[0].pose.translation.vector - stale.translation.vector).norm()
+                < 1e-6
+        );
+    }
+
+    #[test]
+    fn export_without_colour_is_geometry_and_mirrors_after_extraction() {
+        let mut scanner = scanner();
+        let room = room_frame(WIDTH, HEIGHT, &intrinsics());
+        scanner.add_frame(&room, WIDTH, HEIGHT);
+
+        let unflipped = scanner.mesh();
+        let exported = scanner
+            .export_mesh(true, true)
+            .expect("the room has a surface");
+        let ExportMesh::Geometry(mirrored, coloring) = exported else {
+            panic!("an atlas was built with no colour views");
+        };
+        assert!(coloring.is_none());
+        assert!(mirrored.colors.is_none());
+        assert!(
+            unflipped
+                .vertices
+                .iter()
+                .zip(&mirrored.vertices)
+                .any(|(before, after)| (after.x + before.x).abs() < 1e-5 && before.x.abs() > 1e-3),
+            "mirroring did not negate a vertex that had an x coordinate"
+        );
+    }
+
+    #[test]
+    fn the_atlas_is_built_before_the_mirror() {
+        let mut scanner = Scanner::new(
+            intrinsics(),
+            ScannerConfig {
+                coloring: ColoringParams {
+                    // The extracted surface sits a voxel or so off the raw
+                    // depth. Wide enough that the view really paints a face,
+                    // which is what makes the UVs depend on the unflipped pose.
+                    depth_tolerance: 0.5,
+                    ..ColoringParams::default()
+                },
+                tsdf: TsdfParams {
+                    voxel_size: 0.04,
+                    truncation: 0.16,
+                    ..TsdfParams::default()
+                },
+                ..ScannerConfig::default()
+            },
+        );
+        let room = room_frame(WIDTH, HEIGHT, &intrinsics());
+        let pixels = WIDTH * HEIGHT;
+        let rgb = vec![40u8; pixels * 3];
+        let valid = vec![1u8; pixels];
+        scanner.add_frame_with_color(
+            &room,
+            WIDTH,
+            HEIGHT,
+            Some(frame_color(&rgb, &room, &valid, 0.01)),
+        );
+
+        let (raw, report) = scanner.textured_mesh().expect("atlas");
+        assert!(report.triangles > 0);
+        assert!(
+            report.unobserved < report.triangles,
+            "no face was observed, so the UV check would not catch a mirror that ran too early"
+        );
+
+        let exported = scanner.export_mesh(true, true).expect("export");
+        let ExportMesh::Atlas(textured, _) = exported else {
+            panic!("colour views did not produce an atlas");
+        };
+
+        let mut expected = raw.clone();
+        expected.flip_x();
+        assert_eq!(textured.uvs, expected.uvs);
+        assert_eq!(textured.indices, expected.indices);
+        assert_eq!(textured.atlas, expected.atlas);
+        for (before, after) in expected.positions.iter().zip(&textured.positions) {
+            assert!((after - before).norm() < 1e-5);
+        }
+        assert!(
+            raw.positions
+                .iter()
+                .zip(&textured.positions)
+                .any(|(before, after)| (after.x + before.x).abs() < 1e-4 && before.x.abs() > 1e-3),
+            "export left the atlas in the unflipped frame"
+        );
     }
 }

@@ -53,6 +53,39 @@ impl Mesh {
         (b - a).cross(&(c - a))
     }
 
+    /// Area-weighted vertex normals, one per vertex.
+    ///
+    /// Each triangle contributes its unnormalized cross product. That vector's
+    /// length is twice the triangle's area, so a large face pulls a shared
+    /// vertex harder than a small one. The sum is then normalized. A vertex
+    /// with no finite incident area — unused, or lying only on a degenerate
+    /// face — stays at zero. Colouring treats that zero as "no orientation"
+    /// rather than as a direction.
+    pub fn vertex_normals(&self) -> Vec<Vector3<f32>> {
+        let mut normals = vec![Vector3::zeros(); self.vertices.len()];
+
+        for triangle in &self.triangles {
+            let face = self.triangle_normal(triangle);
+            if !face.x.is_finite() || !face.y.is_finite() || !face.z.is_finite() {
+                continue;
+            }
+            for index in triangle {
+                normals[*index as usize] += face;
+            }
+        }
+
+        for normal in &mut normals {
+            let length = normal.norm();
+            if length > 1e-12 && length.is_finite() {
+                *normal /= length;
+            } else {
+                *normal = Vector3::zeros();
+            }
+        }
+
+        normals
+    }
+
     pub fn centroid(&self, triangle: &[u32; 3]) -> Vector3<f32> {
         let a = self.vertices[triangle[0] as usize];
         let b = self.vertices[triangle[1] as usize];
@@ -86,8 +119,8 @@ impl Mesh {
     /// Per-vertex colour is written as `uchar red/green/blue` when the mesh has
     /// one entry per vertex. Those are the conventional property names, which is
     /// what MeshLab, CloudCompare and Blender read. PLY has no texture
-    /// coordinates in its core format, so a proper texture atlas would need OBJ
-    /// or glTF rather than an extension here.
+    /// coordinates in its core format, so an atlas goes out through
+    /// [`crate::export`] as OBJ or glTF instead of an extension here.
     pub fn write_ply<W: Write>(&self, writer: &mut W) -> io::Result<()> {
         let colored = self
             .colors
@@ -232,6 +265,85 @@ mod tests {
 
         assert!(header.contains("element vertex 2"));
         assert_eq!(buffer.len() - header_end, 2 * 12);
+    }
+
+    #[test]
+    fn vertex_normals_are_unit_and_follow_the_face() {
+        let mesh = Mesh {
+            colors: None,
+            vertices: vec![
+                Vector3::new(0.0, 0.0, 0.0),
+                Vector3::new(2.0, 0.0, 0.0),
+                Vector3::new(0.0, 1.0, 0.0),
+            ],
+            triangles: vec![[0, 1, 2]],
+        };
+
+        let normals = mesh.vertex_normals();
+        for normal in &normals {
+            assert!((normal.norm() - 1.0).abs() < 1e-5, "{normal:?}");
+            assert!(normal.z > 0.99, "winding should face +z, got {normal:?}");
+        }
+    }
+
+    #[test]
+    fn a_larger_face_wins_the_shared_vertex() {
+        // v0 is shared. The +z triangle has cross-product length 16; the
+        // opposing one has length 1. Equal weighting would nearly cancel, and
+        // area weighting must keep the sign of the large face.
+        let mesh = Mesh {
+            colors: None,
+            vertices: vec![
+                Vector3::new(0.0, 0.0, 0.0),
+                Vector3::new(4.0, 0.0, 0.0),
+                Vector3::new(0.0, 4.0, 0.0),
+                Vector3::new(1.0, 0.0, 0.0),
+                Vector3::new(0.0, 1.0, 0.0),
+            ],
+            triangles: vec![[0, 1, 2], [0, 4, 3]],
+        };
+
+        let normals = mesh.vertex_normals();
+        assert!(normals[0].z > 0.99, "shared vertex {:?}", normals[0]);
+        assert!(normals[1].z > 0.99 && normals[2].z > 0.99);
+        assert!(normals[3].z < -0.99 && normals[4].z < -0.99);
+    }
+
+    #[test]
+    fn equal_opposing_areas_cancel() {
+        let mesh = Mesh {
+            colors: None,
+            vertices: vec![
+                Vector3::new(0.0, 0.0, 0.0),
+                Vector3::new(1.0, 0.0, 0.0),
+                Vector3::new(0.0, 1.0, 0.0),
+            ],
+            triangles: vec![[0, 1, 2], [0, 2, 1]],
+        };
+
+        let normals = mesh.vertex_normals();
+        assert!(
+            normals.iter().all(|normal| normal.norm() < 1e-5),
+            "{normals:?}"
+        );
+    }
+
+    #[test]
+    fn unused_and_degenerate_vertices_have_no_normal() {
+        let mesh = Mesh {
+            colors: None,
+            vertices: vec![
+                Vector3::new(0.0, 0.0, 0.0),
+                Vector3::new(1.0, 0.0, 0.0),
+                Vector3::new(2.0, 0.0, 0.0),
+                Vector3::new(5.0, 5.0, 5.0),
+            ],
+            triangles: vec![[0, 1, 2]],
+        };
+
+        let normals = mesh.vertex_normals();
+        assert_eq!(normals[0], Vector3::zeros());
+        assert_eq!(normals[3], Vector3::zeros());
     }
 
     #[test]

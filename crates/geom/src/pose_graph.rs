@@ -42,9 +42,7 @@
 //! (see the scanner: ICP fitness thresholds). On top of that, a Huber kernel here
 //! stops any one edge that survives verification from dominating.
 
-use nalgebra::{
-    DMatrix, Isometry3, Matrix6, Translation3, UnitQuaternion, Vector3, Vector6,
-};
+use nalgebra::{DMatrix, Isometry3, Matrix6, Translation3, UnitQuaternion, Vector3, Vector6};
 
 /// An observed relative pose between two nodes.
 #[derive(Clone, Copy, Debug)]
@@ -118,13 +116,7 @@ impl PoseGraph {
 
     /// Add a measurement. `measurement` must be the observed motion *from* `from`
     /// *to* `to`, i.e. `T_from^-1 T_to`.
-    pub fn add_edge(
-        &mut self,
-        from: usize,
-        to: usize,
-        measurement: Isometry3<f32>,
-        weight: f32,
-    ) {
+    pub fn add_edge(&mut self, from: usize, to: usize, measurement: Isometry3<f32>, weight: f32) {
         assert!(from < self.nodes.len(), "edge references a missing node");
         assert!(to < self.nodes.len(), "edge references a missing node");
         assert_ne!(from, to, "an edge from a node to itself constrains nothing");
@@ -218,8 +210,7 @@ impl PoseGraph {
             let mut gradient = DMatrix::<f32>::zeros(dimension, 1);
 
             for edge in &self.edges {
-                let (j_from, j_to, error) =
-                    self.linearise(edge, params.finite_difference_step);
+                let (j_from, j_to, error) = self.linearise(edge, params.finite_difference_step);
 
                 // Huber: quadratic near zero, linear in the tails, so one edge that
                 // survived verification but is still wrong cannot drag the map.
@@ -238,8 +229,7 @@ impl PoseGraph {
                         gradient[(j + k, 0)] += weight * j_to[(a, k)] * error[a];
 
                         for l in 0..6 {
-                            hessian[(i + k, i + l)] +=
-                                weight * j_from[(a, k)] * j_from[(a, l)];
+                            hessian[(i + k, i + l)] += weight * j_from[(a, k)] * j_from[(a, l)];
                             hessian[(i + k, j + l)] += weight * j_from[(a, k)] * j_to[(a, l)];
                             hessian[(j + k, i + l)] += weight * j_to[(a, k)] * j_from[(a, l)];
                             hessian[(j + k, j + l)] += weight * j_to[(a, k)] * j_to[(a, l)];
@@ -303,11 +293,7 @@ impl PoseGraph {
 
     /// Jacobians of one edge's residual with respect to its two nodes, by central
     /// differences. Columns are the six perturbation directions of that node.
-    fn linearise(
-        &self,
-        edge: &Edge,
-        step: f32,
-    ) -> (Matrix6<f32>, Matrix6<f32>, Vector6<f32>) {
+    fn linearise(&self, edge: &Edge, step: f32) -> (Matrix6<f32>, Matrix6<f32>, Vector6<f32>) {
         let from = self.nodes[edge.from];
         let to = self.nodes[edge.to];
         let base = error_between(&edge.measurement, &from, &to);
@@ -378,10 +364,7 @@ mod tests {
     use super::*;
 
     fn translate(x: f32, y: f32) -> Isometry3<f32> {
-        Isometry3::from_parts(
-            Translation3::new(x, y, 0.0),
-            UnitQuaternion::identity(),
-        )
+        Isometry3::from_parts(Translation3::new(x, y, 0.0), UnitQuaternion::identity())
     }
 
     fn relative(from: &Isometry3<f32>, to: &Isometry3<f32>) -> Isometry3<f32> {
@@ -495,7 +478,8 @@ mod tests {
         graph.optimize(&PoseGraphParams::default());
 
         assert_eq!(
-            graph.nodes()[0], anchor,
+            graph.nodes()[0],
+            anchor,
             "the anchor moved, so the gauge is not fixed"
         );
     }

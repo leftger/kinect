@@ -359,7 +359,11 @@ mod tests {
         (points, normals)
     }
 
-    fn perturbed(truth: &Isometry3<f32>, points: &[Vector3<f32>], normals: &[Vector3<f32>]) -> (Vec<Vector3<f32>>, Vec<Vector3<f32>>) {
+    fn perturbed(
+        truth: &Isometry3<f32>,
+        points: &[Vector3<f32>],
+        normals: &[Vector3<f32>],
+    ) -> (Vec<Vector3<f32>>, Vec<Vector3<f32>>) {
         (
             points.iter().map(|p| transform_point(truth, p)).collect(),
             normals.iter().map(|n| truth.rotation * n).collect(),
@@ -385,20 +389,26 @@ mod tests {
             ),
         );
 
-        let (raw_source_points, raw_source_normals) = perturbed(
-            &truth,
-            &target.points,
-            &target.normals,
-        );
+        let (raw_source_points, raw_source_normals) =
+            perturbed(&truth, &target.points, &target.normals);
         let source = IcpCloud::new(raw_source_points, raw_source_normals, 0.15);
 
-        let result = align(&source, &target, Isometry3::identity(), &IcpParams {
-            max_correspondence_distance: 0.15,
-            ..IcpParams::default()
-        });
+        let result = align(
+            &source,
+            &target,
+            Isometry3::identity(),
+            &IcpParams {
+                max_correspondence_distance: 0.15,
+                ..IcpParams::default()
+            },
+        );
 
         assert!(result.converged, "ICP should converge on this input");
-        assert!(result.inlier_ratio > 0.9, "inlier ratio {}", result.inlier_ratio);
+        assert!(
+            result.inlier_ratio > 0.9,
+            "inlier ratio {}",
+            result.inlier_ratio
+        );
 
         // Aligning source onto target must undo `truth`.
         let expected = truth.inverse();
@@ -436,7 +446,12 @@ mod tests {
         let far_normals = vec![Vector3::new(0.0, 0.0, 1.0); far_points.len()];
         let source = IcpCloud::new(far_points, far_normals, 0.1);
 
-        let result = align(&source, &target, Isometry3::identity(), &IcpParams::default());
+        let result = align(
+            &source,
+            &target,
+            Isometry3::identity(),
+            &IcpParams::default(),
+        );
 
         assert!(!result.converged);
         assert_eq!(result.correspondences, 0);
@@ -449,8 +464,24 @@ mod tests {
         let (points, normals) = wavy_surface(10);
         let target = IcpCloud::new(points, normals, 0.1);
 
-        assert!(!align(&empty, &target, Isometry3::identity(), &IcpParams::default()).converged);
-        assert!(!align(&target, &empty, Isometry3::identity(), &IcpParams::default()).converged);
+        assert!(
+            !align(
+                &empty,
+                &target,
+                Isometry3::identity(),
+                &IcpParams::default()
+            )
+            .converged
+        );
+        assert!(
+            !align(
+                &target,
+                &empty,
+                Isometry3::identity(),
+                &IcpParams::default()
+            )
+            .converged
+        );
     }
 
     /// Noise at the level measured from the real sensor (5 mm RMS) must not
@@ -480,10 +511,15 @@ mod tests {
             .collect();
         let source = IcpCloud::new(noisy_points, noisy_normals, 0.15);
 
-        let result = align(&source, &target, Isometry3::identity(), &IcpParams {
-            max_correspondence_distance: 0.15,
-            ..IcpParams::default()
-        });
+        let result = align(
+            &source,
+            &target,
+            Isometry3::identity(),
+            &IcpParams {
+                max_correspondence_distance: 0.15,
+                ..IcpParams::default()
+            },
+        );
 
         let expected = truth.inverse();
         let rotation_error = angle_between(&result.transform.rotation, &expected.rotation);
@@ -491,6 +527,9 @@ mod tests {
             (result.transform.translation.vector - expected.translation.vector).norm();
 
         assert!(rotation_error < 1.0, "rotation error {rotation_error} deg");
-        assert!(translation_error < 0.015, "translation error {translation_error} m");
+        assert!(
+            translation_error < 0.015,
+            "translation error {translation_error} m"
+        );
     }
 }

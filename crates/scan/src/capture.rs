@@ -50,6 +50,14 @@ pub struct CapturedColor {
     pub rgb: Vec<u8>,
     /// Undistorted depth in metres, same grid, for the visibility test.
     pub depth: Vec<f32>,
+    /// One byte per depth pixel. `1` where `rgb` was copied from the colour
+    /// camera, `0` where registration left it untouched. A zero colour sample
+    /// is also a real black pixel, so this mask is the only way to tell.
+    pub valid: Vec<u8>,
+    /// Colour-camera settings for this frame, copied off the colour packet.
+    pub exposure: f32,
+    pub gain: f32,
+    pub gamma: f32,
 }
 
 enum DepthBackend {
@@ -309,9 +317,11 @@ impl Capture {
                     .await
                     .map_err(|e| format!("processing colour packet: {e}"))?;
 
-                let (registered, undistorted_depth) =
-                    self.registration
-                        .undistort_depth_and_color(&color_frame, &depth_frame, false);
+                // The occlusion filter drops the farther depth pixel when two
+                // of them register onto the same colour sample.
+                let (registered, undistorted_depth, valid) = self
+                    .registration
+                    .undistort_depth_and_color_with_validity(&color_frame, &depth_frame, true);
 
                 self.captured = Some(CapturedColor {
                     rgb: registered.buffer,
@@ -320,6 +330,10 @@ impl Capture {
                         .iter()
                         .map(|millimetres| millimetres / 1000.0)
                         .collect(),
+                    valid,
+                    exposure: registered.exposure,
+                    gain: registered.gain,
+                    gamma: registered.gamma,
                 });
             }
 
