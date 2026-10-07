@@ -596,12 +596,20 @@ fn print_progress(index: usize, report: &FrameReport) {
         },
     };
 
+    // A frame that closes a gap jumped by that many frames' worth of motion. It
+    // is worth calling out: a scan that is only recovering between failures
+    // should look like one, rather than like a scan that is tracking.
+    let recovered = match report.track.recovered {
+        0 => String::new(),
+        gap => format!("  RECOVERED a {gap}-frame gap"),
+    };
+
     // `move` is the recovered sensor motion for this frame and `iters` the total
     // ICP iterations spent on it: together they are the quickest way to spot a
     // jump that the acceptance gates should have caught, or a solve that is
     // burning its whole budget without settling.
     println!(
-        "[scan] {:>4}  pts {:>6}  inliers {:>5.1}%  rmse {:>5.1} mm  move {:>5.1} cm  iters {:>3}  pos [{:>6.3} {:>6.3} {:>6.3}]  {outcome}",
+        "[scan] {:>4}  pts {:>6}  inliers {:>5.1}%  rmse {:>5.1} mm  move {:>5.1} cm  iters {:>3}  pos [{:>6.3} {:>6.3} {:>6.3}]  {outcome}{recovered}",
         index,
         report.points,
         report.track.inlier_ratio * 100.0,

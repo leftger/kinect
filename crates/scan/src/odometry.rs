@@ -36,6 +36,15 @@ impl Level {
             Level { max_distance: 0.05 },
             Level { max_distance: 0.10 },
             // Coarsest (quarter resolution): the basin the initial guess needs.
+            //
+            // Tried adding a still coarser eighth-resolution level at 0.40 m, on
+            // the reasoning that the second half of a real capture fails with
+            // inlier ratios near 3%, which is what "nothing within the radius"
+            // looks like. It is much worse, not better: this capture went from
+            // 57 fused frames to 19. A radius that wide lets the coarse level
+            // match the wrong surface outright, and the finer levels then refine
+            // a wrong answer instead of correcting one. This ladder is at the
+            // point where widening it starts costing more than it buys.
             Level { max_distance: 0.20 },
         ]
     }
@@ -100,6 +109,14 @@ impl Default for OdometryConfig {
     }
 }
 
+/// How many frames a gap may extrapolate the motion model over.
+///
+/// The constant-velocity model predicts the next frame well and the tenth badly:
+/// a sensor that has been travelling in a straight line for ten frames probably
+/// is not still doing so, and extrapolating that far walks the search origin off
+/// the real trajectory. Past this the tracker stops guessing where it went.
+const MAX_EXTRAPOLATED_GAP: usize = 2;
+
 #[derive(Clone, Copy, Debug)]
 pub struct TrackReport {
     /// Camera-to-world pose after this frame. Unchanged if the frame was rejected.
@@ -115,6 +132,13 @@ pub struct TrackReport {
     pub iterations: usize,
     /// Motion recovered from this frame, in metres. Zero when rejected.
     pub translation: f32,
+    /// How many consecutive frames were rejected before this one was accepted.
+    ///
+    /// Zero for the ordinary case. Non-zero means the pose just jumped by that
+    /// many frames' worth of motion, which is the recovery path earning its
+    /// keep; reported because a scan that is only recovering should look like
+    /// one rather than like a scan that is tracking.
+    pub recovered: usize,
 }
 
 /// Depth odometry, aligned either frame to frame or frame to model.
@@ -142,11 +166,28 @@ pub struct Odometry {
     /// Previous motion, used as the initial guess (constant-velocity model), and
     /// as the displacement that predicts where the next frame will be.
     guess: Isometry3<f32>,
+    /// The pose that has been *committed to*: the one this frame is fused at,
+    /// and the one [`Self::pose`] reports. It only moves when a frame is
+    /// accepted, because a rejected frame's motion was never trusted and
+    /// recording a gap is more honest than inventing a pose.
     pose: Isometry3<f32>,
-    /// The pose of the frame `previous` came from. The acceptance gates ask how
-    /// far the sensor *moved*, which is not the same as how far the correction
-    /// to the alignment was, and only this can tell them apart.
-    previous_pose: Isometry3<f32>,
+    /// Where the next alignment starts from: the *predicted* pose of the frame
+    /// `previous` came from.
+    ///
+    /// This is the piece that makes a rejected frame recoverable. It advances by
+    /// the constant-velocity guess on every frame, accepted or not, while
+    /// `pose` stands still. Without it a scan can never catch up after a
+    /// rejection: `pose * transform` adds a single inter-frame step per accepted
+    /// frame, so falling one frame behind is permanent.
+    ///
+    /// That is not hypothetical. On a real 150-frame capture this scanner
+    /// rejected 97 frames after one hard frame at frame 22, and the committed
+    /// pose ended 1.259 m from the origin -- 53 accepted frames at roughly
+    /// 2.4 cm each, which is exactly what "one step per accepted frame" predicts
+    /// and far short of the path the sensor actually travelled.
+    search: Isometry3<f32>,
+    /// Consecutive rejected frames since the last accepted one.
+    gap: usize,
 }
 
 impl Odometry {
@@ -160,7 +201,8 @@ impl Odometry {
             started: false,
             guess: Isometry3::identity(),
             pose: Isometry3::identity(),
-            previous_pose: Isometry3::identity(),
+            search: Isometry3::identity(),
+            gap: 0,
         }
     }
 
@@ -212,13 +254,14 @@ impl Odometry {
                 rmse: f32::INFINITY,
                 iterations: 0,
                 translation: 0.0,
+                recovered: 0,
             };
         }
 
         if !self.started {
             self.started = true;
             self.previous = Some(current);
-            self.previous_pose = self.pose;
+            self.search = self.pose;
             return TrackReport {
                 pose: self.pose,
                 accepted: false,
@@ -227,6 +270,7 @@ impl Odometry {
                 rmse: 0.0,
                 iterations: 0,
                 translation: 0.0,
+                recovered: 0,
             };
         }
 
@@ -236,10 +280,16 @@ impl Odometry {
             None
         };
 
-        // Either target is anchored at the last trusted pose and the solve starts
-        // from the motion guess, so frame-to-model and frame-to-frame differ only
-        // in *what* is being aligned to, not in the geometry of the solve.
-        let base = self.pose;
+        // The target is anchored at the *predicted* pose the reference frame came
+        // from, not at the last trusted one. Those differ exactly while a gap is
+        // open, and using the trusted pose there is what made a rejection
+        // permanent: the solve could only ever add one step to a pose that had
+        // stopped moving. Anchoring at the prediction lets a single accepted
+        // frame close the whole gap.
+        //
+        // `self.guess` is still the right starting correction, because `search`
+        // has already been advanced by it.
+        let base = self.search;
         let mut transform = self.guess;
 
         let mut inlier_ratio = 0.0;
@@ -292,14 +342,25 @@ impl Odometry {
 
         let candidate = base * transform;
 
-        // How far the sensor actually moved since the previous frame. Not the
-        // same as how far the alignment moved: with frame-to-model the render is
-        // already at the predicted pose, so the correction is small even when
-        // the sensor is travelling quickly, and gating on it would accept
-        // exactly the jumps these limits exist to catch.
-        let motion = self.previous_pose.inverse() * candidate;
+        // Motion between this frame and the frame the target came from. `base` is
+        // the predicted pose of *that* frame, so this is one frame's worth of
+        // movement however long the surrounding gap is -- which keeps the gates
+        // below measuring what they are meant to measure. Measuring from the last
+        // trusted pose instead would make a frame that closes a gap look like an
+        // implausible jump, and reject the very frame that recovers the scan.
+        let motion = base.inverse() * candidate;
         let translation = motion.translation.vector.norm();
         let rotation = motion.rotation.angle();
+
+        // How far this frame's pose departs from the last pose actually trusted.
+        // Closing a gap has to let the pose move further than one frame's worth,
+        // but only as far as the extrapolation was allowed to guess. An unbounded
+        // allowance is how a stale motion model becomes a two-metre teleport,
+        // which duplicates geometry instead of recovering it; past the allowance
+        // the frame is refused and the committed pose stands, which is exactly
+        // the behaviour that predates any of this.
+        let jump = self.pose.inverse() * candidate;
+        let allowance = (self.gap.min(MAX_EXTRAPOLATED_GAP) + 1) as f32;
 
         let rejection = if inlier_ratio < self.config.min_inlier_ratio {
             Some("too few inliers")
@@ -309,27 +370,34 @@ impl Odometry {
             Some("implausible translation")
         } else if rotation > self.config.max_rotation {
             Some("implausible rotation")
+        } else if jump.translation.vector.norm() > self.config.max_translation * allowance {
+            Some("recovery moved further than the gap allows")
+        } else if jump.rotation.angle() > self.config.max_rotation * allowance {
+            Some("recovery turned further than the gap allows")
         } else {
             None
         };
 
         if let Some(reason) = rejection {
-            // The pose does not move: the recovered motion is not trustworthy, so
-            // recording a gap is more honest than inventing a pose. The frame is
-            // simply not fused, and `pose`/`guess` stay as they were.
+            // The *committed* pose does not move: the recovered motion is not
+            // trustworthy, so recording a gap is more honest than inventing a
+            // pose. The frame is simply not fused.
             //
             // The *reference cloud* does advance, and that detail matters. Holding
             // the last good frame looks safer -- don't track against junk -- but
             // it is a trap: the sensor keeps moving while we hold, so the next
             // frame sits even further from the stale reference, exceeds the
-            // correspondence radius, and fails too. That is a permanent lock-out,
-            // and it reproduced exactly on real data: one rejected frame at 33 cm
-            // of motion took the scan from 47% inliers to 3% and never recovered.
-            //
-            // A reference cloud is only ever used in its own camera frame, so a
-            // fresh one is always the better target regardless of whether the pose
-            // attached to it is trusted.
+            // correspondence radius, and fails too. A reference cloud is only
+            // ever used in its own camera frame, so a fresh one is always the
+            // better target regardless of whether the pose attached to it is
+            // trusted.
             self.previous = Some(current);
+            // The search origin moves even though the pose does not, up to the
+            // point where continuing to guess is worse than standing still.
+            if self.gap < MAX_EXTRAPOLATED_GAP {
+                self.search *= self.guess;
+            }
+            self.gap += 1;
 
             return TrackReport {
                 pose: self.pose,
@@ -339,15 +407,18 @@ impl Odometry {
                 rmse,
                 iterations,
                 translation,
+                recovered: 0,
             };
         }
 
         // `candidate` is in world coordinates already: `base` maps the frame the
         // alignment was expressed in to the world, and `transform` maps this
         // frame's camera coordinates into that frame.
+        let recovered = self.gap;
+        self.gap = 0;
         self.pose = candidate;
+        self.search = candidate;
         self.guess = motion;
-        self.previous_pose = candidate;
         self.previous = Some(current);
 
         TrackReport {
@@ -358,6 +429,7 @@ impl Odometry {
             rmse,
             iterations,
             translation,
+            recovered,
         }
     }
 }
