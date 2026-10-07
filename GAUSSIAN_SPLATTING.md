@@ -184,29 +184,58 @@ ratios 75–92%) and then collapsing:
 | Total rejected | 97 of 150 | 9 and climbing, then locked out |
 | Pose after | frozen at [0.517 0.134 0.104] | frozen at [0.361 0.077 0.136] |
 
-Once a frame is rejected the pose stops moving, so the next frame is measured
-from a stale position, which is precisely the lock-out cascade the comments in
-`odometry.rs` warn about. Something around frame 19–22 — a fast pan, a
-reflective or featureless surface, or the sensor being covered — breaks the
-correspondence and neither tracker gets it back.
+**What frames 1–22 are not:** they are not a fast pan, and not junk depth. The
+depth decoder clips every frame at 4.50 m, and no frame in the capture has a
+single reading beyond the working range, so the "junk far past the rated range"
+the README warns about is not what breaks it. What does change at frame 22 is the
+scene: the median scene depth jumps from 1.97 m to 2.95 m in one frame while the
+tracked pose moves 2.5 cm, which is a large view change the tracker is not
+keeping up with. From frame 22 on the inlier ratio is bimodal — frames either
+match well (75–90%) or not at all (1–45%) — and the rejection map for the whole
+capture is:
 
-Work it in this order:
+```text
+frames   1- 50:  ......................XXX.XXXXXXXXXXXXXX.XXXXXXXXX
+frames  51-100:  XXXXXXX.XXXXXXXX.XXXXXXX.X.XX.XXX.X.XXXXX.XX.XXX..
+frames 101-150:  .X..XX.XX....XX.X......XXXXXXXXXX.X.XXXXXXXXXX.XXX
+```
 
-1. **Find out what happens at frame 19.** Replay `--frames 30` and dump the
-   trajectory and a few depth frames around it. This is a concrete, bounded
-   investigation and it is worth doing before any tuning.
-2. **Log which gate trips and when.** The end-of-frame line already reports the
-   reason; what is missing is the *sequence*. A rejection histogram per run
-   would show lock-out versus genuine failure immediately.
-3. **Consider recovery rather than prevention.** If a frame is unusable, the
-   honest options are to keep tracking against the model (which does not move)
-   or to re-localise against it, which is exactly what frame-to-model is for —
-   but the render must be *searchable* over a wider radius, not just a few
-   centimetres from the last pose. This is where frame-to-model would earn its
-   place, and it is a better use of it than drift reduction.
-4. **Check the capture itself.** One `.k2df` that defeats both trackers is thin
-   evidence. Recording a slow, deliberate walk with no fast pans would separate
-   "the tracker is fragile" from "this capture is hard".
+**The structural defect, now fixed.** A rejected frame's motion was discarded
+*and* the committed pose stood still, which is right — the motion was not
+trusted — but nothing could then make up the difference: `pose * transform` adds
+a single inter-frame step per *accepted* frame, so falling one frame behind was
+permanent. The arithmetic confirms it: 53 accepted frames at roughly 2.4 cm each
+predicts 1.259 m of path, which is exactly what the run reported. A separate
+search origin now advances by the motion model even when the committed pose does
+not, with the extrapolation capped at two frames and a recovery bounded to a jump
+that allowance justifies. On this capture: **57 fused frames instead of 53, path
+1.894 m → 3.065 m, largest single step 40 cm** (198 cm without the bound).
+
+**Still open, and it is the main problem.** 93 of 150 frames are still rejected.
+The recovery is bounded and helps at the margin; it does not make the failing
+frames track. What follows from the evidence above:
+
+1. **The failure is not "no correspondence within the radius".** That was the
+   obvious reading of inlier ratios near 3%, and the obvious fix — an
+   eighth-resolution pyramid level at 0.40 m — is *much worse*: 19 fused frames
+   instead of 57. A radius that wide lets the coarse level match the wrong
+   surface outright and the finer levels then refine a wrong answer. The ladder
+   in `Level::handheld_default` is at the point where widening it costs more
+   than it buys, and that is now recorded there so nobody retries it.
+2. **So the frames are either genuinely far apart in viewpoint, or the scene is
+   hard to match** (repetitive structure, or largely planar). Distinguishing
+   those needs a capture with slower motion: if every frame matches at 5 cm/frame
+   and none do at 15 cm/frame, it is motion. **This capture cannot answer it.**
+3. **The real fix is a search, not a guess.** Projective association cannot look
+   for a surface that has left the frame; `geom::icp::align` with a `VoxelCloud`
+   can, and its module comment already says it exists for "aligning keyframes
+   that are far apart". Re-localising a lost frame against the last trusted cloud
+   with a wide *spatial* search, gated by a strict inlier requirement rather than
+   by the motion model, is the principled version of what the bounded
+   extrapolation only approximates.
+4. **Get a capture with a ground truth.** A deliberate slow walk out and back is
+   the single most valuable piece of test data this project could have, and every
+   pose number in this document is currently unfalsifiable without it.
 
 **M2.2 — Then drift.** Frame-to-model is implemented but **not yet shown to
 help, and on this recording it does worse** — it locks out three frames earlier
