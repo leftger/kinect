@@ -7,7 +7,7 @@
 //! ```text
 //! scan live   [--frames N] [--out mesh.ply] [--voxel M] [--no-filter] [--color]
 //!             [--color-mode best|blend|average] [--color-depth-tolerance M]
-//!             [--gpu] [--loop-closure] [--viewer]
+//!             [--gpu] [--loop-closure] [--viewer] [--dataset DIR]
 //! scan record  --out capture.k2df [--frames N] [--no-filter] [--drain-color] [--gpu]
 //! scan replay  --in capture.k2df [--out mesh.ply] [--voxel M] [--frames N] [--loop-closure]
 //! ```
@@ -16,8 +16,12 @@
 //! byte-identical input instead of a live sensor: the scene changes between live
 //! runs, so two parameter sets never see the same data. A `.k2df` file stores
 //! depth only, so `--color` paints a live scan and does nothing on replay.
+//!
+//! `--dataset` turns a colour scan into something a Gaussian-splatting trainer
+//! can read; see [`dataset`]. It needs `live --color`, for the same reason.
 
 mod capture;
+mod dataset;
 mod loop_closure;
 mod odometry;
 mod recording;
@@ -37,6 +41,7 @@ use geom::texturing::TexturingReport;
 use geom::tsdf::TsdfParams;
 use loop_closure::LoopClosureConfig;
 use nalgebra::Vector3;
+use odometry::OdometryConfig;
 use scanner::{ExportMesh, FrameColor, FrameReport, Scanner, ScannerConfig};
 
 const DEFAULT_FRAMES: usize = 60;
@@ -84,6 +89,20 @@ struct Options {
     /// Un-mirror the reconstruction horizontally so real-world left and right match.
     /// True by default: the Kinect v2 sensor reads out mirrored frames.
     unmirror: bool,
+    /// Track each frame against a render of the fused model instead of against
+    /// the previous frame, so tracking error stops accumulating.
+    ///
+    /// Costs a raycast per frame, which is why it is not the default: at sensor
+    /// resolution that is around a second per frame on this hardware. Live
+    /// capture becomes a slideshow, so the useful place for it is `replay`,
+    /// where wall clock does not matter and the poses it produces are the ones
+    /// a scan is ultimately graded on.
+    frame_to_model: bool,
+    /// Export a Nerfstudio dataset for a Gaussian-splatting trainer: the colour
+    /// views, their masks, `transforms.json`, and an initial point cloud.
+    /// Needs `--color`, because the dataset is built from the colour views.
+    /// The dataset always stays in the sensor frame; the mirror does not apply.
+    dataset: Option<PathBuf>,
 }
 
 impl Default for Options {
@@ -102,6 +121,8 @@ impl Default for Options {
             color_depth_tolerance: ColoringParams::default().depth_tolerance,
             viewer: false,
             unmirror: true,
+            frame_to_model: false,
+            dataset: None,
         }
     }
 }
@@ -187,10 +208,38 @@ fn parse_args(
             "--gpu" => options.gpu = true,
             "--mirror" => options.unmirror = false,
             "--no-mirror" | "--unmirror" => options.unmirror = true,
+            "--frame-to-model" => options.frame_to_model = true,
+            "--dataset" => {
+                options.dataset = Some(PathBuf::from(next_value(&mut args, "--dataset")?))
+            }
             "-h" | "--help" => return Ok((Command::Help, options)),
             other => {
                 return Err(format!("unrecognised argument `{other}` (try --help)").into());
             }
+        }
+    }
+
+    // A dataset is built from the colour views, which only a live capture has.
+    // Checked here rather than at the end so a mistyped invocation fails before
+    // the sensor is opened and a scan is spent.
+    if options.dataset.is_some() {
+        match &command {
+            Command::Live if options.color => {}
+            Command::Live => {
+                return Err(
+                    "--dataset needs --color: the dataset is built from the colour views, \
+                     and a depth-only scan has none"
+                        .into(),
+                )
+            }
+            Command::Record | Command::Replay => {
+                return Err(
+                    "--dataset needs `live`: a .k2df recording stores depth frames only, \
+                     so there is no colour to build a dataset from"
+                        .into(),
+                )
+            }
+            Command::Help => {}
         }
     }
 
@@ -227,7 +276,7 @@ fn usage_text() -> String {
          USAGE:\n\
          \x20 scan live   [--frames N] [--out mesh.ply] [--voxel M] [--no-filter] [--color]\n\
          \x20             [--color-mode best|blend|average] [--color-depth-tolerance M]\n\
-         \x20             [--gpu] [--loop-closure] [--viewer]\n\
+         \x20             [--gpu] [--loop-closure] [--viewer] [--dataset DIR]\n\
          \x20 scan record  --out capture.k2df [--frames N] [--no-filter] [--drain-color] [--gpu]\n\
          \x20 scan replay  --in capture.k2df [--out mesh.ply] [--voxel M] [--frames N]\n\
          \x20             [--loop-closure]\n\
@@ -283,8 +332,31 @@ fn usage_text() -> String {
          \x20               returns somewhere it has already been.\n\
          \x20 --viewer      Open a live window. Needs `--features viewer` and a\n\
          \x20               display. Closing the window stops the scan.\n\
+         \x20 --frame-to-model\n\
+         \x20               Track each frame against a render of the fused model\n\
+         \x20               instead of against the previous frame. Frame-to-frame\n\
+         \x20               error is added to the next frame, so drift grows with the\n\
+         \x20               length of the scan; aligning to the model stops it\n\
+         \x20               compounding. Costs a raycast per frame -- roughly a second\n\
+         \x20               at sensor resolution on this hardware -- so it is off by\n\
+         \x20               default and most useful with `replay`, where wall clock\n\
+         \x20               does not matter and the poses are what the scan is graded\n\
+         \x20               on.\n\
          \x20 --mirror      Keep the raw sensor mirror orientation instead of flipping\n\
          \x20               X to match real-world coordinates (un-mirrored by default).\n\
+         \x20               A dataset is always written in the sensor frame, so this\n\
+         \x20               does not apply to --dataset.\n\
+         \x20 --dataset DIR With --color on live: also write a dataset a Gaussian-\n\
+         \x20               splatting trainer can read. DIR gains images/ (the\n\
+         \x20               registered colour, one PNG per kept view), masks/ (white\n\
+         \x20               where registration copied a colour sample, so the trainer\n\
+         \x20               ignores the holes), transforms.json (depth intrinsics and\n\
+         \x20               the pose of every view), and init.ply (the scanned surface,\n\
+         \x20               coloured, as the initial Gaussian positions).\n\
+         \x20               Images are at depth resolution, 512x424, not the colour\n\
+         \x20               sensor's own size: registration copies colour into the\n\
+         \x20               depth grid, and that is what keeps the intrinsics and the\n\
+         \x20               poses exact. Needs `live`: a .k2df recording has no colour.\n\
          \n\
          A trajectory PLY is written alongside the mesh as <out>.trajectory.ply,\n\
          which is the quickest way to see how badly the pose has drifted."
@@ -439,6 +511,10 @@ fn scanner_config(options: &Options) -> ScannerConfig {
     ScannerConfig {
         tsdf: options.tsdf,
         loop_closure: options.loop_closure.then(LoopClosureConfig::default),
+        odometry: OdometryConfig {
+            frame_to_model: options.frame_to_model,
+            ..OdometryConfig::default()
+        },
         coloring: ColoringParams {
             mode: options.color_mode,
             depth_tolerance: options.color_depth_tolerance,
@@ -701,6 +777,32 @@ pub(crate) fn finish(scanner: &Scanner, options: &Options) -> Result<(), Box<dyn
         trajectory_points.len()
     );
 
+    if let Some(dir) = &options.dataset {
+        // Written last, and after the poses are final: `close_loops` ran in
+        // `finish_scan`, and a correction moves the views onto the rebuilt
+        // trajectory. A dataset assembled before that would carry the drifted
+        // poses the trainer is most sensitive to.
+        println!("[scan] writing dataset to {} ...", dir.display());
+        let report = dataset::write_dataset(scanner, dir)?;
+
+        println!(
+            "[scan] dataset: {} views, {} initial points in {}",
+            report.views,
+            report.points,
+            report.dir.display()
+        );
+        if report.skipped > 0 {
+            println!(
+                "[scan]   {} views skipped: their pose could not be written",
+                report.skipped
+            );
+        }
+        println!(
+            "[scan]   images, poses and init.ply are all in the sensor frame, so they agree; \
+             --mirror does not apply to a dataset"
+        );
+    }
+
     Ok(())
 }
 
@@ -807,6 +909,68 @@ mod tests {
                 "{value}: {error}"
             );
         }
+    }
+
+    #[test]
+    fn a_dataset_path_is_parsed_and_a_colour_scan_carries_it() {
+        let (command, options) =
+            parse_args(words(&["live", "--color", "--dataset", "out/room-dataset"]))
+                .expect("parse");
+
+        assert!(matches!(command, Command::Live));
+        assert_eq!(
+            options.dataset,
+            Some(PathBuf::from("out/room-dataset")),
+            "--dataset should carry its path"
+        );
+        // The dataset is built from the colour views, so the flag that produces
+        // them has to survive alongside it.
+        assert!(options.color);
+    }
+
+    #[test]
+    fn dataset_without_color_is_refused_before_the_sensor_is_opened() {
+        let error = parse_args(words(&["live", "--dataset", "out/d"])).expect_err("no colour");
+
+        assert!(
+            error.to_string().contains("--dataset needs --color"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn dataset_is_refused_for_the_depth_only_commands() {
+        for command in ["record", "replay"] {
+            let error = parse_args(words(&[command, "--dataset", "out/d"])).expect_err(command);
+            assert!(
+                error.to_string().contains("--dataset needs `live`"),
+                "{command}: {error}"
+            );
+            assert!(
+                error.to_string().contains(".k2df"),
+                "{command} should say why: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn dataset_needs_a_value() {
+        let error = parse_args(words(&["live", "--color", "--dataset"])).expect_err("missing");
+        assert!(error.to_string().contains("needs a value"), "{error}");
+    }
+
+    #[test]
+    fn usage_documents_the_dataset_and_its_limits() {
+        let usage = usage_text();
+
+        assert!(usage.contains("--dataset DIR"), "{usage}");
+        assert!(usage.contains("transforms.json"), "{usage}");
+        assert!(usage.contains("init.ply"), "{usage}");
+        assert!(usage.contains("masks/"), "{usage}");
+        // The resolution ceiling is stated rather than discovered.
+        assert!(usage.contains("512x424"), "{usage}");
+        // And that a recording cannot be turned into one after the fact.
+        assert!(usage.contains(".k2df recording has no colour"), "{usage}");
     }
 
     #[test]

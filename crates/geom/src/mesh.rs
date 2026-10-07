@@ -199,6 +199,67 @@ pub fn save_points_ply(path: &Path, points: &[Vector3<f32>]) -> io::Result<()> {
     writer.flush()
 }
 
+/// Binary little-endian PLY of points, optionally with per-point colour.
+///
+/// Deliberately *not* the same shape as [`Mesh::write_ply`]: there is no `face`
+/// element, because a consumer that wants a point cloud rather than a surface
+/// keys off the absence of one. Colour goes out as `uchar red/green/blue`, the
+/// conventional names.
+///
+/// The property set matters to Gaussian-splatting loaders. They read `x/y/z`,
+/// take `red/green/blue` as the colour, and leave anything they do not find at
+/// their own defaults. Writing Gaussian attributes here — `scale_0`, `opacity`,
+/// `rot_0`, `f_dc_*` — would replace those defaults with zeros, which is worse
+/// than saying nothing.
+pub fn write_colored_points_ply<W: Write>(
+    writer: &mut W,
+    points: &[Vector3<f32>],
+    colors: Option<&[[u8; 3]]>,
+) -> io::Result<()> {
+    let colored = colors.is_some_and(|colors| colors.len() == points.len());
+
+    write!(
+        writer,
+        "ply\nformat binary_little_endian 1.0\n\
+         element vertex {}\n\
+         property float x\nproperty float y\nproperty float z\n",
+        points.len()
+    )?;
+
+    if colored {
+        write!(
+            writer,
+            "property uchar red\nproperty uchar green\nproperty uchar blue\n"
+        )?;
+    }
+
+    write!(writer, "end_header\n")?;
+
+    for (index, p) in points.iter().enumerate() {
+        for c in [p.x, p.y, p.z] {
+            writer.write_all(&c.to_le_bytes())?;
+        }
+        if colored {
+            if let Some(colors) = colors {
+                writer.write_all(&colors[index])?;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+pub fn save_colored_points_ply(
+    path: &Path,
+    points: &[Vector3<f32>],
+    colors: Option<&[[u8; 3]]>,
+) -> io::Result<()> {
+    let file = File::create(path)?;
+    let mut writer = BufWriter::new(file);
+    write_colored_points_ply(&mut writer, points, colors)?;
+    writer.flush()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -264,6 +325,58 @@ mod tests {
         let header = std::str::from_utf8(&buffer[..header_end]).expect("utf8 header");
 
         assert!(header.contains("element vertex 2"));
+        assert_eq!(buffer.len() - header_end, 2 * 12);
+    }
+
+    #[test]
+    fn colored_point_ply_carries_rgb_and_no_face_element() {
+        let points = vec![Vector3::new(1.0, 2.0, 3.0), Vector3::new(-4.0, 5.0, -6.0)];
+        let colors = vec![[9u8, 8, 7], [6, 5, 4]];
+
+        let mut buffer = Vec::new();
+        write_colored_points_ply(&mut buffer, &points, Some(&colors)).expect("write");
+
+        let header_end = buffer
+            .windows(11)
+            .position(|w| w == b"end_header\n")
+            .expect("header")
+            + 11;
+        let header = std::str::from_utf8(&buffer[..header_end]).expect("utf8 header");
+
+        assert!(header.contains("element vertex 2"));
+        assert!(header.contains("property uchar red"));
+        assert!(
+            !header.contains("element face"),
+            "a point cloud must not advertise faces: {header}"
+        );
+
+        // Two points, 12 bytes of position and 3 of colour each.
+        assert_eq!(buffer.len() - header_end, 2 * 15);
+        assert_eq!(&buffer[header_end + 12..header_end + 15], &[9, 8, 7]);
+        assert_eq!(&buffer[header_end + 27..header_end + 30], &[6, 5, 4]);
+    }
+
+    #[test]
+    fn colored_point_ply_drops_a_mismatched_colour_buffer() {
+        // A colour list that does not line up with the points would silently
+        // shift every sample by one. Fall back to uncoloured instead.
+        let points = vec![Vector3::new(0.0, 0.0, 0.0), Vector3::new(1.0, 1.0, 1.0)];
+        let colors = vec![[1u8, 2, 3]];
+
+        let mut buffer = Vec::new();
+        write_colored_points_ply(&mut buffer, &points, Some(&colors)).expect("write");
+
+        // Only the header is text; the vertices after it are binary.
+        let header_end = buffer
+            .windows(11)
+            .position(|w| w == b"end_header\n")
+            .expect("header")
+            + 11;
+        let header = std::str::from_utf8(&buffer[..header_end]).expect("utf8 header");
+
+        assert!(header.contains("element vertex 2"));
+        assert!(!header.contains("property uchar red"));
+        // Uncoloured points are 12 bytes each, with no colour bytes appended.
         assert_eq!(buffer.len() - header_end, 2 * 12);
     }
 
