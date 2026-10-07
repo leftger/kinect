@@ -64,6 +64,47 @@ impl Default for Block {
     }
 }
 
+/// One-entry cache over the block map, for the ray march.
+///
+/// A ray samples the field every few centimetres, and a block is `BLOCK` voxels
+/// on a side -- 16 cm at the default 2 cm voxels -- so consecutive samples land
+/// in the same block most of the time. Without this every sample paid a SipHash
+/// of the cell key and a probe into a map whose values are 4 KB, which is what
+/// made a full-resolution render take tens of seconds.
+struct BlockCache<'a> {
+    blocks: &'a HashMap<Cell, Block>,
+    cell: Cell,
+    block: Option<&'a Block>,
+}
+
+impl<'a> BlockCache<'a> {
+    fn new(blocks: &'a HashMap<Cell, Block>) -> Self {
+        Self {
+            blocks,
+            // No real block can sit here, so the first query misses the cache
+            // rather than reading whatever was left in it.
+            cell: [i32::MIN; 3],
+            block: None,
+        }
+    }
+
+    /// The block at `cell`, or `None` if it was never allocated.
+    ///
+    /// Returning `&'a Block` rather than `&self`'s borrow lets the caller hold
+    /// the block across further `get` calls, which is what makes the cache worth
+    /// having.
+    #[inline]
+    fn get(&mut self, cell: Cell) -> Option<&'a Block> {
+        if cell == self.cell {
+            return self.block;
+        }
+        let block = self.blocks.get(&cell);
+        self.cell = cell;
+        self.block = block;
+        block
+    }
+}
+
 /// Statistics from one [`TsdfVolume::integrate`] call.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct IntegrationStats {
@@ -73,6 +114,27 @@ pub struct IntegrationStats {
     pub examined_voxels: usize,
     /// Blocks allocated for the first time this frame.
     pub new_blocks: usize,
+}
+
+/// What [`TsdfVolume::raycast`] rendered.
+pub struct RaycastImage {
+    pub width: usize,
+    pub height: usize,
+    /// Camera-space z in metres, row-major, in the same convention as
+    /// [`DepthImage`]. `NaN` where no surface was found along the ray.
+    pub depth: Vec<f32>,
+}
+
+impl RaycastImage {
+    /// Pixels that found a surface.
+    pub fn hits(&self) -> usize {
+        self.depth.iter().filter(|d| d.is_finite()).count()
+    }
+
+    /// The render as a depth image, for anything that already consumes one.
+    pub fn as_depth_image(&self) -> DepthImage<'_> {
+        DepthImage::new(self.width, self.height, &self.depth)
+    }
 }
 
 pub struct TsdfVolume {
@@ -264,6 +326,249 @@ impl TsdfVolume {
     /// Minimum observation count needed for a voxel to count as observed.
     pub fn min_weight_for_extraction(&self) -> f32 {
         0.0
+    }
+
+    /// Distance to the nearest surface at `point`, in metres, trilinearly
+    /// interpolated between voxel corners. `None` only when *no* surrounding
+    /// corner was observed.
+    ///
+    /// Voxel values belong to *corners*, not centres: `integrate` evaluates the
+    /// field at `voxel_size * index`, the cell's minimum corner. Reading the
+    /// value of whichever voxel happens to contain a query therefore attributes
+    /// one corner's distance to the whole cell -- and a ray only ever samples
+    /// points *after* the corner it landed in, so that error is one-directional
+    /// rather than noise. Measured at 2 cm voxels it was +18 mm on average and
+    /// 60 mm at worst, which matters because the render is the target every pose
+    /// is measured against. Interpolating between the corners removes it.
+    ///
+    /// Corners that were never observed are left out of the average rather than
+    /// failing the sample. Demanding all eight shrinks the rendered surface to
+    /// the cells fully enclosed by the truncation band, which on a real frame
+    /// costs about half the pixels and leaves the alignment too little to match
+    /// against. Weighting by the observed corners is what the weight array is
+    /// for, and a cell with nothing observed still reads as unknown so the march
+    /// keeps striding.
+    pub fn distance_at(&self, point: &Vector3<f32>) -> Option<f32> {
+        let mut cache = BlockCache::new(&self.blocks);
+        self.sample(&mut cache, point)
+    }
+
+    /// [`Self::distance_at`], re-using `cache` across calls.
+    ///
+    /// A ray march samples the field every few centimetres, so threading the
+    /// cache through is the difference between one hash probe per sample and one
+    /// per block.
+    fn sample(&self, cache: &mut BlockCache<'_>, point: &Vector3<f32>) -> Option<f32> {
+        let size = self.params.voxel_size;
+        let base = self.voxel_of(point);
+
+        // Position inside the cell, in [0, 1). `voxel_of` floors, so no
+        // component can be negative.
+        let fraction = Vector3::new(
+            point.x / size - base[0] as f32,
+            point.y / size - base[1] as f32,
+            point.z / size - base[2] as f32,
+        );
+
+        // The eight corners occupy the 2x2x2 voxel neighbourhood at `base`. That
+        // neighbourhood sits inside a single block unless `base` lies on the
+        // block's far face -- unlikely on all three axes at once -- so usually
+        // one probe covers all eight corners instead of eight probes covering
+        // them.
+        let cell = self.block_of(base);
+        let local = [
+            base[0].rem_euclid(BLOCK),
+            base[1].rem_euclid(BLOCK),
+            base[2].rem_euclid(BLOCK),
+        ];
+        let single_block = local.iter().all(|axis| *axis < BLOCK - 1);
+
+        let single = if single_block { cache.get(cell) } else { None };
+        if single_block && single.is_none() {
+            // The whole neighbourhood is unobserved, so nothing here is known.
+            return None;
+        }
+
+        let mut weighted = 0.0f32;
+        let mut total_weight = 0.0f32;
+
+        for index in 0..8usize {
+            let offset = [
+                (index & 1) as i32,
+                ((index >> 1) & 1) as i32,
+                ((index >> 2) & 1) as i32,
+            ];
+
+            // Trilinear weight: a corner on the far side of the query along an
+            // axis is weighted by how far past it the query lies.
+            let weight = [fraction.x, fraction.y, fraction.z]
+                .iter()
+                .enumerate()
+                .map(|(axis, f)| if offset[axis] == 1 { *f } else { 1.0 - *f })
+                .product::<f32>();
+
+            let value = match single {
+                Some(block) => {
+                    let index = ((local[0] + offset[0])
+                        + (local[1] + offset[1]) * BLOCK
+                        + (local[2] + offset[2]) * BLOCK * BLOCK)
+                        as usize;
+                    if block.weight[index] <= 0.0 {
+                        continue;
+                    }
+                    block.distance[index]
+                }
+                None => {
+                    // Straddling a block face: this corner resolves through its
+                    // own block.
+                    let corner = [
+                        base[0] + offset[0],
+                        base[1] + offset[1],
+                        base[2] + offset[2],
+                    ];
+                    let Some(block) = cache.get(self.block_of(corner)) else {
+                        continue;
+                    };
+                    let index = (corner[0].rem_euclid(BLOCK)
+                        + corner[1].rem_euclid(BLOCK) * BLOCK
+                        + corner[2].rem_euclid(BLOCK) * BLOCK * BLOCK)
+                        as usize;
+                    if block.weight[index] <= 0.0 {
+                        continue;
+                    }
+                    block.distance[index]
+                }
+            };
+
+            weighted += value * weight;
+            total_weight += weight;
+        }
+
+        if total_weight <= 0.0 {
+            return None;
+        }
+
+        Some(weighted / total_weight * self.params.truncation)
+    }
+
+    /// Render the fused surface as a depth image viewed from `camera_to_world`.
+    ///
+    /// This is what makes frame-to-model tracking possible: aligning a live frame
+    /// to a *render of the model* instead of to the previous frame is what stops
+    /// tracking error accumulating frame by frame. The output is an ordinary
+    /// depth image in the same convention as [`DepthImage`] -- camera-space z, in
+    /// metres, `NaN` where no surface was found -- so the existing projective
+    /// alignment can be pointed straight at it.
+    ///
+    /// Cost is per pixel and independent of how large the model has grown, which
+    /// matters: real scans reach 150k blocks and 600 MB, so anything that walked
+    /// the volume once per frame could not keep up.
+    ///
+    /// # How a ray is marched
+    ///
+    /// The integrator only ever writes a voxel within `truncation` of a measured
+    /// surface, so a voxel that was never observed proves the nearest surface is
+    /// *further* than the truncation band. Two consequences are used here:
+    ///
+    /// * In unobserved space the ray may stride a full truncation band without
+    ///   stepping over anything, which is what keeps empty space cheap.
+    /// * When the march finally meets a negative sample, the last positive sample
+    ///   is either a real distance or the band width, and either is a sound lower
+    ///   bound for interpolating where the crossing lies.
+    ///
+    /// Inside the band the stored value is a genuine (truncated) distance, so
+    /// stepping by the sample itself -- sphere tracing -- lands on the surface
+    /// from the first positive sample onwards.
+    pub fn raycast(
+        &self,
+        intrinsics: &Intrinsics,
+        camera_to_world: &Isometry3<f32>,
+        width: usize,
+        height: usize,
+    ) -> RaycastImage {
+        let truncation = self.params.truncation;
+        // Half a band, not a voxel. A voxel-sized floor forces up to
+        // `range / voxel_size` steps -- 400 at the defaults -- and it exists
+        // only to stop a distance near zero stalling the march. Overshooting the
+        // surface by up to half a band is harmless: the sample lands inside the
+        // band on the far side, reads negative, and the crossing is then placed
+        // by interpolation between the last two samples.
+        let min_step = truncation * 0.5;
+        let (near, far) = (self.params.min_depth, self.params.max_depth);
+
+        let mut depth = vec![f32::NAN; width * height];
+
+        for y in 0..height {
+            for x in 0..width {
+                // `direction.z` is 1, so the ray parameter *is* the camera-space
+                // depth, and no separate division is needed at the hit.
+                let direction = intrinsics.back_project(x as f32 + 0.5, y as f32 + 0.5, 1.0);
+                if let Some(hit) =
+                    self.march(camera_to_world, &direction, near, far, truncation, min_step)
+                {
+                    depth[y * width + x] = hit;
+                }
+            }
+        }
+
+        RaycastImage {
+            width,
+            height,
+            depth,
+        }
+    }
+
+    /// One ray, from the near plane to the far plane. Returns the camera-space
+    /// depth of the first surface crossing, or `None`.
+    fn march(
+        &self,
+        camera_to_world: &Isometry3<f32>,
+        direction: &Vector3<f32>,
+        near: f32,
+        far: f32,
+        truncation: f32,
+        min_step: f32,
+    ) -> Option<f32> {
+        // One cache for the whole ray: successive samples are centimetres apart
+        // and a block is 16 cm on a side, so most steps re-use the same block.
+        let mut cache = BlockCache::new(&self.blocks);
+        let mut t = near;
+
+        // The sample before the current one. Before the ray reaches the band
+        // nothing is known, but "at least a band away" is known, and it is
+        // exactly the value that makes the first crossing interpolation honest.
+        let mut previous_t = near;
+        let mut previous_distance = truncation;
+
+        while t <= far {
+            let world = transform_point(camera_to_world, &(direction * t));
+            let observed = self.sample(&mut cache, &world);
+
+            // An unobserved voxel is not "distance zero": it means nothing came
+            // within a band of this point, so the surface is at least that far.
+            let distance = observed.unwrap_or(truncation);
+
+            if distance <= 0.0 {
+                let denominator = previous_distance - distance;
+                let hit = if denominator.abs() > f32::EPSILON {
+                    previous_t + (t - previous_t) * (previous_distance / denominator)
+                } else {
+                    t
+                };
+                return Some(hit.clamp(near, far));
+            }
+
+            previous_t = t;
+            previous_distance = distance;
+
+            // In the band, step by the distance itself. Outside it, stride.
+            t += match observed {
+                Some(distance) => distance.max(min_step),
+                None => truncation,
+            };
+        }
+
+        None
     }
 
     /// Whether a depth reading is a usable measurement for this field.
@@ -713,5 +1018,135 @@ mod tests {
 
         assert_eq!(stats.updated_voxels, 0);
         assert_eq!(volume.block_count(), 0);
+    }
+
+    /// A volume holding one fronto-parallel plane at `plane` metres, observed
+    /// from the origin.
+    fn volume_with_plane(width: usize, height: usize, plane: f32) -> (TsdfVolume, Intrinsics) {
+        let intrinsics = intrinsics(width, height);
+        let depth = vec![plane; width * height];
+
+        let mut volume = TsdfVolume::new(TsdfParams {
+            voxel_size: 0.01,
+            truncation: 0.04,
+            ..TsdfParams::default()
+        });
+        volume.integrate(
+            &DepthImage::new(width, height, &depth),
+            &intrinsics,
+            &Isometry3::identity(),
+        );
+
+        (volume, intrinsics)
+    }
+
+    #[test]
+    fn an_empty_volume_raycasts_nothing() {
+        let volume = TsdfVolume::new(TsdfParams::default());
+        let image = volume.raycast(&intrinsics(32, 32), &Isometry3::identity(), 32, 32);
+
+        assert_eq!(image.hits(), 0, "an empty field cannot be rendered");
+        assert!(image.depth.iter().all(|d| d.is_nan()));
+    }
+
+    #[test]
+    fn raycast_recovers_the_plane_it_integrated() {
+        let (width, height) = (64, 64);
+        let plane = 1.5f32;
+        let (volume, intrinsics) = volume_with_plane(width, height, plane);
+
+        let image = volume.raycast(&intrinsics, &Isometry3::identity(), width, height);
+        assert!(
+            image.hits() > width * height / 2,
+            "only {} of {} rays found the plane",
+            image.hits(),
+            width * height
+        );
+
+        // Border rays graze the edge of the integrated patch, so the middle is
+        // what is checked. A hit should land within about a voxel.
+        let mut worst = 0.0f32;
+        for y in height / 4..(3 * height) / 4 {
+            for x in width / 4..(3 * width) / 4 {
+                let depth = image.depth[y * width + x];
+                assert!(depth.is_finite(), "no surface at ({x}, {y})");
+                worst = worst.max((depth - plane).abs());
+            }
+        }
+        assert!(worst < 0.02, "worst depth error {worst} m");
+    }
+
+    #[test]
+    fn raycast_returns_the_nearest_surface_not_the_farthest() {
+        // Two bands, at 1 m and 2 m. A ray from the camera meets the near one
+        // first; returning the far one would put the predicted model behind the
+        // real surface and drive tracking in the wrong direction.
+        let (width, height) = (48, 48);
+        let (mut volume, intrinsics) = volume_with_plane(width, height, 1.0);
+
+        let far = vec![2.0f32; width * height];
+        volume.integrate(
+            &DepthImage::new(width, height, &far),
+            &intrinsics,
+            &Isometry3::identity(),
+        );
+
+        let image = volume.raycast(&intrinsics, &Isometry3::identity(), width, height);
+        let middle = image.depth[(height / 2) * width + width / 2];
+        assert!(
+            (middle - 1.0).abs() < 0.02,
+            "expected the near plane at 1 m, got {middle}"
+        );
+    }
+
+    #[test]
+    fn a_pose_that_never_saw_the_surface_raycasts_nothing() {
+        let (width, height) = (32, 32);
+        let (volume, intrinsics) = volume_with_plane(width, height, 1.5);
+
+        // Far past the model, still looking away from it.
+        let away = Isometry3::from_parts(
+            Translation3::new(0.0, 0.0, 50.0),
+            nalgebra::UnitQuaternion::identity(),
+        );
+
+        let image = volume.raycast(&intrinsics, &away, width, height);
+        assert_eq!(image.hits(), 0, "rays that never reach the band must miss");
+    }
+
+    #[test]
+    fn a_small_motion_still_renders_the_surface() {
+        // The model render is used at a *predicted* pose, which is never the pose
+        // the surface was integrated from. It has to survive that offset.
+        let (width, height) = (48, 48);
+        let plane = 1.5f32;
+        let (volume, intrinsics) = volume_with_plane(width, height, plane);
+
+        let nudged = Isometry3::from_parts(
+            Translation3::new(0.03, 0.0, 0.0),
+            nalgebra::UnitQuaternion::identity(),
+        );
+
+        let image = volume.raycast(&intrinsics, &nudged, width, height);
+        assert!(image.hits() > 100, "only {} hits", image.hits());
+
+        // Viewed from 3 cm to the side, a fronto-parallel plane is still 1.5 m
+        // away along the optical axis.
+        let middle = image.depth[(height / 2) * width + width / 2];
+        assert!(
+            (middle - plane).abs() < 0.02,
+            "expected ~{plane} m from the nudged pose, got {middle}"
+        );
+    }
+
+    #[test]
+    fn distance_at_is_none_where_nothing_was_observed() {
+        let (width, height) = (32, 32);
+        let (volume, _) = volume_with_plane(width, height, 1.5);
+
+        // On the plane, in the band: a real distance.
+        assert!(volume.distance_at(&Vector3::new(0.0, 0.0, 1.5)).is_some());
+        // Nowhere near anything: unobserved.
+        assert!(volume.distance_at(&Vector3::new(5.0, 5.0, 5.0)).is_none());
     }
 }
