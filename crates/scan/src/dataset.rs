@@ -841,4 +841,102 @@ mod tests {
             "a view with no usable pose must not leave an image behind"
         );
     }
+
+    /// The whole exporter, driven by a scene with no sensor behind it.
+    ///
+    /// Every other test here builds a `Scanner` by hand out of synthetic arrays
+    /// that were chosen to exercise one branch. This one walks a real capture
+    /// through it -- tracking, fusion, registration, the colour views, the mesh,
+    /// the poses -- so it is the only test that covers the path `scan live
+    /// --color --dataset` actually takes, and it is the only one that can run to
+    /// completion without a Kinect attached.
+    #[test]
+    fn a_synthetic_room_produces_a_dataset_a_trainer_can_read() {
+        let intrinsics = crate::synthetic::intrinsics();
+        let mut scanner = Scanner::new(
+            intrinsics,
+            ScannerConfig {
+                // Finer than the default so a small room still extracts a
+                // surface worth seeding from.
+                tsdf: TsdfParams {
+                    voxel_size: 0.03,
+                    truncation: 0.12,
+                    ..TsdfParams::default()
+                },
+                ..ScannerConfig::default()
+            },
+        );
+
+        // Short enough that every frame tracks: the tracker is known to lose a
+        // viewpoint that turns onto a bare wall around frame 20, and this test is
+        // about the exporter, not about that.
+        let shots = crate::synthetic::shots(16);
+        for shot in &shots {
+            let rendered = crate::synthetic::render(shot, &intrinsics);
+            scanner.add_frame_with_color(
+                &rendered.depth,
+                crate::synthetic::WIDTH,
+                crate::synthetic::HEIGHT,
+                Some(FrameColor {
+                    rgb: &rendered.rgb,
+                    depth: &rendered.depth,
+                    valid: &rendered.valid,
+                    exposure: shot.brightness,
+                    gain: 1.0,
+                    gamma: 1.0,
+                }),
+            );
+        }
+
+        let dir = TempDir::new("synthetic");
+        let report = write_dataset(&scanner, dir.path()).expect("write");
+
+        assert_eq!(report.skipped, 0, "no synthetic frame should be dropped");
+        assert!(
+            report.views >= shots.len() - 1,
+            "kept {} views out of {} shots",
+            report.views,
+            shots.len()
+        );
+        assert!(
+            report.points > 0,
+            "the room should have extracted a surface to seed from"
+        );
+
+        // Every view gets an image and a mask that agree with it.
+        for index in 0..report.views {
+            let name = format!("{index:05}.png");
+            let image = fs::read(dir.path().join("images").join(&name)).expect("image");
+            let mask = fs::read(dir.path().join("masks").join(&name)).expect("mask");
+
+            assert_eq!(png_dimensions(&image), (crate::synthetic::WIDTH as u32, crate::synthetic::HEIGHT as u32));
+            assert_eq!(png_dimensions(&mask), (crate::synthetic::WIDTH as u32, crate::synthetic::HEIGHT as u32));
+            assert_ne!(
+                image, mask,
+                "the mask must not be a copy of the image at {name}"
+            );
+        }
+
+        // The poses describe one scene at a metric scale: the room is 3 x 2.4 m,
+        // so a frame that wandered metres away would mean the convention or the
+        // anchoring is wrong, and one that never moved would mean the poses are
+        // all the same matrix.
+        let transforms = fs::read_to_string(dir.path().join("transforms.json")).expect("json");
+        assert!(transforms.contains("\"ply_file_path\""), "{transforms}");
+
+        let translations: Vec<f32> = scanner
+            .trajectory()
+            .iter()
+            .map(|p| p.norm())
+            .collect();
+        let furthest = translations.iter().copied().fold(0.0f32, f32::max);
+        assert!(
+            furthest > 0.2,
+            "the capture moved but the furthest pose is only {furthest:.3} m from the anchor"
+        );
+        assert!(
+            furthest < 3.0,
+            "a pose {furthest:.3} m from the anchor is outside the room"
+        );
+    }
 }

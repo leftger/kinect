@@ -26,6 +26,7 @@ mod loop_closure;
 mod odometry;
 mod recording;
 mod scanner;
+mod synthetic;
 #[cfg(feature = "viewer")]
 mod viewer;
 #[cfg(feature = "wgpu-decode")]
@@ -132,6 +133,8 @@ enum Command {
     Live,
     Record,
     Replay,
+    /// Build a synthetic coloured capture and write it as a dataset.
+    Synth,
     Help,
 }
 
@@ -141,6 +144,7 @@ async fn run() -> Result<(), Box<dyn Error>> {
         Command::Live => live(&options).await,
         Command::Record => record(&options).await,
         Command::Replay => replay(&options),
+        Command::Synth => synth(&options),
         Command::Help => {
             print_usage();
             Ok(())
@@ -162,6 +166,7 @@ fn parse_args(
         "live" => Command::Live,
         "record" => Command::Record,
         "replay" => Command::Replay,
+        "synth" => Command::Synth,
         other => return Err(format!("unknown command `{other}` (try --help)").into()),
     };
 
@@ -235,10 +240,13 @@ fn parse_args(
             Command::Record | Command::Replay => {
                 return Err(
                     "--dataset needs `live`: a .k2df recording stores depth frames only, \
-                     so there is no colour to build a dataset from"
+                     so there is no colour to build a dataset from. Use `synth`, which \
+                     renders its own colour, to build a dataset without a capture"
                         .into(),
                 )
             }
+            // `synth` renders its own colour, so it needs no stream and no flag.
+            Command::Synth => {}
             Command::Help => {}
         }
     }
@@ -505,6 +513,112 @@ fn replay(options: &Options) -> Result<(), Box<dyn Error>> {
     }
 
     finish_scan(&mut scanner, options)
+}
+
+/// Build a synthetic coloured capture and write it as a dataset.
+///
+/// The point is to exercise the exporter's whole path -- registration, colour
+/// views, the mesh, the poses -- on a machine with no sensor, against a scene
+/// whose true poses are known. A real capture cannot do that: there is no
+/// reference trajectory to check against, so a wrong pose convention or a
+/// transposed matrix looks exactly like a hard scan.
+fn synth(options: &Options) -> Result<(), Box<dyn Error>> {
+    if options.dataset.is_none() {
+        return Err("`synth` needs --dataset DIR: writing one is the whole point".into());
+    }
+
+    let count = options.frames.unwrap_or(24).max(2);
+    let intrinsics = synthetic::intrinsics();
+    let shots = synthetic::shots(count);
+
+    println!(
+        "[scan] synthetic room, {} shots of {}x{}",
+        shots.len(),
+        synthetic::WIDTH,
+        synthetic::HEIGHT,
+    );
+
+    let mut scanner = Scanner::new(intrinsics, scanner_config(options));
+
+    for (index, shot) in shots.iter().enumerate() {
+        let rendered = synthetic::render(shot, &intrinsics);
+
+        let color = FrameColor {
+            rgb: &rendered.rgb,
+            // Registration is a no-op here: the render is already on the depth
+            // grid with the depth camera's intrinsics, which is exactly the
+            // state registration exists to produce.
+            depth: &rendered.depth,
+            valid: &rendered.valid,
+            exposure: shot.brightness,
+            gain: 1.0,
+            gamma: 1.0,
+        };
+
+        let report = scanner.add_frame_with_color(
+            &rendered.depth,
+            synthetic::WIDTH,
+            synthetic::HEIGHT,
+            Some(color),
+        );
+
+        print_progress(index + 1, &report);
+    }
+
+    report_tracking_error(&scanner, &shots);
+    finish_scan(&mut scanner, options)
+}
+
+/// How far the tracked trajectory ended from where the camera really was.
+///
+/// This is the one number in the project that has a right answer. Every other
+/// drift figure comes from a capture with no reference, so it can only be
+/// compared against another run of the same broken thing.
+fn report_tracking_error(scanner: &Scanner, shots: &[synthetic::Shot]) {
+    let lived = scanner.trajectory();
+    if lived.is_empty() {
+        println!("[scan] ground truth: nothing was tracked");
+        return;
+    }
+
+    // The scanner defines the world frame as the *first frame's camera frame*, so
+    // a later pose is comparable only after the anchor has been divided out.
+    // Comparing against the raw eye positions is off by the anchor's own pose,
+    // which is a metre of nonsense on this path.
+    let anchor = shots[0].pose;
+    let aligned: Vec<Vector3<f32>> = shots
+        .iter()
+        .map(|shot| (anchor.inverse() * shot.pose).translation.vector)
+        .collect();
+
+    let truth = aligned[aligned.len() - 1];
+    let ended = lived[lived.len() - 1];
+
+    // The path the camera actually took, for comparison against how far the
+    // tracker believes it went.
+    let truth_path: f32 = aligned.windows(2).map(|pair| (pair[1] - pair[0]).norm()).sum();
+    let lived_path: f32 = lived.windows(2).map(|pair| (pair[1] - pair[0]).norm()).sum();
+
+    println!(
+        "[scan] ground truth: path {:.3} m tracked as {:.3} m over {} of {} frames",
+        truth_path,
+        lived_path,
+        lived.len(),
+        shots.len(),
+    );
+
+    // Only the same frame is being compared when every frame was tracked; with
+    // rejections this is the last tracked pose against the path's end, which
+    // overstates the error by however far the tail travelled.
+    let note = if lived.len() == shots.len() {
+        ""
+    } else {
+        "  (skewed: frames were rejected, so this is not the same frame)"
+    };
+    println!(
+        "[scan] ground truth: final position off by {:.4} m{note}",
+        (ended - truth).norm(),
+    );
 }
 
 fn scanner_config(options: &Options) -> ScannerConfig {
