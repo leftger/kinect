@@ -250,7 +250,11 @@ impl Scanner {
         // Tracking consumes the depth image directly: the odometry builds its own
         // multi-resolution pyramid from it, so the back-projected cloud below is
         // only needed for fusion.
-        let track = self.odometry.track(&image);
+        //
+        // The volume goes along as well so frame-to-model mode can render the
+        // surface it has fused so far and align against that instead of against
+        // the previous frame. `Odometry` ignores it unless the mode is on.
+        let track = self.odometry.track(&image, Some(&self.volume));
         self.total_tracking += started.elapsed();
 
         // The first frame defines the world frame and is always fused. After
