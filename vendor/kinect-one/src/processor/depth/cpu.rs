@@ -824,9 +824,7 @@ mod determinism_tests {
                 p2: 0.0,
             })
             .expect("ir params");
-        processor
-            .set_config(&Config::default())
-            .expect("config");
+        processor.set_config(&Config::default()).expect("config");
 
         processor
     }

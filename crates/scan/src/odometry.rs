@@ -364,7 +364,10 @@ mod tests {
         let report = odometry.track(&frame(&room));
 
         assert!(!report.accepted, "there is nothing to track against yet");
-        assert!(report.rejection.is_none(), "not an error, just the first frame");
+        assert!(
+            report.rejection.is_none(),
+            "not an error, just the first frame"
+        );
         assert!(report.pose.translation.vector.norm() < 1e-6);
     }
 
@@ -401,7 +404,11 @@ mod tests {
             let room = render_room(eye);
 
             let report = odometry.track(&frame(&room));
-            assert!(report.accepted, "step {step} rejected: {:?}", report.rejection);
+            assert!(
+                report.accepted,
+                "step {step} rejected: {:?}",
+                report.rejection
+            );
             assert!(
                 report.inlier_ratio > 0.5,
                 "poor convergence at step {step}: {}",

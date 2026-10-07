@@ -33,32 +33,36 @@ const WORKGROUP: u32 = 64;
 fn main() {
     let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
 
-    let adapter = match pollster::block_on(
-        instance.request_adapter(&wgpu::RequestAdapterOptions::default()),
-    ) {
-        Ok(adapter) => adapter,
-        Err(error) => {
-            println!("no Vulkan adapter: {error}");
-            println!("VERDICT: no usable adapter, so compute cannot run at all.");
-            return;
-        }
-    };
+    let adapter =
+        match pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default()))
+        {
+            Ok(adapter) => adapter,
+            Err(error) => {
+                println!("no Vulkan adapter: {error}");
+                println!("VERDICT: no usable adapter, so compute cannot run at all.");
+                return;
+            }
+        };
 
     let info = adapter.get_info();
-    println!("adapter : {} ({:?}, {:?})", info.name, info.backend, info.device_type);
+    println!(
+        "adapter : {} ({:?}, {:?})",
+        info.name, info.backend, info.device_type
+    );
     println!("driver  : {} {}", info.driver, info.driver_info);
 
-    let (device, queue) = match pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
-        label: Some("vk_check"),
-        ..Default::default()
-    })) {
-        Ok(pair) => pair,
-        Err(error) => {
-            println!("device creation failed: {error}");
-            println!("VERDICT: adapter present but no device; compute cannot run.");
-            return;
-        }
-    };
+    let (device, queue) =
+        match pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+            label: Some("vk_check"),
+            ..Default::default()
+        })) {
+            Ok(pair) => pair,
+            Err(error) => {
+                println!("device creation failed: {error}");
+                println!("VERDICT: adapter present but no device; compute cannot run.");
+                return;
+            }
+        };
 
     let bytes = (N * std::mem::size_of::<f32>()) as u64;
 
@@ -102,8 +106,9 @@ fn main() {
         }],
     });
 
-    let mut encoder =
-        device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("fill") });
+    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("fill"),
+    });
     {
         let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor::default());
         pass.set_pipeline(&pipeline);
@@ -149,8 +154,9 @@ fn read_back(
     staging: &wgpu::Buffer,
     bytes: u64,
 ) -> Vec<f32> {
-    let mut encoder =
-        device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("copy") });
+    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("copy"),
+    });
     encoder.copy_buffer_to_buffer(source, 0, staging, 0, bytes);
     queue.submit(Some(encoder.finish()));
 

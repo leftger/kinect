@@ -165,8 +165,8 @@ fn print_usage() {
         "scan - handheld 3D scanner for the Kinect v2\n\
          \n\
          USAGE:\n\
-         \x20 scan live   [--frames N] [--out mesh.ply] [--voxel M] [--no-filter] [--drain-color]\n\
-         \x20 scan record  --out capture.k2df [--frames N] [--no-filter] [--drain-color]\n\
+         \x20 scan live   [--frames N] [--out mesh.ply] [--voxel M] [--no-filter] [--color] [--gpu]\n\
+         \x20 scan record  --out capture.k2df [--frames N] [--no-filter] [--drain-color] [--gpu]\n\
          \x20 scan replay  --in capture.k2df [--out mesh.ply] [--voxel M] [--frames N]\n\
          \n\
          COMMANDS:\n\
@@ -185,25 +185,25 @@ fn print_usage() {
          \x20               truncation band to 4x this.\n\
          \x20 --no-filter   Disable the decoder's bilateral/edge filters: roughly\n\
          \x20               doubles frame rate, keeps more junk points.\n\
-         \x20 --drain-color Keep reading the colour stream. Off by default: the\n\
-         \x20               scanner never uses colour, and waiting for a colour\n\
-         \x20               packet costs more than half the frame time -- that\n\
-         \x20               stream delivers at about a third of the depth rate.\n\
-         \x20 --gpu         Decode depth on the GPU. Needs a build with\n\
-         \x20               `--features wgpu-decode` (Vulkan, preferred) or\n\
-         \x20               `--features gpu-decode` (OpenCL). OpenCL does not work\n\
-         \x20               on this GPU -- Rusticl runs no kernels at all, see\n\
-         \x20               examples/ocl_check.rs. It cuts host CPU time 6-13x\n\
-         \x20               but measured no faster wall clock, so it is not a\n\
-         \x20               speed-up -- the decode is not the bottleneck.\n\
+         \x20 --color       On live: capture colour and paint the mesh. Off by\n\
+         \x20               default. The colour stream is slower than depth.\n\
+         \x20 --drain-color On record: read and discard colour packets. Does not\n\
+         \x20               apply to live; use --color there.\n\
+         \x20 --gpu         Decode depth on the GPU during live and record.\n\
+         \x20               Needs `--features wgpu-decode` (Metal on macOS,\n\
+         \x20               Vulkan on Linux). OpenCL (`--features gpu-decode`)\n\
+         \x20               does not run kernels under Rusticl. Host CPU time\n\
+         \x20               drops sharply; a live scan does not finish sooner.\n\
          \x20 --loop-closure  Detect revisits, redistribute the accumulated drift\n\
          \x20               over the whole trajectory, and rebuild the model from\n\
          \x20               the corrected poses. Costs memory: frames are kept\n\
          \x20               (about 850 KB each) so the model can be rebuilt once\n\
          \x20               the poses move. Only helps a scan that returns\n\
          \x20               somewhere it has already been.\n\
-         \x20 --mirror       Keep the raw sensor mirror orientation instead of flipping\n\
-         \x20                X to match real-world coordinates (un-mirrored by default).\n\
+         \x20 --viewer      Open a live window. Needs `--features viewer` and a\n\
+         \x20               display. Closing the window stops the scan.\n\
+         \x20 --mirror      Keep the raw sensor mirror orientation instead of flipping\n\
+         \x20               X to match real-world coordinates (un-mirrored by default).\n\
          \n\
          A trajectory PLY is written alongside the mesh as <out>.trajectory.ply,\n\
          which is the quickest way to see how badly the pose has drifted."
@@ -238,8 +238,7 @@ where
 {
     let frames = options.frames.unwrap_or(DEFAULT_FRAMES);
 
-    let mut capture =
-        capture::Capture::open(options.filters, options.color, options.gpu).await?;
+    let mut capture = capture::Capture::open(options.filters, options.color, options.gpu).await?;
     let intrinsics = capture.intrinsics();
     let (width, height) = capture.dimensions();
 
@@ -313,10 +312,7 @@ fn replay(options: &Options) -> Result<(), Box<dyn Error>> {
     let input = options.input.clone().ok_or("replay needs --in <file>")?;
     let recording = recording::read(&input)?;
 
-    let duration = recording
-        .frames
-        .last()
-        .map_or(0.0, |frame| frame.timestamp);
+    let duration = recording.frames.last().map_or(0.0, |frame| frame.timestamp);
 
     println!(
         "[scan] {} frames over {:.1} s of {}x{} from {}",
@@ -353,9 +349,7 @@ fn replay(options: &Options) -> Result<(), Box<dyn Error>> {
 fn scanner_config(options: &Options) -> ScannerConfig {
     ScannerConfig {
         tsdf: options.tsdf,
-        loop_closure: options
-            .loop_closure
-            .then(LoopClosureConfig::default),
+        loop_closure: options.loop_closure.then(LoopClosureConfig::default),
         ..ScannerConfig::default()
     }
 }
@@ -379,11 +373,7 @@ fn close_loops(scanner: &mut Scanner, options: &Options) {
 
     println!(
         "loop closure: {} revisits over {} frames, cost {:.3} -> {:.3} in {} iterations",
-        report.loop_edges,
-        report.nodes,
-        report.cost_before,
-        report.cost_after,
-        report.iterations
+        report.loop_edges, report.nodes, report.cost_before, report.cost_after, report.iterations
     );
     println!(
         "  largest pose change {:.1} cm, {:.1} degrees",

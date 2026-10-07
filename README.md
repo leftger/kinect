@@ -42,8 +42,9 @@ gaps. Read this section before the code.
   covers 4.8 m of path and ends 2.15 m from where it started. Loop closure exists
   to correct exactly this, but it has never been exercised on a real loop: the
   test capture contains none.
-- **The GPU depth decoder is correct but buys little.** About 6% off the wall
-  clock and a third off host CPU time. See `crates/scan/src/wgpu_depth.rs`.
+- **The GPU depth decoder is correct but does not shorten a scan.** It cuts
+  host CPU time sharply and leaves the wall clock about where it was, because
+  capture waits on USB. See [GPU decoding](#gpu-decoding).
 - **Fusion is now the largest remaining per-frame cost**, about 100 ms at 1 cm
   voxels, and it scales with the size of the model. Tracking is about 35 ms.
 
@@ -54,9 +55,8 @@ gaps. Read this section before the code.
   with a different driver and an IMU.
 - A **USB 3.0 port**. The sensor is SuperSpeed-only and needs its own power
   supply; the USB cable carries data, not power.
-- Linux with libusb access to the device. The udev rule in
-  `platform/linux/udev/90-kinect2.rules` grants that, and must be installed as
-  root:
+- Linux or macOS. On Linux, libusb access comes from the udev rule in
+  `platform/linux/udev/90-kinect2.rules`, installed as root:
 
   ```
   sudo cp platform/linux/udev/90-kinect2.rules /etc/udev/rules.d/
@@ -65,21 +65,47 @@ gaps. Read this section before the code.
 
   Without it every capture fails with an opaque permission error.
 
+  On macOS, install libusb (`brew install libusb`). There is no udev rule.
+  The operating system is chosen when the binary is compiled. A Mac build
+  drives control, colour, and depth through libusb, because `nusb` opens the
+  device exclusively on macOS and has no isochronous transfers there. A Linux
+  build keeps the `nusb` path. Windows is not supported. `--gpu` selects the
+  wgpu depth decoder, which uses Metal on macOS and Vulkan on Linux.
+
 ## Build
 
+Build on the machine that will run the scanner. The USB backend is selected
+at compile time, so a Mac binary does not become a Linux binary by being
+copied across.
+
 ```
-cargo build --release
+cargo build --release -p scan
+```
+
+GPU depth decode needs the wgpu feature. On macOS that is Metal; on Linux it
+is Vulkan.
+
+```
+cargo build --release -p scan --features wgpu-decode
 ```
 
 The scanner binary is `target/release/scan`. To check that the sensor works
 before using the scanner, `cargo run --release -p probe`.
 
+`--frames` defaults to 60. A 300-frame GPU scan on this Mac is:
+
+```
+target/release/scan live --gpu --frames 300 --out scan.ply
+```
+
+Add `--color` to paint the mesh.
+
 ## Use
 
 ```
-scan live   [--frames N] [--out mesh.ply] [--voxel M] [--no-filter] [--drain-color] [--gpu] [--loop-closure]
+scan live   [--frames N] [--out mesh.ply] [--voxel M] [--no-filter] [--color] [--gpu] [--loop-closure] [--viewer]
 scan record  --out capture.k2df [--frames N] [--no-filter] [--drain-color] [--gpu]
-scan replay  --in capture.k2df [--out mesh.ply] [--voxel M] [--frames N] [--gpu] [--loop-closure]
+scan replay  --in capture.k2df [--out mesh.ply] [--voxel M] [--frames N] [--loop-closure]
 ```
 
 - `live` captures and reconstructs as it goes.
@@ -94,18 +120,23 @@ Useful options:
   megabytes, and `--voxel 0.02` cuts that by roughly eight.
 - `--no-filter` disables the decoder's bilateral and edge-aware filters. It is
   faster and keeps more junk points.
+- `--frames N` is how many frames to capture or replay. The default is 60.
 - `--loop-closure` detects revisits and rebuilds the model from corrected poses.
   It buffers the frames to do that, about 850 KB each, so a 200-frame scan costs
   around 170 MB. It only helps a scan that returns somewhere it has already been.
-- `--drain-color` reads and discards the colour stream. Off by default, because
-  the scanner never uses colour and waiting for it costs more than half the frame
-  time. Turn it on only if you are extending the scanner to use colour.
+- `--color` captures the colour stream during `live` and paints the finished
+  mesh. Off by default, because that stream is slower than depth.
+- `--drain-color` applies to `record`. It reads and discards colour packets so
+  the pipe stays drained, without writing them into the recording.
 - `--viewer` opens a live window showing the scan as it builds: the reconstruction
   so far, the frame count, the tracked position and the model size. Needs a build
-  with `--features viewer` and a display. Closing the window stops the scan, and
-  the mesh is written as usual.
-- `--gpu` decodes on the GPU. Needs a build with `--features wgpu-decode`
-  (Vulkan) or `--features gpu-decode` (OpenCL); see below.
+  with `--features viewer` and a display. The window backend in that feature is
+  Wayland and X11. Closing the window stops the scan, and the mesh is written
+  as usual.
+- `--gpu` decodes depth on the GPU during `live` and `record`. `replay` reads
+  depth that was already decoded, so the flag does nothing there. Needs a build
+  with `--features wgpu-decode`. OpenCL (`--features gpu-decode`) is the other
+  backend and does not work with Rusticl; see below.
 - `--mirror` keeps the raw sensor mirror orientation instead of flipping X (un-mirrored by default).
 
 A trajectory PLY is written alongside the mesh as `<out>.trajectory.ply`.
@@ -163,9 +194,11 @@ while that surface was being integrated. A real texture atlas would mean
 outputting OBJ or glTF instead.
 
 **It costs capture rate.** The colour stream delivers at about a third of the
-depth rate, so waiting for a packet takes a frame from roughly 270 ms to 530 ms.
-Capturing colour every Nth frame would pay that proportionally less often and is
-the obvious next step.
+depth rate. On the Linux machine this was first measured on, waiting for a
+packet took a frame from roughly 270 ms to 530 ms. On the M4 Pro, a 20-frame
+colour scan and a 30-frame depth-only scan both took about 3 s of wall time, so
+colour still lowers throughput. Capturing colour every Nth frame would pay that
+less often.
 
 The alignment this relies on was checked before any of it was written:
 `crates/scan/examples/color_check.rs` writes the registered colour and the depth
@@ -175,15 +208,18 @@ one-pixel offset. That is the check the GPU port should have had first.
 ## The vendored driver
 
 `vendor/kinect-one` is the pure-Rust libfreenect2 port at upstream revision
-`24c6dc0`, MIT licensed, with four local changes. It is vendored rather than used
-as a git dependency so the patches are visible and reviewable.
+`24c6dc0`, MIT licensed. It is vendored rather than used as a git dependency so
+the patches are visible and reviewable.
 
-`vendor/kinect-one/UPSTREAM.patch` holds the complete diff. `VENDORED.txt`
-explains each change. One of them is a genuine upstream bug: `undistort_depth`
-indexes a frame with a sentinel that upstream libfreenect2 bounds-checks and the
-port does not, so a border pixel panics on real frames.
+`vendor/kinect-one/VENDORED.txt` lists the local changes. One of them is a
+genuine upstream bug: `undistort_depth` indexes a frame with a sentinel that
+upstream libfreenect2 bounds-checks and the port does not, so a border pixel
+panics on real frames. The macOS build adds `src/libusb_host.rs` and does not
+yet appear in `UPSTREAM.patch`.
 
-To verify the vendored copy is upstream plus only those changes:
+`UPSTREAM.patch` is the diff from before the macOS host. Regenerating it is
+described in `VENDORED.txt`. Until then, this check does not cover
+`libusb_host.rs`:
 
 ```
 cp -r /tmp/k1/src /tmp/verify/src
@@ -192,16 +228,16 @@ cp -r /tmp/k1/src /tmp/verify/src
 
 ## GPU decoding
 
-Two backends exist, and on the machine this was developed on only one of them
-works.
+Two backends exist. wgpu is the one that runs.
 
-- **OpenCL** (`--features gpu-decode`) is unusable. Mesa's Rusticl enumerates a
-  device, allocates buffers, and transfers data correctly, then silently never
-  executes a kernel. `crates/scan/examples/ocl_check.rs` demonstrates this with a
-  trivial kernel.
-- **Vulkan** (`--features wgpu-decode`) works. The four libfreenect2 decode
-  kernels were translated to WGSL and are driven with wgpu. This is the
-  interesting half of the work and it did not pay off: see below.
+- **OpenCL** (`--features gpu-decode`) is unusable on the Linux machine this was
+  developed on. Mesa's Rusticl enumerates a device, allocates buffers, and
+  transfers data correctly, then silently never executes a kernel.
+  `crates/scan/examples/ocl_check.rs` demonstrates this with a trivial kernel.
+- **wgpu** (`--features wgpu-decode`) works. The four libfreenect2 decode
+  kernels were translated to WGSL. On Linux, wgpu uses Vulkan. On macOS, the
+  same binary feature uses Metal. The log line names the adapter and the
+  backend, for example `Apple M4 Pro (Metal)`.
 
 The translation is verified against the CPU decoder on real sensor data, feeding
 one packet to both:
@@ -214,15 +250,32 @@ one packet to both:
 
 That residual is below the sensor's own noise, so it is not visible through it.
 
-What it buys is less than hoped:
+What it buys is less wall-clock time than hoped.
 
-| 100 frames, `live`, filters off | wall | per frame | user CPU |
+On Linux, 100 frames of `live` with the filters off:
+
+| | wall | per frame | user CPU |
 | --- | --- | --- | --- |
 | CPU decode | 25.6 s | 256 ms | 25.4 s |
 | Vulkan decode | 23.9 s | 239 ms | 16.7 s |
 
-So roughly 6% off the wall clock, which is close to the run-to-run noise of these
-measurements, and a third off the host CPU time, which is not.
+About 6% off the wall clock, close to the run-to-run noise, and a third off the
+host CPU time.
+
+On an Apple M4 Pro, filters on, the sensor sitting still:
+
+| | wall | user CPU |
+| --- | --- | --- |
+| record, 40 frames, CPU | 3.52 s | 2.50 s |
+| record, 40 frames, Metal | 3.31 s | 0.25 s |
+| live, 30 frames, CPU | 2.91 s | 2.02 s |
+| live, 30 frames, Metal | 2.90 s | 0.22 s |
+| live --color, 20 frames, CPU | 2.97 s | 1.50 s |
+| live --color, 20 frames, Metal | 2.99 s | 0.35 s |
+
+Recording got about 6% faster. The live scans did not. Host CPU time dropped by
+about an order of magnitude. Tracking and fusion on that small scene were a few
+milliseconds per frame, so the frame time is the USB wait.
 
 The premise it was built on, that the decode caps capture rate, was wrong: the
 measurement that produced it was taken with the filters on, where the decode cost
@@ -279,9 +332,8 @@ cargo test --release -p scan --features wgpu-decode -- --ignored --nocapture
    to its start would show whether it removes drift.
 4. **File the `undistort_depth` bug upstream**, since it affects anyone using the
    port on real hardware.
-5. **The GPU decoder does not pay off.** Either find it a use, for example
-   running tracking and fusion on the freed cores, or accept it as a documented
-   negative result.
+5. **The GPU decoder frees the CPU and does not shorten the scan.** Either find
+   a use for the spare cores, or accept the wall-clock result above.
 
 ## Licence
 

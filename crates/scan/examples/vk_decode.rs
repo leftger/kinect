@@ -116,7 +116,9 @@ fn main() {
     };
 
     let packet_words = 424 * 10 * 352 + 16;
-    let packet: Vec<u32> = (0..packet_words).map(|_| (next() & 0xFFFF) as u32).collect();
+    let packet: Vec<u32> = (0..packet_words)
+        .map(|_| (next() & 0xFFFF) as u32)
+        .collect();
     let lut: Vec<i32> = (0..2048).map(|i| (i as i32 % 2048) - 1024).collect();
     // z_table must be > 0 or stage 1 marks the pixel invalid, and its magnitude
     // matters: it is millimetres of depth per unit of unwrapped phase, so a
@@ -124,7 +126,9 @@ fn main() {
     // depth image of a few millimetres, which looks plausible in a summary and
     // would hide a scale error.
     let z_table: Vec<f32> = (0..PIXELS).map(|i| 900.0 + (i % 7) as f32 * 20.0).collect();
-    let x_table: Vec<f32> = (0..PIXELS).map(|i| 0.001 + (i % 5) as f32 * 0.0001).collect();
+    let x_table: Vec<f32> = (0..PIXELS)
+        .map(|i| 0.001 + (i % 5) as f32 * 0.0001)
+        .collect();
     let mut p0: Vec<f32> = Vec::with_capacity(PIXELS as usize * 4);
     for i in 0..PIXELS as usize {
         p0.push((i % 97) as f32 * 0.0001);
@@ -133,7 +137,8 @@ fn main() {
         p0.push(0.0);
     }
 
-    let storage = wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST;
+    let storage =
+        wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST;
 
     let lut_buf = from_bytes(&device, "lut", &bytes_i32(&lut), storage);
     let z_buf = from_bytes(&device, "z_table", &bytes_f32(&z_table), storage);
@@ -214,8 +219,9 @@ fn main() {
         "filter_pixel_stage2",
     ];
 
-    let mut encoder =
-        device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("decode") });
+    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("decode"),
+    });
 
     for entry_point in passes {
         let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
@@ -247,7 +253,11 @@ fn main() {
         let finite = values.iter().filter(|v| v.is_finite()).count();
         let nonzero = values.iter().filter(|v| **v != 0.0).count();
         let max = values.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-        let min = values.iter().filter(|v| **v > 0.0).cloned().fold(f32::INFINITY, f32::min);
+        let min = values
+            .iter()
+            .filter(|v| **v > 0.0)
+            .cloned()
+            .fold(f32::INFINITY, f32::min);
         println!(
             "  {name:<9}: {nonzero:>6}/{PIXELS} non-zero, {finite:>6} finite, range {min:.2}..{max:.2}"
         );
@@ -263,7 +273,10 @@ fn main() {
         PIXELS
     );
 
-    let good = filtered.iter().filter(|v| v.is_finite() && **v > 0.0).count();
+    let good = filtered
+        .iter()
+        .filter(|v| v.is_finite() && **v > 0.0)
+        .count();
     println!();
     if good == 0 {
         println!("VERDICT: the chain runs but yields nothing usable. Either a stage is");
@@ -319,8 +332,9 @@ fn read_bytes(
         mapped_at_creation: false,
     });
 
-    let mut encoder =
-        device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("copy") });
+    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("copy"),
+    });
     encoder.copy_buffer_to_buffer(source, 0, &staging, 0, size);
     queue.submit(Some(encoder.finish()));
 
@@ -339,14 +353,24 @@ fn read_bytes(
     out
 }
 
-fn read_f32(device: &wgpu::Device, queue: &wgpu::Queue, source: &wgpu::Buffer, size: u64) -> Vec<f32> {
+fn read_f32(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    source: &wgpu::Buffer,
+    size: u64,
+) -> Vec<f32> {
     read_bytes(device, queue, source, size)
         .chunks_exact(4)
         .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
         .collect()
 }
 
-fn read_u32(device: &wgpu::Device, queue: &wgpu::Queue, source: &wgpu::Buffer, size: u64) -> Vec<u32> {
+fn read_u32(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    source: &wgpu::Buffer,
+    size: u64,
+) -> Vec<u32> {
     read_bytes(device, queue, source, size)
         .chunks_exact(4)
         .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))

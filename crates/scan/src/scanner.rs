@@ -1,9 +1,9 @@
 //! The scan pipeline: depth frame -> odometry -> TSDF fusion.
 
+use geom::coloring::{colorize, ColorView, ColoringParams};
 use geom::mesh::Mesh;
-use geom::tsdf::{IntegrationStats, TsdfParams, TsdfVolume};
-use geom::coloring::{colorize, ColoringParams, ColorView};
 use geom::pose_graph::{PoseGraph, PoseGraphParams};
+use geom::tsdf::{IntegrationStats, TsdfParams, TsdfVolume};
 use geom::{DepthImage, Intrinsics};
 use nalgebra::{Isometry3, Vector3};
 use std::time::{Duration, Instant};
@@ -713,7 +713,10 @@ mod tests {
 
         // A rebuild throws the volume away and lays it down again, so it has to
         // actually produce a model rather than an empty one.
-        assert!(!scanner.mesh().is_empty(), "the rebuild produced no surface");
+        assert!(
+            !scanner.mesh().is_empty(),
+            "the rebuild produced no surface"
+        );
         assert_eq!(scanner.fused(), 6, "the rebuild dropped frames");
     }
 

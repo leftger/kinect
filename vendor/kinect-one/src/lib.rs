@@ -1,5 +1,7 @@
 mod command;
 mod device;
+#[cfg(target_os = "macos")]
+mod libusb_host;
 mod packet;
 mod settings;
 
@@ -76,6 +78,9 @@ pub enum Error {
     UsbActiveConfiguration(#[from] nusb::ActiveConfigurationError),
     #[error(transparent)]
     UsbTransfer(#[from] nusb::transfer::TransferError),
+    #[cfg(target_os = "macos")]
+    #[error(transparent)]
+    Libusb(#[from] rusb::Error),
     #[error("Processing error: {0}")]
     Processing(Box<dyn std::error::Error>),
     #[error("No Kinect connected")]

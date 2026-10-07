@@ -220,13 +220,12 @@ impl WgpuDepthProcessor {
     pub fn new() -> Result<Self, Box<dyn Error>> {
         let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
 
-        let adapter = pollster::block_on(
-            instance.request_adapter(&wgpu::RequestAdapterOptions::default()),
-        )
-        .map_err(|error| format!("no Vulkan adapter: {error}"))?;
+        let adapter =
+            pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default()))
+                .map_err(|error| format!("no GPU adapter: {error}"))?;
 
         let info = adapter.get_info();
-        eprintln!("[scan] Vulkan device: {} ({:?})", info.name, info.backend);
+        eprintln!("[scan] GPU device: {} ({:?})", info.name, info.backend);
 
         // The decode needs 15 storage buffers in one stage. wgpu's default limit
         // is 8, and asking for more fails as a validation error rather than as
@@ -240,16 +239,16 @@ impl WgpuDepthProcessor {
             .into());
         }
 
-        let (device, queue) =
-            pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
-                label: Some("wgpu-depth"),
-                required_limits: limits,
-                ..Default::default()
-            }))
-            .map_err(|error| format!("creating the Vulkan device: {error}"))?;
+        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+            label: Some("wgpu-depth"),
+            required_limits: limits,
+            ..Default::default()
+        }))
+            .map_err(|error| format!("creating the GPU device: {error}"))?;
 
-        let storage =
-            wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC;
+        let storage = wgpu::BufferUsages::STORAGE
+            | wgpu::BufferUsages::COPY_DST
+            | wgpu::BufferUsages::COPY_SRC;
 
         let vertex3 = DEPTH_SIZE as u64 * P0_STRIDE as u64 * 4;
         let scalar = DEPTH_SIZE as u64 * 4;
@@ -399,7 +398,9 @@ impl WgpuDepthProcessor {
 
         let mut encoder = self
             .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("read") });
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("read"),
+            });
         encoder.copy_buffer_to_buffer(source, 0, staging, 0, bytes);
         self.queue.submit(Some(encoder.finish()));
 
@@ -494,9 +495,11 @@ impl ProcessorTrait<DepthPacket, (IrFrame, DepthFrame)> for WgpuDepthProcessor {
         self.queue
             .write_buffer(&self.buffers.packet, 0, &as_bytes(&words));
 
-        let mut encoder = self.device.create_command_encoder(
-            &wgpu::CommandEncoderDescriptor { label: Some("decode") },
-        );
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("decode"),
+            });
         for pipeline in &self.passes {
             // A pass boundary is an implicit barrier, so no stage reads a buffer
             // another is still writing.
@@ -551,10 +554,7 @@ fn binding(binding: u32, buffer: &wgpu::Buffer) -> wgpu::BindGroupEntry<'_> {
 /// Reinterpret a plain-data slice as bytes for upload.
 fn as_bytes<T: bytemuck_free::Pod>(values: &[T]) -> &[u8] {
     unsafe {
-        std::slice::from_raw_parts(
-            values.as_ptr() as *const u8,
-            std::mem::size_of_val(values),
-        )
+        std::slice::from_raw_parts(values.as_ptr() as *const u8, std::mem::size_of_val(values))
     }
 }
 
@@ -830,10 +830,22 @@ mod tests {
             }
         }
 
-        let mean = if both > 0 { sum / both as f64 } else { f64::NAN };
-        let mean_cpu = if both > 0 { sum_cpu / both as f64 } else { f64::NAN };
+        let mean = if both > 0 {
+            sum / both as f64
+        } else {
+            f64::NAN
+        };
+        let mean_cpu = if both > 0 {
+            sum_cpu / both as f64
+        } else {
+            f64::NAN
+        };
         // A bias is the tell for a scale error; scatter alone would be noise.
-        let bias = if mean_cpu > 0.0 { 100.0 * mean / mean_cpu } else { f64::NAN };
+        let bias = if mean_cpu > 0.0 {
+            100.0 * mean / mean_cpu
+        } else {
+            f64::NAN
+        };
 
         println!(
             "  {label:<7} cpu-only {cpu_only:>5}  gpu-only {gpu_only:>5}  both {both:>6}  \

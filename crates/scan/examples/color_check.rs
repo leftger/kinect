@@ -103,9 +103,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     );
 
     let valid_depth = depth_frame.buffer.iter().filter(|d| **d > 0.0).count();
-    eprintln!(
-        "[color] depth frame: {valid_depth}/{DEPTH_SIZE} pixels carry depth"
-    );
+    eprintln!("[color] depth frame: {valid_depth}/{DEPTH_SIZE} pixels carry depth");
 
     // The registration primitive. Input is the *raw* depth frame: the function
     // walks `distort_map` from undistorted to distorted coordinates itself.
@@ -122,7 +120,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
         return Err(format!("unexpected colour space {:?}", registered.color_space).into());
     }
 
-    write_ppm("color_registered.ppm", &registered.buffer, DEPTH_WIDTH, DEPTH_HEIGHT)?;
+    write_ppm(
+        "color_registered.ppm",
+        &registered.buffer,
+        DEPTH_WIDTH,
+        DEPTH_HEIGHT,
+    )?;
 
     // Mark depth discontinuities so the two edge sets can be compared by eye.
     let mut overlay = registered.buffer.clone();

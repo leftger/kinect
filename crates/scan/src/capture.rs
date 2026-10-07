@@ -2,17 +2,17 @@
 
 use std::error::Error;
 
+#[cfg(feature = "wgpu-decode")]
+use crate::wgpu_depth::WgpuDepthProcessor;
 use geom::Intrinsics;
 use kinect_one::config::Config;
 use kinect_one::data::P0Tables;
+use kinect_one::processor::color::{ColorSpace, ZuneColorProcessor};
+#[cfg(feature = "gpu-decode")]
+use kinect_one::processor::depth::OpenCLDepthProcessor;
 use kinect_one::processor::depth::{
     CpuDepthProcessor, DepthFrame, DepthPacket, DepthProcessorTrait, IrFrame,
 };
-#[cfg(feature = "gpu-decode")]
-use kinect_one::processor::depth::OpenCLDepthProcessor;
-#[cfg(feature = "wgpu-decode")]
-use crate::wgpu_depth::WgpuDepthProcessor;
-use kinect_one::processor::color::{ColorSpace, ZuneColorProcessor};
 use kinect_one::processor::{ProcessTrait, ProcessorTrait, Registration};
 use kinect_one::{
     Device, DeviceEnumerator, Opened, DEPTH_HEIGHT, DEPTH_SIZE, DEPTH_WIDTH, LUT_SIZE,
@@ -141,7 +141,11 @@ fn opencl_device() -> Result<ocl::Device, Box<dyn Error>> {
     let mut fallback = None;
     for platform in &platforms {
         for device in Device::list(platform, Some(DeviceType::GPU))? {
-            eprintln!("[scan] OpenCL GPU: {} on {}", device.name()?, platform.name()?);
+            eprintln!(
+                "[scan] OpenCL GPU: {} on {}",
+                device.name()?,
+                platform.name()?
+            );
             return Ok(device);
         }
 
@@ -177,7 +181,7 @@ fn build_backend(use_gpu: bool) -> Result<DepthBackend, Box<dyn Error>> {
     #[cfg(feature = "wgpu-decode")]
     {
         let processor = WgpuDepthProcessor::new()
-            .map_err(|e| format!("creating the Vulkan depth processor: {e}"))?;
+            .map_err(|e| format!("creating the GPU depth processor: {e}"))?;
         return Ok(DepthBackend::Wgpu(processor));
     }
 
@@ -190,9 +194,11 @@ fn build_backend(use_gpu: bool) -> Result<DepthBackend, Box<dyn Error>> {
 
     #[cfg(all(not(feature = "gpu-decode"), not(feature = "wgpu-decode")))]
     {
-        Err("this binary has no GPU decoder; rebuild with `--features wgpu-decode` \
-             (Vulkan) or `--features gpu-decode` (OpenCL)"
-            .into())
+        Err(
+            "this binary has no GPU decoder; rebuild with `--features wgpu-decode` \
+             (Vulkan or Metal) or `--features gpu-decode` (OpenCL)"
+                .into(),
+        )
     }
 }
 
@@ -205,11 +211,7 @@ impl Capture {
     ///
     /// `use_gpu` selects the OpenCL decoder when the binary was built with the
     /// `gpu-decode` feature.
-    pub async fn open(
-        filters: bool,
-        color: bool,
-        use_gpu: bool,
-    ) -> Result<Self, Box<dyn Error>> {
+    pub async fn open(filters: bool, color: bool, use_gpu: bool) -> Result<Self, Box<dyn Error>> {
         let mut device = DeviceEnumerator::open_default(true)
             .await
             .map_err(|e| format!("could not open a Kinect v2: {e}"))?;
@@ -307,8 +309,9 @@ impl Capture {
                     .await
                     .map_err(|e| format!("processing colour packet: {e}"))?;
 
-                let (registered, undistorted_depth) = self.registration
-                    .undistort_depth_and_color(&color_frame, &depth_frame, false);
+                let (registered, undistorted_depth) =
+                    self.registration
+                        .undistort_depth_and_color(&color_frame, &depth_frame, false);
 
                 self.captured = Some(CapturedColor {
                     rgb: registered.buffer,
@@ -323,16 +326,17 @@ impl Capture {
             let undistorted = self.registration.undistort_depth(&depth_frame);
 
             self.frame.clear();
-            self.frame.extend(undistorted.buffer.iter().map(|millimetres| {
-                let metres = millimetres / 1000.0;
-                // The decoder uses 0 for "no measurement"; make that uniform with
-                // the NaN convention the geometry crate expects.
-                if metres.is_finite() && metres > 0.0 {
-                    metres
-                } else {
-                    f32::NAN
-                }
-            }));
+            self.frame
+                .extend(undistorted.buffer.iter().map(|millimetres| {
+                    let metres = millimetres / 1000.0;
+                    // The decoder uses 0 for "no measurement"; make that uniform with
+                    // the NaN convention the geometry crate expects.
+                    if metres.is_finite() && metres > 0.0 {
+                        metres
+                    } else {
+                        f32::NAN
+                    }
+                }));
 
             return Ok(&self.frame);
         }

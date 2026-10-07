@@ -98,11 +98,9 @@ impl Splatter {
                         continue;
                     }
 
-                    let camera = view.intrinsics.back_project(
-                        x as f32 + 0.5,
-                        y as f32 + 0.5,
-                        depth,
-                    );
+                    let camera =
+                        view.intrinsics
+                            .back_project(x as f32 + 0.5, y as f32 + 0.5, depth);
                     // `transform_point`, not `pose * camera`: multiplying an
                     // isometry by a vector rotates it and silently drops the
                     // translation, which would place every view as if its camera
@@ -339,10 +337,7 @@ impl eframe::App for ViewerApp {
             let scale = (available.x / self.size.0 as f32)
                 .min(available.y / self.size.1 as f32)
                 .max(0.01);
-            let size = egui::vec2(
-                self.size.0 as f32 * scale,
-                self.size.1 as f32 * scale,
-            );
+            let size = egui::vec2(self.size.0 as f32 * scale, self.size.1 as f32 * scale);
             ui.image(egui::load::SizedTexture::new(texture.id(), size));
         }
 

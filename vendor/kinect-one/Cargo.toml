@@ -45,3 +45,6 @@ turbo_color = ["dep:turbojpeg"]
 cpu_depth = []
 opencl_depth = ["dep:ocl"]
 opencl_kde_depth = ["dep:ocl"]
+
+[target.'cfg(target_os = "macos")'.dependencies]
+rusb = "0.9"

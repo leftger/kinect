@@ -38,12 +38,7 @@ impl FrameWriter {
         writer.write_all(&(height as u32).to_le_bytes())?;
         // Intrinsics are stored so that replay needs no sensor and no hardcoded
         // calibration: they are per-device factory values.
-        for value in [
-            intrinsics.fx,
-            intrinsics.fy,
-            intrinsics.cx,
-            intrinsics.cy,
-        ] {
+        for value in [intrinsics.fx, intrinsics.fy, intrinsics.cx, intrinsics.cy] {
             writer.write_all(&value.to_le_bytes())?;
         }
 
@@ -197,8 +192,7 @@ mod tests {
             vec![f32::INFINITY, -1.0, 7.0, 8.0],
         ];
 
-        let mut writer =
-            FrameWriter::create(&path, test_intrinsics(), 2, 2).expect("create");
+        let mut writer = FrameWriter::create(&path, test_intrinsics(), 2, 2).expect("create");
         for (i, frame) in frames.iter().enumerate() {
             writer.write_frame(i as f32 * 0.5, frame).expect("write");
         }

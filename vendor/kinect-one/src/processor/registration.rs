@@ -59,10 +59,8 @@ impl Registration {
                 let ix = (mx + 0.5).trunc();
                 let iy = (my + 0.5).trunc();
 
-                let inside = ix >= 0.0
-                    && iy >= 0.0
-                    && ix < DEPTH_WIDTH as f32
-                    && iy < DEPTH_HEIGHT as f32;
+                let inside =
+                    ix >= 0.0 && iy >= 0.0 && ix < DEPTH_WIDTH as f32 && iy < DEPTH_HEIGHT as f32;
 
                 // computing the index from the coordianted for faster access to the data
                 self.distort_map[offset] = if inside {
@@ -120,7 +118,10 @@ impl Registration {
 
         // map for storing the min z values used for each color pixel
         // initializing the depth_map with values outside of the Kinect2 range if filter is enabled
-        let mut filter_map = [INFINITY; COLOR_SIZE];
+        //
+        // Heap, not a local array: COLOR_SIZE is 1920x1080 floats, about 8 MB, which
+        // overflows the main thread stack on macOS.
+        let mut filter_map = vec![INFINITY; COLOR_SIZE];
 
         // map for storing the color offset for each depth pixel
         let mut depth_to_c_off = Vec::with_capacity(DEPTH_SIZE);

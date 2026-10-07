@@ -12,22 +12,22 @@ pub struct Closed {
 impl Device<Closed> {
     /// Open the device.
     pub async fn open(self, reset: bool) -> Result<Device<Opened>, Error> {
+        // On macOS the libusb host resets the device itself. Doing it here
+        // would open the sensor through nusb, which seizes it exclusively.
+        #[cfg(not(target_os = "macos"))]
         if reset {
             self.inner.device_info.open().await?.reset().await?;
         }
 
         Ok(Device {
-            inner: Opened::new(self.inner.device_info).await?,
+            inner: Opened::new(self.inner.device_info, reset).await?,
         })
     }
 }
 
 impl DeviceInfo for Device<Closed> {
     fn id(&self) -> DeviceId {
-        DeviceId {
-            bus: self.inner.device_info.busnum(),
-            address: self.inner.device_info.device_address(),
-        }
+        super::id_of(&self.inner.device_info)
     }
 }
 

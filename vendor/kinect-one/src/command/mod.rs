@@ -2,14 +2,21 @@ mod commands;
 mod response;
 
 pub use commands::*;
+#[cfg(not(target_os = "macos"))]
 use nusb::{
     transfer::{Bulk, In, Out},
     Interface,
 };
 pub use response::*;
+#[cfg(not(target_os = "macos"))]
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-use crate::{Error, FromBuffer, USB_TIMEOUT};
+#[cfg(not(target_os = "macos"))]
+use crate::USB_TIMEOUT;
+use crate::{Error, FromBuffer};
+
+#[cfg(target_os = "macos")]
+use std::sync::Arc;
 
 const COMPLETE_RESPONSE_LENGTH: u32 = 16;
 const COMPLETE_RESPONSE_MAGIC: u32 = 0x0a6fe000;
@@ -18,16 +25,34 @@ const COMPLETE_RESPONSE_MAGIC: u32 = 0x0a6fe000;
 pub struct CommandTransaction {
     in_endpoint: u8,
     out_endpoint: u8,
+    #[cfg(not(target_os = "macos"))]
     interface: Interface,
+    #[cfg(target_os = "macos")]
+    usb: Arc<crate::libusb_host::LibusbSession>,
     sequence: u32,
 }
 
 impl CommandTransaction {
+    #[cfg(not(target_os = "macos"))]
     pub fn new(in_endpoint: u8, out_endpoint: u8, interface: Interface) -> Self {
         Self {
             in_endpoint,
             out_endpoint,
             interface,
+            sequence: 0,
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    pub fn new(
+        in_endpoint: u8,
+        out_endpoint: u8,
+        usb: Arc<crate::libusb_host::LibusbSession>,
+    ) -> Self {
+        Self {
+            in_endpoint,
+            out_endpoint,
+            usb,
             sequence: 0,
         }
     }
@@ -78,14 +103,22 @@ impl CommandTransaction {
             0
         };
 
-        let mut writer = self
-            .interface
-            .endpoint::<Bulk, Out>(self.out_endpoint)?
-            .writer(command.size())
-            .with_write_timeout(USB_TIMEOUT);
+        let bytes = command.as_bytes(sequence);
 
-        writer.write_all(&command.as_bytes(sequence)).await?;
-        writer.flush_end_async().await?;
+        #[cfg(not(target_os = "macos"))]
+        {
+            let mut writer = self
+                .interface
+                .endpoint::<Bulk, Out>(self.out_endpoint)?
+                .writer(command.size())
+                .with_write_timeout(USB_TIMEOUT);
+
+            writer.write_all(&bytes).await?;
+            writer.flush_end_async().await?;
+        }
+
+        #[cfg(target_os = "macos")]
+        self.usb.bulk_write(self.out_endpoint, &bytes).await?;
 
         Ok(sequence)
     }
@@ -93,13 +126,23 @@ impl CommandTransaction {
     async fn receive<const MAX_RESPONSE_LENGTH: u32, const MIN_RESPONSE_LENGTH: u32>(
         &mut self,
     ) -> Result<Vec<u8>, Error> {
-        let mut reader = self
-            .interface
-            .endpoint::<Bulk, In>(self.in_endpoint)?
-            .reader(MAX_RESPONSE_LENGTH as usize)
-            .with_read_timeout(USB_TIMEOUT);
         let mut response = vec![0; MAX_RESPONSE_LENGTH as usize];
-        let length = reader.read(&mut response).await?;
+        let length;
+
+        #[cfg(not(target_os = "macos"))]
+        {
+            let mut reader = self
+                .interface
+                .endpoint::<Bulk, In>(self.in_endpoint)?
+                .reader(MAX_RESPONSE_LENGTH as usize)
+                .with_read_timeout(USB_TIMEOUT);
+            length = reader.read(&mut response).await?;
+        }
+
+        #[cfg(target_os = "macos")]
+        {
+            length = self.usb.bulk_read(self.in_endpoint, &mut response).await?;
+        }
 
         if length < MIN_RESPONSE_LENGTH as usize || length > MAX_RESPONSE_LENGTH as usize {
             Err(Error::Receive(response.len(), MIN_RESPONSE_LENGTH))

@@ -4,12 +4,17 @@ use std::{
     time::Duration,
 };
 
+#[cfg(not(target_os = "macos"))]
 use nusb::{
     descriptors::TransferType,
     transfer::{Bulk, ControlOut, ControlType, In, Recipient},
     Endpoint, Interface, IsoEndpoint,
 };
+#[cfg(target_os = "macos")]
+use std::sync::Arc;
 
+#[cfg(not(target_os = "macos"))]
+use crate::USB_TIMEOUT;
 use crate::{
     command::{
         color_setting_command, init_streams_command, led_setting_command,
@@ -24,11 +29,12 @@ use crate::{
         ColorPacket, DepthPacket,
     },
     settings::{ColorSettingCommandType, LedSettings, PacketParams},
-    Error, FromBuffer, ReadUnaligned, USB_TIMEOUT,
+    Error, FromBuffer, ReadUnaligned,
 };
 
 use super::{Closed, Device, DeviceId, DeviceInfo};
 
+#[cfg(not(target_os = "macos"))]
 #[derive(Clone, Copy)]
 #[repr(u8)]
 enum InterfaceId {
@@ -45,6 +51,7 @@ enum Feature {
 }
 
 impl Feature {
+    #[cfg(not(target_os = "macos"))]
     fn recipient(&self) -> Recipient {
         match self {
             Feature::U1Enable | Feature::U2Enable => Recipient::Device,
@@ -58,30 +65,78 @@ const CONTROL_OUT_ENDPOINT: u8 = 0x02;
 const COLOR_IN_ENDPOINT: u8 = 0x83;
 const IR_IN_ENDPOINT: u8 = 0x84;
 
+#[cfg(not(target_os = "macos"))]
 const SET_ISOCH_DELAY: u8 = 0x31;
+#[cfg(not(target_os = "macos"))]
 const REQUEST_SET_SEL: u8 = 0x30;
 const REQUEST_SET_FEATURE: u8 = 0x03;
+#[cfg(not(target_os = "macos"))]
 const DT_SS_ENDPOINT_COMPANION: u8 = 0x30;
 
 pub struct Opened {
     command_transaction: CommandTransaction,
     device_info: nusb::DeviceInfo,
+    #[cfg(not(target_os = "macos"))]
     device: nusb::Device,
+    #[cfg(not(target_os = "macos"))]
     control_and_color_interface: Interface,
+    #[cfg(not(target_os = "macos"))]
     ir_interface: Interface,
+    #[cfg(not(target_os = "macos"))]
+    color_endpoint: Endpoint<Bulk, In>,
+    #[cfg(not(target_os = "macos"))]
+    ir_endpoint: Option<IsoEndpoint<In>>,
+    #[cfg(target_os = "macos")]
+    usb: Arc<crate::libusb_host::LibusbSession>,
     color_params: ColorParams,
     ir_params: IrParams,
     p0_tables: P0Tables,
     packet_params: PacketParams,
-    color_endpoint: Endpoint<Bulk, In>,
     color_stream_parser: ColorStreamParser,
-    ir_endpoint: Option<IsoEndpoint<In>>,
     depth_stream_parser: DepthStreamParser,
     running: bool,
 }
 
 impl Opened {
-    pub(super) async fn new(device_info: nusb::DeviceInfo) -> Result<Self, Error> {
+    pub(super) async fn new(device_info: nusb::DeviceInfo, reset: bool) -> Result<Self, Error> {
+        #[cfg(target_os = "macos")]
+        let mut opened_device = Self::connect_libusb(device_info, reset).await?;
+        #[cfg(not(target_os = "macos"))]
+        let mut opened_device = {
+            let _ = reset;
+            Self::connect_nusb(device_info).await?
+        };
+
+        // libfreenect2 skips SET_SEL on macOS: the transfer returns overflow,
+        // and the sensor streams without it.
+        #[cfg(not(target_os = "macos"))]
+        opened_device.set_sel(&[0x55, 0, 0x55, 0, 0, 0]).await?;
+        opened_device.set_ir_state(false).await?;
+        // enable power states
+        opened_device.set_feature(Feature::U1Enable).await?;
+        opened_device.set_feature(Feature::U2Enable).await?;
+        opened_device
+            .set_video_transfer_function_state(false)
+            .await?;
+        // get ir max packet size
+        opened_device.packet_params.max_iso_packet_size = opened_device
+            .get_max_iso_packet_size(1, 1, IR_IN_ENDPOINT)
+            .await
+            .unwrap_or(0);
+
+        if opened_device.packet_params.max_iso_packet_size < 0x8400 {
+            return Err(Error::MaxIsoPacket(
+                IR_IN_ENDPOINT,
+                opened_device.packet_params.max_iso_packet_size,
+                0x8400,
+            ));
+        }
+
+        Ok(opened_device)
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    async fn connect_nusb(device_info: nusb::DeviceInfo) -> Result<Self, Error> {
         let device = device_info.open().await?;
 
         if device.active_configuration()?.configuration_value() != 1 {
@@ -108,8 +163,7 @@ impl Opened {
             )
             .await?;
 
-        let packet_params: PacketParams = Default::default();
-        let mut opened_device = Self {
+        Ok(Self {
             command_transaction: CommandTransaction::new(
                 CONTROL_IN_ENDPOINT,
                 CONTROL_OUT_ENDPOINT,
@@ -123,39 +177,37 @@ impl Opened {
             ir_endpoint: None,
             depth_stream_parser: DepthStreamParser::new(),
             running: false,
-            packet_params,
+            packet_params: PacketParams::default(),
             control_and_color_interface,
             ir_interface,
             device_info,
             device,
-        };
-
-        // set power state latencies
-        opened_device.set_sel(&[0x55, 0, 0x55, 0, 0, 0]).await?;
-        opened_device.set_ir_state(false).await?;
-        // enable power states
-        opened_device.set_feature(Feature::U1Enable).await?;
-        opened_device.set_feature(Feature::U2Enable).await?;
-        opened_device
-            .set_video_transfer_function_state(false)
-            .await?;
-        // get ir max packet size
-        opened_device.packet_params.max_iso_packet_size = opened_device
-            .get_max_iso_packet_size(1, 1, IR_IN_ENDPOINT)
-            .await
-            .unwrap_or(0);
-
-        if opened_device.packet_params.max_iso_packet_size < 0x8400 {
-            return Err(Error::MaxIsoPacket(
-                IR_IN_ENDPOINT,
-                opened_device.packet_params.max_iso_packet_size,
-                0x8400,
-            ));
-        }
-
-        Ok(opened_device)
+        })
     }
 
+    #[cfg(target_os = "macos")]
+    async fn connect_libusb(device_info: nusb::DeviceInfo, reset: bool) -> Result<Self, Error> {
+        let usb = crate::libusb_host::LibusbSession::open(&device_info, reset).await?;
+
+        Ok(Self {
+            command_transaction: CommandTransaction::new(
+                CONTROL_IN_ENDPOINT,
+                CONTROL_OUT_ENDPOINT,
+                Arc::clone(&usb),
+            ),
+            color_params: Default::default(),
+            ir_params: Default::default(),
+            p0_tables: Default::default(),
+            color_stream_parser: ColorStreamParser::new(),
+            depth_stream_parser: DepthStreamParser::new(),
+            running: false,
+            packet_params: PacketParams::default(),
+            device_info,
+            usb,
+        })
+    }
+
+    #[cfg(not(target_os = "macos"))]
     async fn set_sel(&self, data: &[u8]) -> Result<(), Error> {
         self.control_and_color_interface
             .control_out(
@@ -175,21 +227,34 @@ impl Opened {
     }
 
     async fn set_feature(&self, feature: Feature) -> Result<(), Error> {
-        self.control_and_color_interface
-            .control_out(
-                ControlOut {
-                    control_type: ControlType::Standard,
-                    recipient: feature.recipient(),
-                    request: REQUEST_SET_FEATURE,
-                    value: feature as u16,
-                    index: 0,
-                    data: &[],
-                },
-                USB_TIMEOUT,
-            )
-            .await?;
+        #[cfg(not(target_os = "macos"))]
+        {
+            self.control_and_color_interface
+                .control_out(
+                    ControlOut {
+                        control_type: ControlType::Standard,
+                        recipient: feature.recipient(),
+                        request: REQUEST_SET_FEATURE,
+                        value: feature as u16,
+                        index: 0,
+                        data: &[],
+                    },
+                    USB_TIMEOUT,
+                )
+                .await?;
+            return Ok(());
+        }
 
-        Ok(())
+        #[cfg(target_os = "macos")]
+        {
+            let recipient = match feature {
+                Feature::U1Enable | Feature::U2Enable => rusb::Recipient::Device,
+                Feature::FunctionSuspend => rusb::Recipient::Interface,
+            };
+            self.usb
+                .control_out(recipient, REQUEST_SET_FEATURE, feature as u16, 0, &[])
+                .await
+        }
     }
 
     async fn set_feature_function_suspend(
@@ -200,17 +265,31 @@ impl Opened {
         let feature = Feature::FunctionSuspend;
         let suspend_options = (low_power_suspend as u16) + ((function_remote_wake as u16) << 1);
 
-        self.control_and_color_interface
+        #[cfg(not(target_os = "macos"))]
+        {
+            self.control_and_color_interface
+                .control_out(
+                    ControlOut {
+                        control_type: ControlType::Standard,
+                        recipient: feature.recipient(),
+                        request: REQUEST_SET_FEATURE,
+                        value: feature as u16,
+                        index: suspend_options << 8 | 0,
+                        data: &[],
+                    },
+                    USB_TIMEOUT,
+                )
+                .await?;
+        }
+
+        #[cfg(target_os = "macos")]
+        self.usb
             .control_out(
-                ControlOut {
-                    control_type: ControlType::Standard,
-                    recipient: feature.recipient(),
-                    request: REQUEST_SET_FEATURE,
-                    value: feature as u16,
-                    index: suspend_options << 8 | 0,
-                    data: &[],
-                },
-                USB_TIMEOUT,
+                rusb::Recipient::Interface,
+                REQUEST_SET_FEATURE,
+                feature as u16,
+                suspend_options << 8,
+                &[],
             )
             .await?;
 
@@ -223,45 +302,74 @@ impl Opened {
         alternate_setting_index: u8,
         endpoint_address: u8,
     ) -> Option<u16> {
-        let configuration = self
-            .device
-            .configurations()
-            .find(|configuration| configuration.configuration_value() == configuration_value)?;
+        #[cfg(target_os = "macos")]
+        {
+            return self.usb.max_iso_packet_size(
+                configuration_value,
+                alternate_setting_index,
+                endpoint_address,
+            );
+        }
 
-        for interface in configuration.interface_alt_settings() {
-            if interface.alternate_setting() == alternate_setting_index {
-                for endpoint in interface.endpoints() {
-                    if endpoint.address() == endpoint_address
-                        && endpoint.transfer_type() == TransferType::Isochronous
-                    {
-                        for buffer in endpoint.descriptors() {
-                            if buffer.len() >= 6 && buffer[1] == DT_SS_ENDPOINT_COMPANION {
-                                return Some(u16::from_buffer(&buffer[4..6]));
+        #[cfg(not(target_os = "macos"))]
+        {
+            let configuration = self
+                .device
+                .configurations()
+                .find(|configuration| configuration.configuration_value() == configuration_value)?;
+
+            for interface in configuration.interface_alt_settings() {
+                if interface.alternate_setting() == alternate_setting_index {
+                    for endpoint in interface.endpoints() {
+                        if endpoint.address() == endpoint_address
+                            && endpoint.transfer_type() == TransferType::Isochronous
+                        {
+                            for buffer in endpoint.descriptors() {
+                                if buffer.len() >= 6 && buffer[1] == DT_SS_ENDPOINT_COMPANION {
+                                    return Some(u16::from_buffer(&buffer[4..6]));
+                                }
                             }
                         }
                     }
                 }
             }
-        }
 
-        None
+            None
+        }
     }
 
     async fn set_ir_state(&mut self, enabled: bool) -> Result<(), Error> {
-        if !enabled {
-            self.ir_endpoint = None;
+        #[cfg(target_os = "macos")]
+        {
+            return self
+                .usb
+                .set_depth_enabled(
+                    enabled,
+                    IR_IN_ENDPOINT,
+                    self.packet_params.ir_num_transfers,
+                    self.packet_params.ir_packets_per_transfer as usize,
+                    self.packet_params.max_iso_packet_size as usize,
+                )
+                .await;
         }
 
-        self.ir_interface.set_alt_setting(enabled as u8).await?;
+        #[cfg(not(target_os = "macos"))]
+        {
+            if !enabled {
+                self.ir_endpoint = None;
+            }
 
-        if enabled {
-            self.ir_endpoint = Some(self.ir_interface.iso_endpoint(
-                IR_IN_ENDPOINT,
-                self.packet_params.ir_packets_per_transfer as usize,
-            )?);
+            self.ir_interface.set_alt_setting(enabled as u8).await?;
+
+            if enabled {
+                self.ir_endpoint = Some(self.ir_interface.iso_endpoint(
+                    IR_IN_ENDPOINT,
+                    self.packet_params.ir_packets_per_transfer as usize,
+                )?);
+            }
+
+            Ok(())
         }
-
-        Ok(())
     }
 
     async fn set_video_transfer_function_state(&self, enabled: bool) -> Result<(), Error> {
@@ -364,25 +472,43 @@ impl Device<Opened> {
             return Err(Error::OnlyWhileRunning("Reading color frame"));
         }
 
-        for _ in 0..self.inner.packet_params.color_num_transfers {
-            self.inner.color_endpoint.submit(
-                self.inner
-                    .color_endpoint
-                    .allocate(self.inner.packet_params.color_transfer_size as usize),
-            );
-        }
-
         let mut result = None;
 
-        while self.inner.color_endpoint.pending() > 0 {
-            let packet = self.inner.color_endpoint.next_complete().await;
-
-            packet.status?;
-
-            result = result.or(self.inner.color_stream_parser.parse(packet.buffer.to_vec()));
+        #[cfg(target_os = "macos")]
+        {
+            for _ in 0..self.inner.packet_params.color_num_transfers {
+                let mut packet = vec![0; self.inner.packet_params.color_transfer_size];
+                let length = self
+                    .inner
+                    .usb
+                    .bulk_read(COLOR_IN_ENDPOINT, &mut packet)
+                    .await?;
+                packet.truncate(length);
+                result = result.or(self.inner.color_stream_parser.parse(packet));
+            }
+            return Ok(result);
         }
 
-        Ok(result)
+        #[cfg(not(target_os = "macos"))]
+        {
+            for _ in 0..self.inner.packet_params.color_num_transfers {
+                self.inner.color_endpoint.submit(
+                    self.inner
+                        .color_endpoint
+                        .allocate(self.inner.packet_params.color_transfer_size as usize),
+                );
+            }
+
+            while self.inner.color_endpoint.pending() > 0 {
+                let packet = self.inner.color_endpoint.next_complete().await;
+
+                packet.status?;
+
+                result = result.or(self.inner.color_stream_parser.parse(packet.buffer.to_vec()));
+            }
+
+            Ok(result)
+        }
     }
 
     pub async fn poll_depth_packet(&mut self) -> Result<Option<DepthPacket>, Error> {
@@ -390,35 +516,48 @@ impl Device<Opened> {
             return Err(Error::OnlyWhileRunning("Reading depth frame"));
         }
 
-        let Some(ir_endpoint) = self.inner.ir_endpoint.as_mut() else {
-            return Ok(None);
-        };
-
-        for _ in 0..self.inner.packet_params.ir_num_transfers {
-            ir_endpoint.submit(
-                ir_endpoint.allocate(
-                    self.inner.packet_params.max_iso_packet_size as usize
-                        * self.inner.packet_params.ir_packets_per_transfer as usize,
-                ),
-                self.inner.packet_params.max_iso_packet_size as usize,
-            );
-        }
-
-        let mut result = None;
-
-        while ir_endpoint.pending() > 0 {
-            let iso_packet = ir_endpoint.next_complete().await;
-
-            iso_packet.status?;
-
-            for packet in iso_packet.successful_packets() {
-                result = result.or(self.inner.depth_stream_parser.parse(
-                    iso_packet.buffer[packet.offset..packet.offset + packet.actual_length].to_vec(),
-                ));
+        #[cfg(target_os = "macos")]
+        {
+            let mut result = None;
+            for packet in self.inner.usb.drain_depth().await? {
+                result = result.or(self.inner.depth_stream_parser.parse(packet));
             }
+            return Ok(result);
         }
 
-        Ok(result)
+        #[cfg(not(target_os = "macos"))]
+        {
+            let Some(ir_endpoint) = self.inner.ir_endpoint.as_mut() else {
+                return Ok(None);
+            };
+
+            for _ in 0..self.inner.packet_params.ir_num_transfers {
+                ir_endpoint.submit(
+                    ir_endpoint.allocate(
+                        self.inner.packet_params.max_iso_packet_size as usize
+                            * self.inner.packet_params.ir_packets_per_transfer as usize,
+                    ),
+                    self.inner.packet_params.max_iso_packet_size as usize,
+                );
+            }
+
+            let mut result = None;
+
+            while ir_endpoint.pending() > 0 {
+                let iso_packet = ir_endpoint.next_complete().await;
+
+                iso_packet.status?;
+
+                for packet in iso_packet.successful_packets() {
+                    result = result.or(self.inner.depth_stream_parser.parse(
+                        iso_packet.buffer[packet.offset..packet.offset + packet.actual_length]
+                            .to_vec(),
+                    ));
+                }
+            }
+
+            Ok(result)
+        }
     }
 
     pub async fn get_firware_versions(&mut self) -> Result<Vec<FirwareVersion>, Error> {
@@ -681,10 +820,7 @@ impl Device<Opened> {
 
 impl DeviceInfo for Device<Opened> {
     fn id(&self) -> DeviceId {
-        DeviceId {
-            bus: self.inner.device_info.busnum(),
-            address: self.inner.device_info.device_address(),
-        }
+        super::id_of(&self.inner.device_info)
     }
 }
 

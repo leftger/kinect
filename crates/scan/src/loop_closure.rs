@@ -171,17 +171,14 @@ impl LoopFinder {
     }
 
     /// Align the new frame against the most plausible earlier ones.
-    fn search(
-        &mut self,
-        index: usize,
-        pose: &Isometry3<f32>,
-        cloud: &IcpCloud,
-    ) -> Option<Loop> {
+    fn search(&mut self, index: usize, pose: &Isometry3<f32>, cloud: &IcpCloud) -> Option<Loop> {
         let mut candidates: Vec<(f32, usize)> = self
             .keyframes
             .iter()
             .enumerate()
-            .filter(|(_, keyframe)| index.saturating_sub(keyframe.index) >= self.config.min_index_gap)
+            .filter(|(_, keyframe)| {
+                index.saturating_sub(keyframe.index) >= self.config.min_index_gap
+            })
             .map(|(position, keyframe)| {
                 (
                     (keyframe.pose.translation.vector - pose.translation.vector).norm(),
@@ -286,10 +283,7 @@ mod tests {
     }
 
     fn at(x: f32, y: f32, z: f32) -> Isometry3<f32> {
-        Isometry3::from_parts(
-            Translation3::new(x, y, z),
-            UnitQuaternion::identity(),
-        )
+        Isometry3::from_parts(Translation3::new(x, y, z), UnitQuaternion::identity())
     }
 
     fn finder() -> LoopFinder {
@@ -306,7 +300,11 @@ mod tests {
 
         // First keyframe: camera at the origin.
         assert!(finder
-            .consider(0, Isometry3::identity(), &view(&world, &Isometry3::identity()))
+            .consider(
+                0,
+                Isometry3::identity(),
+                &view(&world, &Isometry3::identity())
+            )
             .is_none());
 
         // Much later, the camera is genuinely at (0.4, 0, 0), but odometry thinks
@@ -345,7 +343,11 @@ mod tests {
         let world = scene();
         let mut finder = finder();
 
-        finder.consider(0, Isometry3::identity(), &view(&world, &Isometry3::identity()));
+        finder.consider(
+            0,
+            Isometry3::identity(),
+            &view(&world, &Isometry3::identity()),
+        );
 
         // Same nominal pose, but the surface is 1.5 m further away, so nothing can
         // match within the correspondence distance.
@@ -355,7 +357,10 @@ mod tests {
         }
 
         let found = finder.consider(50, at(0.1, 0.0, 0.0), &view(&moved, &at(0.1, 0.0, 0.0)));
-        assert!(found.is_none(), "matched against unrelated geometry: {found:?}");
+        assert!(
+            found.is_none(),
+            "matched against unrelated geometry: {found:?}"
+        );
     }
 
     #[test]
@@ -363,7 +368,11 @@ mod tests {
         let world = scene();
         let mut finder = finder();
 
-        finder.consider(0, Isometry3::identity(), &view(&world, &Isometry3::identity()));
+        finder.consider(
+            0,
+            Isometry3::identity(),
+            &view(&world, &Isometry3::identity()),
+        );
 
         // The very next frames are the same place, but a temporal neighbour says
         // nothing about drift, so the index gap must reject them.
@@ -380,7 +389,11 @@ mod tests {
         let world = scene();
         let mut finder = finder();
 
-        finder.consider(0, Isometry3::identity(), &view(&world, &Isometry3::identity()));
+        finder.consider(
+            0,
+            Isometry3::identity(),
+            &view(&world, &Isometry3::identity()),
+        );
         finder
             .consider(50, at(0.4, 0.0, 0.0), &view(&world, &at(0.4, 0.0, 0.0)))
             .expect("loop");

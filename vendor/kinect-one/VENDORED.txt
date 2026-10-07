@@ -2,7 +2,13 @@ Vendored from https://github.com/Aytixel/kinect-one
 Revision: 24c6dc0
 
 Local changes are marked with `LOCAL PATCH` comments, and the complete diff
-against that revision is in UPSTREAM.patch. Four files differ:
+against that revision is in UPSTREAM.patch. That patch predates the macOS
+libusb host (`src/libusb_host.rs` plus the `cfg(target_os = "macos")` branches
+in the device and command modules): on macOS nusb opens the device
+exclusively and has no isochronous transfers, so the sensor is driven with
+libusb instead. Regenerate UPSTREAM.patch after those changes if you rebase.
+
+Files that differ from upstream, besides the macOS host:
 
   src/lib.rs
       Re-export `Opened`. `Device<Opened>` is the type every caller has to name
@@ -15,6 +21,10 @@ against that revision is in UPSTREAM.patch. Four files differ:
       distortion lands outside the raw image, and writes depth 0 for it; the port
       dropped the check and indexed the frame directly, which panics on real
       frames. This is a genuine upstream bug, not a local preference.
+
+      The colour filter map is also a `Vec` rather than a local array. It is
+      one float per 1920x1080 colour pixel, about 8 MB, which overflows the
+      main-thread stack on macOS.
 
   src/processor/depth/cpu.rs
       An additive `#[cfg(test)]` module only, proving the parallel decode is

@@ -24,6 +24,18 @@ pub trait DeviceInfo: Debug {
     fn id(&self) -> DeviceId;
 }
 
+pub(super) fn id_of(info: &nusb::DeviceInfo) -> DeviceId {
+    DeviceId {
+        // macOS has no USB bus number. The top byte of the IOKit location ID
+        // is the bus, which is enough to tell two sensors apart.
+        #[cfg(target_os = "macos")]
+        bus: (info.location_id() >> 24) as u8,
+        #[cfg(not(target_os = "macos"))]
+        bus: info.busnum(),
+        address: info.device_address(),
+    }
+}
+
 /// Find, open, and control Kinect v2 devices.
 #[derive(Clone)]
 pub struct Device<T> {

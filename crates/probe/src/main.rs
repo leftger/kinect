@@ -1,4 +1,4 @@
-//! Bring-up probe for the Kinect v2 (Xbox One Kinect) on Linux.
+//! Bring-up probe for the Kinect v2 (Xbox One Kinect) on Linux and macOS.
 //!
 //! Answers two questions before any scanning code gets written:
 //! * does the pure-Rust driver actually pull depth frames off this sensor?
@@ -170,12 +170,35 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     device.stop().await?;
 
-    println!("\n[probe] --- timing per frame ({} frames) ---", timing.frames);
-    println!("{:>12}: {:8.1} ms", "poll (USB)", timing.poll.as_secs_f64() * 1000.0 / timing.frames as f64);
-    println!("{:>12}: {:8.1} ms", "depth proc", timing.process.as_secs_f64() * 1000.0 / timing.frames as f64);
-    println!("{:>12}: {:8.1} ms", "undistort", timing.undistort.as_secs_f64() * 1000.0 / timing.frames as f64);
-    println!("{:>12}: {:8.1} ms", "backproject", timing.backproject.as_secs_f64() * 1000.0 / timing.frames as f64);
-    println!("{:>12}: {:8.1} ms", "file write", timing.write.as_secs_f64() * 1000.0 / timing.frames as f64);
+    println!(
+        "\n[probe] --- timing per frame ({} frames) ---",
+        timing.frames
+    );
+    println!(
+        "{:>12}: {:8.1} ms",
+        "poll (USB)",
+        timing.poll.as_secs_f64() * 1000.0 / timing.frames as f64
+    );
+    println!(
+        "{:>12}: {:8.1} ms",
+        "depth proc",
+        timing.process.as_secs_f64() * 1000.0 / timing.frames as f64
+    );
+    println!(
+        "{:>12}: {:8.1} ms",
+        "undistort",
+        timing.undistort.as_secs_f64() * 1000.0 / timing.frames as f64
+    );
+    println!(
+        "{:>12}: {:8.1} ms",
+        "backproject",
+        timing.backproject.as_secs_f64() * 1000.0 / timing.frames as f64
+    );
+    println!(
+        "{:>12}: {:8.1} ms",
+        "file write",
+        timing.write.as_secs_f64() * 1000.0 / timing.frames as f64
+    );
     println!(
         "{:>12}: {:8.1} fps",
         "throughput",
