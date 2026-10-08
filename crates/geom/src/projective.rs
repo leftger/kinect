@@ -212,6 +212,38 @@ impl DepthPyramid {
         Self::build(image.depth, image.width, image.height, intrinsics, count)
     }
 
+    /// Build a pyramid with precomputed surface normals at the finest level.
+    ///
+    /// Used by frame-to-model alignment to supply the TSDF's analytic gradient
+    /// normals directly instead of estimating them from discrete depth differences.
+    pub fn from_image_with_normals(
+        image: &DepthImage<'_>,
+        normals: Vec<Vector3<f32>>,
+        intrinsics: Intrinsics,
+        count: usize,
+    ) -> Self {
+        assert!(count >= 1, "a pyramid needs at least one level");
+        assert_eq!(image.depth.len(), image.width * image.height, "depth size mismatch");
+        assert_eq!(normals.len(), image.width * image.height, "normals size mismatch");
+
+        let mut levels = Vec::with_capacity(count);
+        let mut level = DepthLevel {
+            width: image.width,
+            height: image.height,
+            depth: image.depth.to_vec(),
+            normals,
+            intrinsics,
+        };
+        for _ in 1..count {
+            let next = level.halved();
+            levels.push(level);
+            level = next;
+        }
+        levels.push(level);
+
+        Self { levels }
+    }
+
     /// Finest level.
     pub fn finest(&self) -> &DepthLevel {
         &self.levels[0]
@@ -278,7 +310,8 @@ pub fn align_level(
     initial: Isometry3<f32>,
     params: &IcpParams,
 ) -> IcpResult {
-    if target.normals_present() == 0 {
+    let target_normals = target.normals_present();
+    if target_normals == 0 {
         return IcpResult::failed(initial);
     }
 
@@ -292,5 +325,10 @@ pub fn align_level(
         max_distance: params.max_correspondence_distance,
     };
 
-    align_points(&points, &finder, initial, params)
+    let mut result = align_points(&points, &finder, initial, params);
+    let achievable = points.len().min(target_normals);
+    if achievable > 0 {
+        result.inlier_ratio = (result.correspondences as f32 / achievable as f32).min(1.0);
+    }
+    result
 }

@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = ["crates/geom", "crates/probe", "crates/scan", "vendor/kinect-one"]
+default-members = ["crates/geom", "crates/scan"]
 
 [workspace.package]
 version = "0.1.0"

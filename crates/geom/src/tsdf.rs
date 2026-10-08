@@ -123,6 +123,9 @@ pub struct RaycastImage {
     /// Camera-space z in metres, row-major, in the same convention as
     /// [`DepthImage`]. `NaN` where no surface was found along the ray.
     pub depth: Vec<f32>,
+    /// Camera-space unit normals oriented towards the camera, derived directly
+    /// from the continuous TSDF gradient at the surface crossing.
+    pub normals: Vec<Vector3<f32>>,
 }
 
 impl RaycastImage {
@@ -495,8 +498,11 @@ impl TsdfVolume {
         // by interpolation between the last two samples.
         let min_step = truncation * 0.5;
         let (near, far) = (self.params.min_depth, self.params.max_depth);
+        let h = self.params.voxel_size;
 
         let mut depth = vec![f32::NAN; width * height];
+        let mut normals = vec![Vector3::zeros(); width * height];
+        let mut normal_cache = BlockCache::new(&self.blocks);
 
         for y in 0..height {
             for x in 0..width {
@@ -506,7 +512,20 @@ impl TsdfVolume {
                 if let Some(hit) =
                     self.march(camera_to_world, &direction, near, far, truncation, min_step)
                 {
-                    depth[y * width + x] = hit;
+                    let index = y * width + x;
+                    depth[index] = hit;
+
+                    let cam_point = direction * hit;
+                    let world_point = transform_point(camera_to_world, &cam_point);
+                    if let Some(world_normal) =
+                        self.normal_at_world(&mut normal_cache, &world_point, h)
+                    {
+                        let mut cam_normal = camera_to_world.rotation.inverse() * world_normal;
+                        if cam_normal.dot(&cam_point) > 0.0 {
+                            cam_normal = -cam_normal;
+                        }
+                        normals[index] = cam_normal;
+                    }
                 }
             }
         }
@@ -515,6 +534,30 @@ impl TsdfVolume {
             width,
             height,
             depth,
+            normals,
+        }
+    }
+
+    /// Unit normal in world space from central differences of the TSDF distance field.
+    fn normal_at_world(
+        &self,
+        cache: &mut BlockCache<'_>,
+        world: &Vector3<f32>,
+        h: f32,
+    ) -> Option<Vector3<f32>> {
+        let dx = self.sample(cache, &(world + Vector3::new(h, 0.0, 0.0)))?
+            - self.sample(cache, &(world - Vector3::new(h, 0.0, 0.0)))?;
+        let dy = self.sample(cache, &(world + Vector3::new(0.0, h, 0.0)))?
+            - self.sample(cache, &(world - Vector3::new(0.0, h, 0.0)))?;
+        let dz = self.sample(cache, &(world + Vector3::new(0.0, 0.0, h)))?
+            - self.sample(cache, &(world - Vector3::new(0.0, 0.0, h)))?;
+
+        let grad = Vector3::new(dx, dy, dz);
+        let length = grad.norm();
+        if length > 1e-6 {
+            Some(grad / length)
+        } else {
+            None
         }
     }
 

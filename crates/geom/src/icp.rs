@@ -218,6 +218,9 @@ pub fn align_points(
     }
 
     let mut transform = initial;
+    let mut best_transform = initial;
+    let mut best_inliers = 0usize;
+    let mut best_rmse = f32::INFINITY;
     let mut converged = false;
     let mut last_inliers = 0usize;
     let mut last_rmse = f32::INFINITY;
@@ -275,17 +278,33 @@ pub fn align_points(
             f32::INFINITY
         };
 
+        if inliers >= 6 {
+            let is_better = if inliers > best_inliers {
+                last_rmse < best_rmse * 1.5 || best_inliers == 0
+            } else if inliers as f32 >= best_inliers as f32 * 0.95 {
+                last_rmse < best_rmse
+            } else {
+                false
+            };
+            if is_better {
+                best_transform = transform;
+                best_inliers = inliers;
+                best_rmse = last_rmse;
+            }
+        }
+
+        // If we previously had a solid fit and now the error has exploded or
+        // inliers collapsed, break early rather than drifting further away.
+        if iteration >= 2 && best_inliers >= 6 {
+            if inliers < best_inliers / 2 || last_rmse > best_rmse * 2.0 {
+                break;
+            }
+        }
+
         if inliers < 6 {
             // Under-constrained (a rigid transform needs at least 6 independent
-            // constraints) -- return what we started with rather than nonsense.
-            return IcpResult {
-                transform,
-                correspondences: inliers,
-                inlier_ratio: inliers as f32 / source.len() as f32,
-                rmse: last_rmse,
-                iterations,
-                converged: false,
-            };
+            // constraints) -- break and return the best state found so far.
+            break;
         }
 
         // Slight Levenberg damping keeps the 6x6 system solvable when the
@@ -297,8 +316,29 @@ pub fn align_points(
             break;
         };
 
-        let omega = Vector3::new(step[0], step[1], step[2]);
-        let translation = Vector3::new(step[3], step[4], step[5]);
+        let mut omega = Vector3::new(step[0], step[1], step[2]);
+        let mut translation = Vector3::new(step[3], step[4], step[5]);
+
+        let step_trans_norm = translation.norm();
+        let step_rot_norm = omega.norm();
+
+        // A single iteration must not teleport the sensor: an enormous step
+        // indicates an unconstrained null space (e.g. sliding along a flat wall)
+        // or a near-singular Hessian. Break early rather than throwing the
+        // transform into outer space.
+        if step_trans_norm > 1.0 || step_rot_norm > 1.0 {
+            break;
+        }
+
+        // Clamp step to a plausible per-iteration trust region.
+        let max_iter_translation = 0.15;
+        let max_iter_rotation = 0.20;
+        if step_trans_norm > max_iter_translation {
+            translation *= max_iter_translation / step_trans_norm;
+        }
+        if step_rot_norm > max_iter_rotation {
+            omega *= max_iter_rotation / step_rot_norm;
+        }
 
         let delta = Isometry3::from_parts(
             Translation3::from(translation),
@@ -314,15 +354,18 @@ pub fn align_points(
         }
     }
 
+    let (final_transform, final_inliers, final_rmse) = if best_inliers >= 6 {
+        (best_transform, best_inliers, best_rmse)
+    } else {
+        (initial, last_inliers, last_rmse)
+    };
+
     IcpResult {
-        transform,
-        correspondences: last_inliers,
-        inlier_ratio: last_inliers as f32 / source.len() as f32,
-        rmse: last_rmse,
+        transform: final_transform,
+        correspondences: final_inliers,
+        inlier_ratio: final_inliers as f32 / source.len() as f32,
+        rmse: final_rmse,
         iterations,
-        // Whether the step actually fell below tolerance, rather than merely
-        // running without error. Exhausting the iteration budget with the residual
-        // still moving is exactly the case a caller needs to know about.
         converged,
     }
 }

@@ -8,7 +8,7 @@
 
 use geom::icp::IcpParams;
 use geom::projective::{align_level, DepthPyramid};
-use geom::tsdf::TsdfVolume;
+use geom::tsdf::{RaycastImage, TsdfVolume};
 use geom::{DepthImage, Intrinsics};
 use nalgebra::Isometry3;
 
@@ -233,8 +233,16 @@ impl Odometry {
             return None;
         }
 
-        Some(DepthPyramid::from_image(
-            &rendered.as_depth_image(),
+        let RaycastImage {
+            width: r_width,
+            height: r_height,
+            depth: r_depth,
+            normals: r_normals,
+        } = rendered;
+
+        Some(DepthPyramid::from_image_with_normals(
+            &DepthImage::new(r_width, r_height, &r_depth),
+            r_normals,
             self.intrinsics,
             self.config.levels.len(),
         ))
@@ -274,7 +282,13 @@ impl Odometry {
             };
         }
 
-        let rendered = if self.config.frame_to_model {
+        // In frame-to-model mode, render against the model only when no gap is open.
+        // Once a frame is rejected (gap > 0), the committed pose stands still while
+        // the sensor keeps moving. Continuing to render from the frozen pose makes
+        // the model target further and further away, guaranteeing that the tracker
+        // can never recover. Falling back to the previous frame tracks the sensor
+        // through the gap until it catches up and commits a fresh pose.
+        let rendered = if self.config.frame_to_model && self.gap == 0 {
             model.and_then(|volume| self.render(volume, depth.width, depth.height))
         } else {
             None
@@ -332,10 +346,23 @@ impl Odometry {
                 );
 
                 iterations += result.iterations;
-                if result.correspondences > 0 {
+
+                // Only allow coarse levels to update the transform if they found
+                // a meaningful set of correspondences. If a coarse level diverged
+                // or found almost no inliers, keeping the previous guess is far
+                // safer than poisoning the initialization for finer levels.
+                if result.correspondences >= 10 && result.inlier_ratio >= 0.10 {
                     transform = result.transform;
                     inlier_ratio = result.inlier_ratio;
                     rmse = result.rmse;
+                } else if index == 0 {
+                    // At the finest level, always record the final stats so the
+                    // acceptance gates evaluate against actual correspondence quality.
+                    inlier_ratio = result.inlier_ratio;
+                    rmse = result.rmse;
+                    if result.correspondences > 0 {
+                        transform = result.transform;
+                    }
                 }
             }
         }
@@ -787,7 +814,12 @@ mod tests {
         // *trackable* count bounds the achievable inlier ratio -- and the inlier
         // gate is what decides whether a frame is used at all.
         let source = DepthPyramid::from_image(&DepthImage::new(WIDTH, HEIGHT, &room), intrinsics, 1);
-        let target = DepthPyramid::from_image(&rendered.as_depth_image(), intrinsics, 1);
+        let target = DepthPyramid::from_image_with_normals(
+            &rendered.as_depth_image(),
+            rendered.normals.clone(),
+            intrinsics,
+            1,
+        );
         eprintln!(
             "coverage of {} pixels: frame {} trackable, render {} hits / {} trackable",
             WIDTH * HEIGHT,
