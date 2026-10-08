@@ -237,14 +237,17 @@ fn parse_args(
                         .into(),
                 )
             }
-            Command::Record | Command::Replay => {
+            Command::Record => {
                 return Err(
-                    "--dataset needs `live`: a .k2df recording stores depth frames only, \
-                     so there is no colour to build a dataset from. Use `synth`, which \
-                     renders its own colour, to build a dataset without a capture"
+                    "--dataset cannot be used with `record`: a record run only writes a capture file. \
+                     Use `live --color --dataset DIR`, or replay a colour recording with \
+                     `scan replay --in FILE --dataset DIR`"
                         .into(),
                 )
             }
+            // `replay` is allowed with `--dataset`; the recording itself is checked in
+            // `replay()` to ensure it carries a colour stream.
+            Command::Replay => {}
             // `synth` renders its own colour, so it needs no stream and no flag.
             Command::Synth => {}
             Command::Help => {}
@@ -447,19 +450,35 @@ async fn record(options: &Options) -> Result<(), Box<dyn Error>> {
         .clone()
         .unwrap_or_else(|| PathBuf::from("capture.k2df"));
 
+    let color_enabled = options.color;
+    let drain = if color_enabled { false } else { options.drain_color };
     let mut capture =
-        capture::Capture::open(options.filters, options.drain_color, options.gpu).await?;
+        capture::Capture::open(options.filters, color_enabled || drain, options.gpu).await?;
     let intrinsics = capture.intrinsics();
     let (width, height) = capture.dimensions();
 
-    let mut writer = recording::FrameWriter::create(&out, intrinsics, width, height)?;
-    println!("[scan] recording {frames} frames to {}", out.display());
+    let mut writer =
+        recording::FrameWriter::create_with_color(&out, intrinsics, width, height, color_enabled)?;
+    let mode_desc = if color_enabled { "depth + colour" } else { "depth" };
+    println!("[scan] recording {frames} {mode_desc} frames to {}", out.display());
 
     let started = std::time::Instant::now();
     for index in 1..=frames {
-        let frame = capture.next_frame().await?;
+        let frame = capture.next_frame().await?.to_vec();
+        let color = if color_enabled {
+            capture.color().map(|c| FrameColor {
+                rgb: &c.rgb,
+                depth: &c.depth,
+                valid: &c.valid,
+                exposure: c.exposure,
+                gain: c.gain,
+                gamma: c.gamma,
+            })
+        } else {
+            None
+        };
         // Seconds since capture began, so the recording carries real timing.
-        writer.write_frame(started.elapsed().as_secs_f32(), frame)?;
+        writer.write_frame_with_color(started.elapsed().as_secs_f32(), &frame, color)?;
 
         if index % 10 == 0 || index == frames {
             println!("[scan] recorded {index}/{frames}");
@@ -480,12 +499,13 @@ fn replay(options: &Options) -> Result<(), Box<dyn Error>> {
     let duration = recording.frames.last().map_or(0.0, |frame| frame.timestamp);
 
     println!(
-        "[scan] {} frames over {:.1} s of {}x{} from {}",
+        "[scan] {} frames over {:.1} s of {}x{} from {} (colour: {})",
         recording.frames.len(),
         duration,
         recording.width,
         recording.height,
-        input.display()
+        input.display(),
+        if recording.has_color { "yes" } else { "none" },
     );
     println!(
         "[scan] depth intrinsics fx={:.2} fy={:.2} cx={:.2} cy={:.2}",
@@ -494,9 +514,14 @@ fn replay(options: &Options) -> Result<(), Box<dyn Error>> {
         recording.intrinsics.cx,
         recording.intrinsics.cy
     );
-    if options.color {
+    if !recording.has_color && options.color {
         println!(
-            "[scan] --color is live-only; a .k2df recording stores depth frames and has no colour to paint"
+            "[scan] this .k2df recording has no colour stream; painting is unavailable"
+        );
+    }
+    if !recording.has_color && options.dataset.is_some() {
+        return Err(
+            "cannot export dataset from this recording: it was captured without colour".into(),
         );
     }
 
@@ -508,7 +533,20 @@ fn replay(options: &Options) -> Result<(), Box<dyn Error>> {
     let limit = options.frames.unwrap_or(usize::MAX);
 
     for (index, frame) in recording.frames.iter().take(limit).enumerate() {
-        let report = scanner.add_frame(&frame.depth, recording.width, recording.height);
+        let color = frame.color.as_ref().map(|c| FrameColor {
+            rgb: &c.rgb,
+            depth: &c.depth,
+            valid: &c.valid,
+            exposure: c.exposure,
+            gain: c.gain,
+            gamma: c.gamma,
+        });
+        let report = scanner.add_frame_with_color(
+            &frame.depth,
+            recording.width,
+            recording.height,
+            color,
+        );
         print_progress(index + 1, &report);
     }
 
@@ -1061,18 +1099,19 @@ mod tests {
     }
 
     #[test]
-    fn dataset_is_refused_for_the_depth_only_commands() {
-        for command in ["record", "replay"] {
-            let error = parse_args(words(&[command, "--dataset", "out/d"])).expect_err(command);
-            assert!(
-                error.to_string().contains("--dataset needs `live`"),
-                "{command}: {error}"
-            );
-            assert!(
-                error.to_string().contains(".k2df"),
-                "{command} should say why: {error}"
-            );
-        }
+    fn dataset_is_refused_for_record_command() {
+        let error = parse_args(words(&["record", "--dataset", "out/d"])).expect_err("record");
+        assert!(
+            error.to_string().contains("--dataset cannot be used with `record`"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn dataset_is_allowed_for_replay_at_parse_time() {
+        let (command, options) = parse_args(words(&["replay", "--in", "capture.k2df", "--dataset", "out/d"])).expect("parse");
+        assert!(matches!(command, Command::Replay));
+        assert_eq!(options.dataset, Some(PathBuf::from("out/d")));
     }
 
     #[test]
