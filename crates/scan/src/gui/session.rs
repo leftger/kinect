@@ -44,6 +44,8 @@ const POINT_STRIDE: usize = 4;
 pub(crate) enum Source {
     /// The attached Kinect v2.
     Live,
+    /// The attached Kinect v2, writing a `.k2df` recording as it reconstructs.
+    Record(PathBuf),
     /// A `.k2df` recording. Needs no sensor.
     Replay(PathBuf),
     /// The analytic room in `synthetic`. Needs no sensor.
@@ -54,6 +56,7 @@ impl Source {
     fn label(&self) -> String {
         match self {
             Self::Live => "live sensor".to_string(),
+            Self::Record(path) => format!("record to {}", path.display()),
             Self::Replay(path) => format!("replay {}", path.display()),
             Self::Synthetic => "synthetic room".to_string(),
         }
@@ -110,6 +113,18 @@ impl Status {
     }
 }
 
+/// What the last export wrote as a Gaussian-splatting dataset.
+///
+/// A small copy of the exporter's report, so the UI can show it without
+/// holding the `dataset` module's type in every snapshot.
+#[derive(Clone, Debug)]
+pub(crate) struct DatasetSummary {
+    pub dir: PathBuf,
+    pub views: usize,
+    pub points: usize,
+    pub skipped: usize,
+}
+
 /// The state the GUI reads every repaint.
 pub(crate) struct SessionView {
     pub status: Status,
@@ -128,6 +143,10 @@ pub(crate) struct SessionView {
     pub log: Vec<String>,
     pub error: Option<String>,
     pub output: Option<PathBuf>,
+    /// Vertices and triangles of the last exported mesh, when it had a surface.
+    pub mesh: Option<(usize, usize)>,
+    /// The last dataset hand-off, when an export requested one.
+    pub dataset: Option<DatasetSummary>,
     pub started: Option<Instant>,
     pub finished: Option<Instant>,
 }
@@ -151,6 +170,8 @@ impl Default for SessionView {
             log: Vec::new(),
             error: None,
             output: None,
+            mesh: None,
+            dataset: None,
             started: None,
             finished: None,
         }
@@ -186,6 +207,8 @@ impl SessionView {
             log: self.log.clone(),
             error: self.error.clone(),
             output: self.output.clone(),
+            mesh: self.mesh,
+            dataset: self.dataset.clone(),
             elapsed,
         }
     }
@@ -220,6 +243,10 @@ pub(crate) struct SessionSnapshot {
     pub log: Vec<String>,
     pub error: Option<String>,
     pub output: Option<PathBuf>,
+    /// Vertices and triangles of the last exported mesh.
+    pub mesh: Option<(usize, usize)>,
+    /// The last dataset hand-off, when one was requested and written.
+    pub dataset: Option<DatasetSummary>,
     pub elapsed: f32,
 }
 
@@ -370,7 +397,7 @@ pub(crate) fn spawn(config: SessionConfig) -> SessionHandle {
 
 fn expected_total(config: &SessionConfig) -> usize {
     match &config.source {
-        Source::Live => config.options.frames.unwrap_or(DEFAULT_FRAMES),
+        Source::Live | Source::Record(_) => config.options.frames.unwrap_or(DEFAULT_FRAMES),
         Source::Synthetic => config.options.frames.unwrap_or(24).max(2),
         // Unknown until the recording is opened.
         Source::Replay(_) => 0,
@@ -405,6 +432,8 @@ fn worker(
             view.status = Status::Idle;
             view.finished = Some(Instant::now());
             view.scene = None;
+            view.mesh = None;
+            view.dataset = None;
             view.log("scan discarded");
         }
         Err(error) => {
@@ -436,6 +465,8 @@ fn hold_scanner(
                 view.status = Status::Idle;
                 view.scene = None;
                 view.output = None;
+                view.mesh = None;
+                view.dataset = None;
                 view.error = None;
                 view.log("scan discarded");
                 return;
@@ -462,24 +493,34 @@ fn export_scanner(scanner: &mut Scanner, options: &Options, shared: &Arc<Mutex<S
         ));
     }
 
-    match crate::finish_scan(scanner, options) {
-        Ok(()) => {
+    match crate::finish_scan_with_report(scanner, options) {
+        Ok(summary) => {
+            let written = summary.output.display().to_string();
+            let dataset_log = summary.dataset.as_ref().map(|report| {
+                format!(
+                    "dataset: {} views, {} initial points in {}",
+                    report.views,
+                    report.points,
+                    report.dir.display()
+                )
+            });
+
             let mut view = shared.lock().unwrap();
             view.status = Status::Exported;
-            view.output = Some(
-                options
-                    .out
-                    .clone()
-                    .unwrap_or_else(|| PathBuf::from("scan.ply")),
-            );
+            view.output = Some(summary.output);
+            view.mesh = summary.mesh;
+            view.dataset = summary.dataset.map(|report| DatasetSummary {
+                dir: report.dir,
+                views: report.views,
+                points: report.points,
+                skipped: report.skipped,
+            });
             view.finished = Some(Instant::now());
             view.error = None;
-            let written = view
-                .output
-                .as_ref()
-                .map(|path| path.display().to_string())
-                .unwrap_or_default();
             view.log(format!("exported {written}"));
+            if let Some(line) = dataset_log {
+                view.log(line);
+            }
         }
         Err(error) => {
             // The window may be closing, so the log entry alone can be lost.
@@ -501,7 +542,8 @@ fn execute(
     commands: &Receiver<Command>,
 ) -> Result<Option<Scanner>, Box<dyn Error>> {
     match &config.source {
-        Source::Live => run_live(config, shared, control, commands),
+        Source::Live => run_live(config, shared, control, commands, None),
+        Source::Record(path) => run_live(config, shared, control, commands, Some(path)),
         Source::Replay(path) => run_replay(path, config, shared, control, commands),
         Source::Synthetic => run_synthetic(config, shared, control, commands),
     }
@@ -628,6 +670,7 @@ fn run_live(
     shared: &Arc<Mutex<SessionView>>,
     control: &Control,
     commands: &Receiver<Command>,
+    record_to: Option<&PathBuf>,
 ) -> Result<Option<Scanner>, Box<dyn Error>> {
     let frames = config.options.frames.unwrap_or(DEFAULT_FRAMES);
 
@@ -645,6 +688,33 @@ fn run_live(
         let intrinsics = capture.intrinsics();
         let (width, height) = capture.dimensions();
 
+        // Open the recording before the first frame. If it cannot be created,
+        // stop the capture and fail before a scan is spent.
+        let mut writer = match record_to {
+            Some(path) => match recording::FrameWriter::create_with_color(
+                path,
+                intrinsics,
+                width,
+                height,
+                config.options.color,
+            ) {
+                Ok(writer) => Some(writer),
+                Err(error) => {
+                    if let Err(stop_error) = capture.stop().await {
+                        shared
+                            .lock()
+                            .unwrap()
+                            .log(format!("stopping the sensor failed: {stop_error}"));
+                    }
+                    return Err(
+                        format!("cannot create recording {}: {error}", path.display()).into(),
+                    );
+                }
+            },
+            None => None,
+        };
+        let recording_path = record_to.map(|path| path.display().to_string());
+
         {
             let mut view = shared.lock().unwrap();
             view.status = Status::Running;
@@ -653,12 +723,17 @@ fn run_live(
                 "sensor open: {width}x{height}, fx={:.2} fy={:.2}",
                 intrinsics.fx, intrinsics.fy
             ));
+            if let Some(path) = &recording_path {
+                view.log(format!("recording frames to {path}"));
+            }
         }
 
         let mut state = SessionState::new(intrinsics, width, height, config);
+        let recorded_from = Instant::now();
 
         for index in 1..=frames {
             if !pump(control, commands, shared) {
+                finish_recording(writer.take(), recording_path.as_deref(), shared);
                 // Stopping the streams failed should not cost the scan.
                 if let Err(error) = capture.stop().await {
                     shared
@@ -672,6 +747,7 @@ fn run_live(
             let depth = match capture.next_frame().await {
                 Ok(frame) => frame.to_vec(),
                 Err(error) => {
+                    finish_recording(writer.take(), recording_path.as_deref(), shared);
                     // A sensor that drops out should not throw away the model
                     // built so far. Stop like a user Stop, and let the window
                     // export what it has.
@@ -688,6 +764,35 @@ fn run_live(
                     return finish_session(state, control);
                 }
             };
+
+            // Write the recording first, then hand the same frame to the
+            // scanner. A failed write disables recording but keeps the scan.
+            let mut write_failed = None;
+            if let Some(active) = writer.as_mut() {
+                let recorded_color = capture.color().map(|captured| FrameColor {
+                    rgb: captured.rgb.as_slice(),
+                    depth: captured.depth.as_slice(),
+                    valid: captured.valid.as_slice(),
+                    exposure: captured.exposure,
+                    gain: captured.gain,
+                    gamma: captured.gamma,
+                });
+                if let Err(error) = active.write_frame_with_color(
+                    recorded_from.elapsed().as_secs_f32(),
+                    &depth,
+                    recorded_color,
+                ) {
+                    write_failed = Some(error);
+                }
+            }
+            if let Some(error) = write_failed {
+                shared
+                    .lock()
+                    .unwrap()
+                    .log(format!("recording failed: {error}; continuing without it"));
+                writer = None;
+            }
+
             let color = capture.color().map(|captured| FrameColor {
                 rgb: captured.rgb.as_slice(),
                 depth: captured.depth.as_slice(),
@@ -701,6 +806,7 @@ fn run_live(
             state.maybe_publish(shared, index == 1);
         }
 
+        finish_recording(writer.take(), recording_path.as_deref(), shared);
         state.maybe_publish(shared, true);
         if let Err(error) = capture.stop().await {
             // A failure to shut the streams down must not discard the scan.
@@ -711,6 +817,36 @@ fn run_live(
         }
         Ok(Some(state.scanner))
     })
+}
+
+/// Close an optional recording and report what it wrote.
+///
+/// The writer owns the file, so every exit path from `run_live` calls this,
+/// including Stop, Reset and a sensor that drops out.
+fn finish_recording(
+    writer: Option<recording::FrameWriter>,
+    path: Option<&str>,
+    shared: &Arc<Mutex<SessionView>>,
+) {
+    let Some(writer) = writer else {
+        return;
+    };
+    match writer.finish() {
+        Ok(count) => {
+            if let Some(path) = path {
+                shared
+                    .lock()
+                    .unwrap()
+                    .log(format!("recorded {count} frames to {path}"));
+            }
+        }
+        Err(error) => {
+            shared
+                .lock()
+                .unwrap()
+                .log(format!("finishing the recording failed: {error}"));
+        }
+    }
 }
 
 fn run_replay(
@@ -1068,7 +1204,10 @@ mod tests {
         // tracker.
         let mut config = synthetic_config(12);
         let out = std::env::temp_dir().join(format!("scan-gui-test-{}.ply", std::process::id()));
+        let dataset = std::env::temp_dir().join(format!("scan-gui-test-ds-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dataset);
         config.options.out = Some(out.clone());
+        config.options.dataset = Some(dataset.clone());
 
         let shared = Arc::new(Mutex::new(SessionView::default()));
         let control = Control::default();
@@ -1103,9 +1242,22 @@ mod tests {
         // The window's Drop path ends here: stop, then export the held scanner.
         export_scanner(&mut scanner, &config.options, &shared);
         assert!(out.exists(), "export did not write {}", out.display());
-        assert_eq!(shared.lock().unwrap().status, Status::Exported);
+        {
+            let view = shared.lock().unwrap();
+            assert_eq!(view.status, Status::Exported);
+            let mesh = view.mesh.expect("the export reported its mesh");
+            assert!(mesh.0 > 0 && mesh.1 > 0);
+            let summary = view
+                .dataset
+                .as_ref()
+                .expect("the export reported its dataset");
+            assert!(summary.views > 0);
+            assert!(summary.points > 0);
+            assert_eq!(summary.dir, dataset);
+        }
 
         let _ = std::fs::remove_file(&out);
+        let _ = std::fs::remove_dir_all(&dataset);
         let _ = std::fs::remove_file(out.with_extension("trajectory.ply"));
     }
 
@@ -1165,6 +1317,35 @@ mod tests {
         if let Some(dataset) = &config.options.dataset {
             let _ = std::fs::remove_dir_all(dataset);
         }
+    }
+
+    #[test]
+    fn finish_recording_closes_the_file_and_reports_the_count() {
+        let path = std::env::temp_dir().join(format!(
+            "scan-gui-finish-record-{}.k2df",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+
+        let mut writer =
+            recording::FrameWriter::create(&path, synthetic::intrinsics(), 4, 4).expect("create");
+        writer
+            .write_frame(0.0, &vec![2.0f32; 16])
+            .expect("write frame");
+
+        let shared = Arc::new(Mutex::new(SessionView::default()));
+        finish_recording(Some(writer), Some("test.k2df"), &shared);
+
+        let recording = recording::read(&path).expect("read the finished recording");
+        assert_eq!(recording.frames.len(), 1);
+        assert!(shared
+            .lock()
+            .unwrap()
+            .log
+            .iter()
+            .any(|line| line.contains("recorded 1 frames to test.k2df")));
+
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

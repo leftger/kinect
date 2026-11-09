@@ -23,9 +23,9 @@ mod render;
 mod session;
 
 use std::error::Error;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use eframe::egui;
 use geom::coloring::ColorMode;
@@ -41,6 +41,7 @@ use session::{SessionConfig, SessionHandle, SessionSnapshot, Source, Status};
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SourceChoice {
     Live,
+    Record,
     Replay,
     Synthetic,
 }
@@ -49,9 +50,45 @@ impl SourceChoice {
     fn label(self) -> &'static str {
         match self {
             Self::Live => "Live sensor",
+            Self::Record => "Record",
             Self::Replay => "Replay",
             Self::Synthetic => "Synthetic",
         }
+    }
+}
+
+/// Check that `path` (or its nearest existing ancestor) can be written to.
+///
+/// The window starts a long scan before it writes the dataset or recording, so
+/// a typo or a read-only mount should be caught at Start, not after the capture.
+/// The probe file is removed immediately.
+fn check_directory_writable(path: &Path) -> Result<(), String> {
+    let mut probe = path.to_path_buf();
+    while !probe.exists() {
+        match probe.parent() {
+            Some(parent) if !parent.as_os_str().is_empty() => probe = parent.to_path_buf(),
+            _ => {
+                probe = PathBuf::from(".");
+                break;
+            }
+        }
+    }
+
+    if !probe.is_dir() {
+        return Err(format!("{} is not a directory", probe.display()));
+    }
+
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_nanos())
+        .unwrap_or(0);
+    let test = probe.join(format!(".scan-write-{}-{stamp}", std::process::id()));
+    match std::fs::File::create(&test) {
+        Ok(_) => {
+            let _ = std::fs::remove_file(&test);
+            Ok(())
+        }
+        Err(error) => Err(format!("cannot write in {}: {error}", probe.display())),
     }
 }
 
@@ -139,7 +176,9 @@ struct ScannerApp {
     base: Options,
     config: UiConfig,
     source: SourceChoice,
+    /// Replay input, or the `.k2df` path a Record session writes.
     replay_path: String,
+    record_path: String,
     session: Option<SessionHandle>,
     snapshot: SessionSnapshot,
     scene: Option<Arc<PreviewScene>>,
@@ -161,6 +200,7 @@ impl ScannerApp {
             config: UiConfig::from_options(options),
             source,
             replay_path,
+            record_path: "capture.k2df".to_string(),
             session: None,
             snapshot: SessionSnapshot::default(),
             scene: None,
@@ -279,11 +319,12 @@ impl ScannerApp {
         }
 
         let dataset = self.config.dataset.trim();
-        if !dataset.is_empty() && self.source == SourceChoice::Live && !self.config.color {
-            // A live dataset is built from the colour views, so it needs the
-            // colour stream. Replay and synthetic may already have colour.
+        let needs_colour = matches!(self.source, SourceChoice::Live | SourceChoice::Record);
+        if !dataset.is_empty() && needs_colour && !self.config.color {
+            // A live or recorded dataset is built from the colour views, so it
+            // needs the colour stream. Replay and synthetic may already have it.
             self.form_error =
-                Some("a dataset needs colour on a live scan; tick Colour".to_string());
+                Some("a dataset needs colour on a live or recorded scan; tick Colour".to_string());
             return;
         }
         options.dataset = if dataset.is_empty() {
@@ -291,9 +332,41 @@ impl ScannerApp {
         } else {
             Some(PathBuf::from(dataset))
         };
+        if let Some(dir) = &options.dataset {
+            // The exporter creates the directory, but only after the scan has
+            // run. Check the nearest writable ancestor now instead.
+            if let Err(error) = check_directory_writable(dir) {
+                self.form_error = Some(error);
+                return;
+            }
+        }
 
         let source = match self.source {
             SourceChoice::Live => Source::Live,
+            SourceChoice::Record => {
+                let path = self.record_path.trim();
+                if path.is_empty() {
+                    self.form_error = Some("choose a .k2df path for the recording".to_string());
+                    return;
+                }
+                let path = PathBuf::from(path);
+                let parent = path
+                    .parent()
+                    .filter(|parent| !parent.as_os_str().is_empty())
+                    .unwrap_or_else(|| Path::new("."));
+                if !parent.is_dir() {
+                    self.form_error = Some(format!(
+                        "recording directory {} does not exist",
+                        parent.display()
+                    ));
+                    return;
+                }
+                if let Err(error) = check_directory_writable(parent) {
+                    self.form_error = Some(error);
+                    return;
+                }
+                Source::Record(path)
+            }
             SourceChoice::Replay => {
                 let path = self.replay_path.trim();
                 if path.is_empty() {
@@ -348,6 +421,7 @@ impl ScannerApp {
             ui.horizontal_wrapped(|ui| {
                 for choice in [
                     SourceChoice::Live,
+                    SourceChoice::Record,
                     SourceChoice::Replay,
                     SourceChoice::Synthetic,
                 ] {
@@ -359,8 +433,19 @@ impl ScannerApp {
                 SourceChoice::Live => {
                     ui.small("A Kinect v2 on a USB 3 port. Nothing else is needed.");
                 }
+                SourceChoice::Record => {
+                    ui.small(
+                        "Capture while reconstructing, and write a .k2df for later replays. \
+                         Tick Colour to store the colour views a dataset needs.",
+                    );
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.record_path).hint_text("capture.k2df"),
+                    );
+                }
                 SourceChoice::Replay => {
-                    ui.small("A .k2df recording. Use `scan record` to make one.");
+                    ui.small(
+                        "A .k2df recording. Make one with the Record source or `scan record`.",
+                    );
                     ui.add(
                         egui::TextEdit::singleline(&mut self.replay_path)
                             .hint_text("/path/to/capture.k2df"),
@@ -398,7 +483,7 @@ impl ScannerApp {
 
                     ui.label("Colour");
                     match self.source {
-                        SourceChoice::Live => {
+                        SourceChoice::Live | SourceChoice::Record => {
                             ui.checkbox(&mut self.config.color, "capture and paint");
                         }
                         SourceChoice::Replay => {
@@ -497,7 +582,10 @@ impl ScannerApp {
                 egui::TextEdit::singleline(&mut self.config.dataset)
                     .hint_text("optional dataset directory"),
             );
-            ui.small("A dataset needs colour. Leave empty to skip it.");
+            ui.small(
+                "A Nerfstudio/Brush dataset for Gaussian splatting. Needs colour views; \
+                 leave empty to skip it.",
+            );
         });
 
         ui.separator();
@@ -719,6 +807,30 @@ impl ScannerApp {
             }
         });
 
+        if let Some(dataset) = &snapshot.dataset {
+            ui.separator();
+            ui.horizontal_wrapped(|ui| {
+                ui.label(egui::RichText::new("dataset").weak().small());
+                ui.monospace(dataset.dir.display().to_string());
+                ui.separator();
+                ui.label(format!("{} views", dataset.views));
+                ui.label(format!("{} initial points", dataset.points));
+                if dataset.skipped > 0 {
+                    ui.colored_label(
+                        egui::Color32::from_rgb(240, 200, 90),
+                        format!("{} views skipped", dataset.skipped),
+                    );
+                }
+            });
+        }
+
+        if let Some((vertices, triangles)) = snapshot.mesh {
+            ui.horizontal_wrapped(|ui| {
+                ui.label(egui::RichText::new("exported mesh").weak().small());
+                ui.monospace(format!("{vertices} vertices, {triangles} triangles"));
+            });
+        }
+
         if let Some(error) = &snapshot.error {
             ui.colored_label(egui::Color32::LIGHT_RED, error);
         }
@@ -869,5 +981,52 @@ fn status_color(status: Status) -> egui::Color32 {
         Status::Exported => egui::Color32::from_rgb(96, 220, 130),
         Status::Error => egui::Color32::from_rgb(250, 120, 110),
         Status::Idle => egui::Color32::from_gray(170),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_write_probe_accepts_a_directory_and_rejects_a_file() {
+        let dir = std::env::temp_dir().join(format!("scan-gui-write-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+
+        check_directory_writable(&dir).expect("the temp directory is writable");
+        check_directory_writable(&dir.join("not/created/yet"))
+            .expect("the nearest existing ancestor is writable");
+
+        let file = dir.join("file");
+        std::fs::write(&file, b"x").expect("write file");
+        let error = check_directory_writable(&file.join("child")).expect_err("a file is not a dir");
+        assert!(error.contains("not a directory"), "{error}");
+
+        std::fs::remove_dir_all(&dir).expect("remove temp dir");
+    }
+
+    #[test]
+    fn a_bad_record_or_dataset_path_is_rejected_before_a_worker_starts() {
+        let dir = std::env::temp_dir().join(format!("scan-gui-start-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let file = dir.join("not-a-directory");
+        std::fs::write(&file, b"x").expect("write file");
+
+        let mut record = ScannerApp::new(&Options::default(), SourceChoice::Record, String::new());
+        record.record_path = file.join("capture.k2df").display().to_string();
+        record.start();
+        assert!(record.form_error.is_some());
+        assert!(record.session.is_none());
+
+        let mut dataset = ScannerApp::new(&Options::default(), SourceChoice::Live, String::new());
+        dataset.config.color = true;
+        dataset.config.dataset = file.join("dataset").display().to_string();
+        dataset.start();
+        assert!(dataset.form_error.is_some());
+        assert!(dataset.session.is_none());
+
+        std::fs::remove_dir_all(&dir).expect("remove temp dir");
     }
 }

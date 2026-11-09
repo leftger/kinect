@@ -8,11 +8,11 @@ things that silently break, and the order to do the rest in. Numbers in it were
 measured on this machine unless marked otherwise.
 
 > **Status after the scanner window.** `scan gui` now owns the capture and the
-> dataset hand-off. The window can scan a live sensor, replay a colour `.k2df`
-> recording, or run the synthetic room, and it can write the dataset on Export.
-> It does not launch a trainer or render splats. This document marks that
-> boundary explicitly: what already lives in the window, and what the window
-> should own next.
+> dataset hand-off. The window can scan a live sensor (optionally writing a
+> `.k2df` as it reconstructs), replay a colour recording, or run the synthetic
+> room, and it can write the dataset on Export. It does not launch a trainer or
+> render splats. This document marks that boundary explicitly: what already
+> lives in the window, and what the window should own next.
 
 ---
 
@@ -60,9 +60,9 @@ from one. The window's Replay source uses the same path. This is no longer a
 live-only workflow; the old M2.4 is done.
 
 **Scanner window** (`crates/scan/src/gui/`). `scan gui` and `live --viewer`
-open the same window: live/replay/synthetic sources, start/pause/stop/reset/
-export, a navigable TSDF preview, and the dataset field above. It does not train
-a model or render splats.
+open the same window: live/record/replay/synthetic sources, start/pause/stop/
+reset/export, a navigable TSDF preview, the dataset field, and a dataset result
+card after Export. It does not train a model or render splats.
 
 **`TsdfVolume::raycast`** (`crates/geom/src/tsdf.rs`). Renders the fused surface
 as a depth image, which is what any frame-to-model work needs.
@@ -84,13 +84,14 @@ reduce drift — see §5, M2.
   Lifting this needs the depth→colour extrinsics; see §5, M3.
 - **The exporter needs colour views.** A depth-only scan or depth-only `.k2df`
   has no dataset to write. `live --color`, `record --color` and the synthetic
-  room do. The window checks the live case at Start and rejects a depth-only
+  room do. The window checks live and Record at Start and rejects a depth-only
   replay before it starts.
 - **The window stops at the dataset boundary.** It does not start Brush, monitor
   a training job, or load the trained `.ply`. That last mile is still a terminal
   command; see §5, M1.5.
-- **The window cannot record yet.** `record --color` is still a CLI command. The
-  source picker is Live, Replay, Synthetic; adding Record to it is M0.
+- **The paths are still text fields.** The dataset and recording paths are
+  preflighted at Start, but there is no native folder picker yet; that is the
+  one M0 item left.
 - **`cargo test --workspace` does not build on this machine** (`turbojpeg-sys`
   wants NASM, pulled in by `kinect-one`'s default features). Pre-existing and
   unrelated; use `-p geom -p scan`.
@@ -127,26 +128,26 @@ scan gui (live | replay | synthetic)
 
 The workflow in the window today:
 
-1. Choose **Live** with **Colour** ticked, **Replay** of a colour recording, or
-   **Synthetic** (always coloured).
-2. Set **Output → dataset directory**. The mesh path is still validated; the
-   dataset path is independent of it.
-3. **Start**, then **Stop** or **Export**. `finish_scan` writes the mesh and the
-   dataset in one pass, after loop closure has moved the colour views to their
-   final poses.
-4. The log reports `dataset: N views, M initial points in DIR`. That is the
-   hand-off point for an external trainer.
+1. Choose **Live** with **Colour** ticked, **Record** with **Colour** ticked,
+   **Replay** of a colour recording, or **Synthetic** (always coloured).
+2. Set **Output → dataset directory**. For **Record**, set the `.k2df` path in
+   **Source**; Start preflights both paths.
+3. **Start**, then **Stop** or **Export**. A Record session writes its `.k2df`
+   while it reconstructs; `finish_scan` writes the mesh and the dataset in one
+   pass, after loop closure has moved the colour views to their final poses.
+4. The telemetry panel reports the exported mesh and
+   `dataset: N views, M initial points in DIR`. That is the hand-off point for
+   an external trainer.
 
 The dataset is deliberately written from the *final* pose set. Exporting before
 loop closure would hand the trainer the drifted poses the scanner is trying to
-remove.
+remove. A Record session's `.k2df` can be replayed later to re-export without
+the sensor.
 
 What the window does **not** do yet, and must not be described as doing:
 
 - start a trainer or monitor its progress,
-- load the trainer's `.ply` and render Gaussians,
-- record a `.k2df`. `record --color` is still a CLI command; adding a Record
-  source to the window is M0.
+- load the trainer's `.ply` and render Gaussians.
 
 M1.5 and M1.6 below are the milestones that move those last steps into the
 window. Until they land, the window's viewport is a TSDF mesh/point preview, not
@@ -231,26 +232,31 @@ M0 (if the window is the goal) or M2.1 (if the poses are). M1.5 needs a trainer
 that already opens the dataset, so it comes after M1; M1.6 needs a trained
 result, so it comes after M1.5.
 
-### M0 — Finish the dataset side of the window (mostly done)
+### M0 — Finish the dataset side of the window (done, except the folder picker)
 
-The window already has the source picker, the dataset path and the export
-pipeline. What remains is polish that stops the operator dropping back to a
-terminal:
+Landed:
 
-1. **Record source.** Add Record to the source picker, writing a version-2
-   `.k2df` with colour while the preview runs. The CLI already does this; the
-   window needs the same capture loop behind a different transport button.
-2. **Dataset preflight.** At Start, check that the dataset directory is
-   writable and that the chosen source can supply colour. Live and a depth-only
-   replay are rejected now; the writable-directory check is still missing.
-3. **Dataset result card.** After export, show views, initial points and the
-   output path in the telemetry panel, not just in the log.
-4. **Folder picker.** Replace the free-text dataset path with a native
-   directory chooser where a dialog backend exists; keep the text field as the
-   fallback.
+1. **Record source.** The window writes a version-2 `.k2df` while it
+   reconstructs. Tick Colour to store the colour views a dataset needs. Stop,
+   Reset and a sensor dropout all close the recording through
+   `finish_recording`, so the file is usable after an interrupted scan.
+2. **Dataset preflight.** Start checks that the dataset and recording paths
+   have a writable nearest ancestor, and rejects a live or Record dataset with
+   Colour off before a worker starts. A depth-only replay is rejected when the
+   recording is opened.
+3. **Dataset result card.** `finish_scan_with_report` returns what was written;
+   the telemetry panel shows the dataset directory, view count, initial points,
+   skipped views and the exported mesh counts, not only the log.
+
+Remaining:
+
+4. **Folder picker.** Replace the free-text dataset and recording paths with a
+   native directory chooser where a dialog backend exists; keep the text fields
+   as the fallback.
 
 **Done when:** a colour capture can be recorded, replayed and exported as a
-dataset entirely from the window, and the result is visible in the window.
+dataset entirely from the window, and the result is visible in the window. This
+is met with the text fields; the folder picker is polish.
 
 ### M1 — Prove the exporter end to end
 
@@ -440,8 +446,8 @@ current cost is tolerable offline and the complexity is not.
 
 **M2.4 — (done) Store colour in `.k2df`.** The recording format has a version-2
 payload with the registered colour, `record --color` writes it, and
-`replay --dataset` exports from it. The window's Replay source reads it. The
-remaining work is the M0 Record source, not the format.
+`replay --dataset` exports from it. The window's Record source writes it and its
+Replay source reads it, so the offline loop is closed.
 
 **M2.5 — Stop a bad dataset before the trainer starts.** A dataset with 97
 rejected frames is not a training failure; it is a scan the operator should
@@ -488,11 +494,11 @@ coupling is proven:
   **SplaTAM**, **MonoGS**, **Gaussian-SLAM** are RGB-D 3DGS SLAM systems. Read
   them before building anything.
 
-The honest sequencing: M0 removes the remaining terminal steps from the window,
-M1 tells you whether the plumbing works, M2 tells you whether the poses are good
-enough, M3 tells you whether resolution is the constraint. M1.5 and M1.6 are
-window conveniences that ride on M1; do not let them get ahead of it. Only then
-is it clear whether M4 is needed at all.
+The honest sequencing: M0 removed the remaining terminal steps from the window
+(except the folder picker), M1 tells you whether the plumbing works, M2 tells
+you whether the poses are good enough, M3 tells you whether resolution is the
+constraint. M1.5 and M1.6 are window conveniences that ride on M1; do not let
+them get ahead of it. Only then is it clear whether M4 is needed at all.
 
 ---
 
@@ -569,7 +575,10 @@ target/release/scan live --color --dataset out/ds --frames 60 --out out/ds_scan.
 
 # The same scan from the window:
 #   scan gui -> Live + Colour + Output/dataset directory: out/ds
-#   Start, then Export. The log reports the dataset hand-off.
+#   Start, then Export. The telemetry panel reports the dataset hand-off.
+#
+#   Record + Colour writes a replayable .k2df while it reconstructs:
+#   Source/Record, recording path out/room_color.k2df, then Start and Export.
 
 # Synthetic dataset and window, no sensor at all (Export or close to write it)
 target/release/scan gui --synthetic --auto-start --frames 24 --voxel 0.02 \

@@ -776,9 +776,33 @@ fn scanner_config(options: &Options) -> ScannerConfig {
     }
 }
 
+/// What a finished export wrote, for callers that display it.
+///
+/// The CLI ignores this; the scanner window uses it to report the exported mesh
+/// and the dataset hand-off without scraping stdout.
+#[derive(Debug)]
+pub(crate) struct FinishSummary {
+    /// The mesh path actually written.
+    pub output: PathBuf,
+    /// Vertices and triangles in the exported mesh, or `None` when there was
+    /// no surface to extract.
+    pub mesh: Option<(usize, usize)>,
+    /// Present when `--dataset` was set and a surface existed.
+    pub dataset: Option<dataset::DatasetReport>,
+}
+
 /// Close loops, then write the mesh. Live, replay, and the scanner window all
 /// end here, so closing the window still corrects the trajectory before export.
 pub(crate) fn finish_scan(scanner: &mut Scanner, options: &Options) -> Result<(), Box<dyn Error>> {
+    finish_scan_with_report(scanner, options).map(|_| ())
+}
+
+/// The same ending as [`finish_scan`], but returns what was written so the
+/// window can show a dataset result card instead of reading stdout.
+pub(crate) fn finish_scan_with_report(
+    scanner: &mut Scanner,
+    options: &Options,
+) -> Result<FinishSummary, Box<dyn Error>> {
     close_loops(scanner, options);
     finish(scanner, options)
 }
@@ -944,7 +968,10 @@ fn position_bounds(positions: &[Vector3<f32>]) -> Option<(Vector3<f32>, Vector3<
     Some((min, max))
 }
 
-pub(crate) fn finish(scanner: &Scanner, options: &Options) -> Result<(), Box<dyn Error>> {
+pub(crate) fn finish(
+    scanner: &Scanner,
+    options: &Options,
+) -> Result<FinishSummary, Box<dyn Error>> {
     println!();
     println!(
         "[scan] frames: {} (fused {}, skipped {})",
@@ -989,10 +1016,14 @@ pub(crate) fn finish(scanner: &Scanner, options: &Options) -> Result<(), Box<dyn
     // and the texture coordinates stay on the image that was just painted.
     let Some(exported) = scanner.export_mesh(options.unmirror, format.uses_texture_atlas()) else {
         println!("[scan] no surface extracted - was anything in range?");
-        return Ok(());
+        return Ok(FinishSummary {
+            output: out,
+            mesh: None,
+            dataset: None,
+        });
     };
 
-    match &exported {
+    let mesh_summary = match &exported {
         ExportMesh::Geometry(mesh, coloring) => {
             if let Some((min, max)) = mesh.bounds() {
                 print_mesh_extent(mesh.vertex_count(), mesh.triangle_count(), min, max);
@@ -1000,6 +1031,7 @@ pub(crate) fn finish(scanner: &Scanner, options: &Options) -> Result<(), Box<dyn
             if let Some(report) = coloring {
                 println!("{}", format_paint(report));
             }
+            Some((mesh.vertex_count(), mesh.triangle_count()))
         }
         ExportMesh::Atlas(textured, report) => {
             if let Some((min, max)) = position_bounds(&textured.positions) {
@@ -1011,8 +1043,9 @@ pub(crate) fn finish(scanner: &Scanner, options: &Options) -> Result<(), Box<dyn
                 );
             }
             println!("{}", format_atlas(report));
+            Some((textured.positions.len(), textured.triangle_count()))
         }
-    }
+    };
 
     match exported {
         ExportMesh::Geometry(mesh, _) => export::save_mesh(&mesh, &out)?,
@@ -1037,6 +1070,7 @@ pub(crate) fn finish(scanner: &Scanner, options: &Options) -> Result<(), Box<dyn
         trajectory_points.len()
     );
 
+    let mut dataset_report = None;
     if let Some(dir) = &options.dataset {
         // Written last, and after the poses are final: `close_loops` ran in
         // `finish_scan`, and a correction moves the views onto the rebuilt
@@ -1061,9 +1095,14 @@ pub(crate) fn finish(scanner: &Scanner, options: &Options) -> Result<(), Box<dyn
             "[scan]   images, poses and init.ply are all in the sensor frame, so they agree; \
              --mirror does not apply to a dataset"
         );
+        dataset_report = Some(report);
     }
 
-    Ok(())
+    Ok(FinishSummary {
+        output: out,
+        mesh: mesh_summary,
+        dataset: dataset_report,
+    })
 }
 
 #[cfg(test)]

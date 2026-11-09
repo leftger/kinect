@@ -23,7 +23,11 @@ gaps. Read this section before the code.
 - Optional live colour, painted onto the mesh as per-vertex PLY colour or as a texture atlas (OBJ, glTF, or a single GLB)
 - A scanner window (`scan gui`) with an interactive 3D preview, source picker,
   start/pause/stop, parameters and export. It can run the synthetic room or a
-  recording, so the real-time path works with no sensor attached.
+  recording, so the real-time path works with no sensor attached, and it can
+  record a `.k2df` while reconstructing.
+- Gaussian-splatting dataset export (`--dataset DIR`, or the window's output
+  field): posed colour views, masks and a coloured `init.ply` for an external
+  trainer. No trainer is bundled; see [GAUSSIAN_SPLATTING.md](GAUSSIAN_SPLATTING.md).
 
 **Found by profiling, and fixed**
 
@@ -116,26 +120,32 @@ Add `--color` to paint a live mesh. `--out scan.ply` keeps per-vertex colour; `-
 
 ```
 scan gui    [--in FILE | --synthetic] [--auto-start] [--frames N]
-            [--out mesh.ply] [--color] [--preview-every N] [--playback-fps F]
+            [--out mesh.ply] [--dataset DIR] [--color] [--preview-every N]
+            [--playback-fps F]
 scan live   [--frames N] [--out mesh.ply] [--voxel M] [--no-filter] [--color]
             [--color-mode best|blend|average] [--color-depth-tolerance M]
-            [--gpu] [--loop-closure] [--viewer]
+            [--gpu] [--loop-closure] [--viewer] [--dataset DIR]
 scan record  --out capture.k2df [--frames N] [--no-filter] [--drain-color] [--gpu] [--color]
 scan replay  --in capture.k2df [--out mesh.ply] [--voxel M] [--frames N] [--loop-closure]
+            [--dataset DIR]
 ```
 
-- `gui` opens the scanner window. Pick a live sensor, a recording, or the
-  synthetic room; start, pause, stop, adjust parameters, and export. The 3D
-  viewport updates as frames fuse. It needs a build with `--features gui` and a
-  display, but not a sensor: `scan gui --synthetic --auto-start` runs the whole
-  real-time path on a machine with nothing plugged in.
-- `live` captures and reconstructs as it goes.
+- `gui` opens the scanner window. Pick a live sensor, Record, a recording, or
+  the synthetic room; start, pause, stop, adjust parameters, and export. Record
+  captures while reconstructing and writes a `.k2df` for later replays. The
+  output field can also write a Gaussian-splatting dataset. The 3D viewport
+  updates as frames fuse. It needs a build with `--features gui` and a display,
+  but not a sensor: `scan gui --synthetic --auto-start` runs the whole real-time
+  path on a machine with nothing plugged in.
+- `live` captures and reconstructs as it goes. `--dataset DIR` also writes a
+  Nerfstudio/Brush dataset for Gaussian splatting.
 - `record` stores frames to a file for offline work. With `--color` it stores
   the registered colour too; without it the recording is depth only. A
   recording is deterministic, so replaying a prefix of it is a repeatable test
   case.
 - `replay` reconstructs from a recording and needs no sensor. If the recording
-  carries colour, the mesh is painted from it.
+  carries colour, the mesh is painted from it and `--dataset DIR` can write a
+  dataset. A depth-only recording cannot.
 
 Useful options:
 
@@ -166,6 +176,11 @@ Useful options:
 - `--out` selects the file by extension. `.ply` is per-vertex colour. `.obj`
   also writes a sibling `.mtl` and `.png`. `.gltf` also writes a sibling `.bin`
   and `.png`. `.glb` is the geometry and the PNG in one file.
+- `--dataset DIR` also writes a Nerfstudio dataset for a Gaussian-splatting
+  trainer: `transforms.json`, posed `images/`, `masks/`, and a coloured
+  `init.ply`. It needs colour views, so use `live --color`, or `record --color`
+  and replay. The window preflights the path and reports the result. This repo
+  does not train splats; see [GAUSSIAN_SPLATTING.md](GAUSSIAN_SPLATTING.md).
 - `--viewer` opens the scanner window on the live source and starts immediately.
   It is the same window as `scan gui`; the old picture-only viewer is gone. Needs
   a build with `--features gui` (or the `viewer` alias) and a display. Closing
@@ -192,24 +207,27 @@ A trajectory PLY is written alongside the mesh as `<out>.trajectory.ply`.
 scan gui --synthetic --auto-start --frames 60 --out out/room.ply
 scan gui --in out/capture.k2df --auto-start --voxel 0.02
 scan gui --color --out out/room.obj
+scan gui --color --dataset out/room-ds --out out/room.ply
 ```
 
 The window has four parts:
 
-- **Source**: live sensor, a `.k2df` recording, or the synthetic room. The
-  source and the parameters are locked once a scan starts; Reset returns to the
-  picker.
+- **Source**: live sensor, Record (capture while writing a `.k2df`), a `.k2df`
+  recording, or the synthetic room. The source and the parameters are locked
+  once a scan starts; Reset returns to the picker.
 - **Reconstruction and output**: frames, voxel size, colour and its mode,
   colour-depth tolerance, filters, loop closure, frame-to-model, GPU decode,
-  mirror, preview interval, playback rate, and the output path. The extension
-  selects the format exactly as it does on the command line.
+  mirror, preview interval, playback rate, the output path, and the optional
+  dataset directory. The extension selects the mesh format exactly as it does
+  on the command line.
 - **3D viewport**: drag to orbit, right-drag (or middle-drag) to pan, scroll to
   zoom, double-click or *Fit view* to frame the model. The surface is extracted
   from the TSDF every `--preview-every` frames, so it refines as the scan
   proceeds. The latest depth frame is drawn as coloured points, the camera path
   as a cyan line, and the current sensor as a yellow frustum.
 - **Telemetry**: frames, fused and rejected counts, position, TSDF size,
-  tracking and fusion time, preview rate, the worker's log and any error.
+  tracking and fusion time, preview rate, the worker's log, and the exported
+  mesh and dataset summary after Export.
 
 *Start* runs the selected source. *Pause* stops consuming frames without
 losing the scanner; *Resume* continues. *Stop* ends the capture but keeps the
@@ -217,6 +235,18 @@ scanner in memory so the finished model can be inspected and exported.
 *Export* writes it, and if the scan is still running it stops first. *Reset*
 throws the scan away. Closing the window exports an unexported scan rather
 than losing it, so Reset is the explicit discard.
+
+Record streams the same frames to the `.k2df` path in the Source panel while
+they reconstruct, so a session can be replayed later. Stop, Reset, or a sensor
+dropout closes the recording rather than losing it.
+
+The optional **dataset directory** writes the Gaussian-splatting hand-off:
+`transforms.json`, posed `images/`, `masks/`, and a coloured `init.ply` that a
+Nerfstudio/Brush trainer can start from. It needs colour views, so tick Colour
+on a live or Record source, or replay a recording made with `record --color`.
+Start preflights the path; Export shows the view and initial-point counts in
+the telemetry panel. The window does not run the trainer; see
+[GAUSSIAN_SPLATTING.md](GAUSSIAN_SPLATTING.md).
 
 The preview is rasterised on the CPU into an ordinary egui texture. That keeps
 the window independent of the GPU decoder and testable without a display; at a
@@ -479,7 +509,7 @@ platform/linux      udev rule
 cargo test -p geom -p scan --features gui
 ```
 
-193 tests. The geometry is tested against synthetic scenes and known transforms
+196 tests. The geometry is tested against synthetic scenes and known transforms
 rather than against recorded data, so the suite runs without a sensor. The
 window's tests are headless too: they exercise the session worker, a synthetic
 scan and its export, and the software renderer without opening a window. Without
