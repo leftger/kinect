@@ -100,10 +100,17 @@ struct Frame {
 
 /// Write the scan's colour views, poses and surface to `dir`.
 ///
-/// Needs `scanner.color_views()`: the dataset is built from the colour stream, so
-/// only a `live --color` scan has one. A depth-only scan has nothing to export.
+/// Needs colour views: `live --color`, a colour `.k2df` replay, or the synthetic
+/// room. A depth-only scan has nothing to export, which is an error rather than
+/// an empty dataset.
 pub fn write_dataset(scanner: &Scanner, dir: &Path) -> io::Result<DatasetReport> {
     let views = scanner.color_views();
+    if views.is_empty() {
+        return Err(invalid(
+            "no colour views to export: a dataset needs `live --color`, a colour \
+             recording, or the synthetic room",
+        ));
+    }
 
     let image_dir = dir.join(IMAGE_DIR);
     let mask_dir = dir.join(MASK_DIR);
@@ -155,8 +162,8 @@ fn write_views(
 ) -> io::Result<(Vec<Frame>, usize)> {
     let Some(first) = views.first() else {
         return Err(invalid(
-            "no colour views to export: a dataset is built from the colour stream, \
-             so capture it with `live --color`",
+            "no colour views to export: a dataset needs `live --color`, a colour \
+             recording, or the synthetic room",
         ));
     };
 

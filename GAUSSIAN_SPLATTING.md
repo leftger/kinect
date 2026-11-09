@@ -7,6 +7,13 @@ This is a plan, not a summary. It records what is verified, what is not, the
 things that silently break, and the order to do the rest in. Numbers in it were
 measured on this machine unless marked otherwise.
 
+> **Status after the scanner window.** `scan gui` now owns the capture and the
+> dataset hand-off. The window can scan a live sensor, replay a colour `.k2df`
+> recording, or run the synthetic room, and it can write the dataset on Export.
+> It does not launch a trainer or render splats. This document marks that
+> boundary explicitly: what already lives in the window, and what the window
+> should own next.
+
 ---
 
 ## 1. The split, and why it is the right one
@@ -42,7 +49,20 @@ resolve. Everything about pose quality lands squarely on this repo.
 
 **`--dataset` exporter** (`crates/scan/src/dataset.rs`). Writes a Nerfstudio
 dataset: `transforms.json`, `images/`, `masks/`, `init.ply`. Format requirements
-were read out of Brush's source and are enforced by tests — see §3.
+were read out of Brush's source and are enforced by tests — see §3. The same
+export is reachable from `scan gui`: the Output panel has an optional dataset
+directory, and Export writes the mesh, trajectory and dataset together. The
+worker's log reports the dataset path, view count and initial-point count.
+
+**Colour recordings.** `record --color` writes a version-2 `.k2df` with the
+registered colour views, and `replay --in FILE --dataset DIR` exports a dataset
+from one. The window's Replay source uses the same path. This is no longer a
+live-only workflow; the old M2.4 is done.
+
+**Scanner window** (`crates/scan/src/gui/`). `scan gui` and `live --viewer`
+open the same window: live/replay/synthetic sources, start/pause/stop/reset/
+export, a navigable TSDF preview, and the dataset field above. It does not train
+a model or render splats.
 
 **`TsdfVolume::raycast`** (`crates/geom/src/tsdf.rs`). Renders the fused surface
 as a depth image, which is what any frame-to-model work needs.
@@ -62,9 +82,15 @@ reduce drift — see §5, M2.
 - **Colour is 512×424, not 1080p.** Registration copies colour into the depth
   grid, so the dataset is capped at depth resolution before training starts.
   Lifting this needs the depth→colour extrinsics; see §5, M3.
-- **The exporter is live-only.** A `.k2df` recording stores depth frames and
-  nothing else, so a dataset needs someone holding the sensor through a fresh
-  scan. This is the biggest workflow tax in the whole pipeline; see §5, M2.4.
+- **The exporter needs colour views.** A depth-only scan or depth-only `.k2df`
+  has no dataset to write. `live --color`, `record --color` and the synthetic
+  room do. The window checks the live case at Start and rejects a depth-only
+  replay before it starts.
+- **The window stops at the dataset boundary.** It does not start Brush, monitor
+  a training job, or load the trained `.ply`. That last mile is still a terminal
+  command; see §5, M1.5.
+- **The window cannot record yet.** `record --color` is still a CLI command. The
+  source picker is Live, Replay, Synthetic; adding Record to it is M0.
 - **`cargo test --workspace` does not build on this machine** (`turbojpeg-sys`
   wants NASM, pulled in by `kinect-one`'s default features). Pre-existing and
   unrelated; use `-p geom -p scan`.
@@ -75,6 +101,56 @@ reduce drift — see §5, M2.
   happens around frame 19–22 is a hard tracking failure, not drift. See §5,
   M2.1 — this is now the first thing to fix, because no drift comparison means
   anything on a capture that loses tracking.
+
+### The window's role
+
+The window is the scanner's front end, not the trainer's. The boundary is
+deliberate and matches the split in §1:
+
+```text
+scan gui (live | replay | synthetic)
+  -> tracking + fusion + colour views
+  -> final poses after loop closure
+  -> dataset (transforms.json, images/, masks/, init.ply)
+  -> external trainer (Brush)
+  -> splat .ply
+  -> external viewer, or the window after M1.6
+```
+
+| Step | Current owner | Where it lives |
+| --- | --- | --- |
+| Capture, tracking, fusion | this repo | `scan gui` worker |
+| Colour views and poses | this repo | `ColorView`; exported by `--dataset` |
+| Dataset files | this repo | Output panel / `--dataset DIR` |
+| Splat training | external Brush | a terminal, outside the window |
+| Splat rendering | external viewer | outside the window |
+
+The workflow in the window today:
+
+1. Choose **Live** with **Colour** ticked, **Replay** of a colour recording, or
+   **Synthetic** (always coloured).
+2. Set **Output → dataset directory**. The mesh path is still validated; the
+   dataset path is independent of it.
+3. **Start**, then **Stop** or **Export**. `finish_scan` writes the mesh and the
+   dataset in one pass, after loop closure has moved the colour views to their
+   final poses.
+4. The log reports `dataset: N views, M initial points in DIR`. That is the
+   hand-off point for an external trainer.
+
+The dataset is deliberately written from the *final* pose set. Exporting before
+loop closure would hand the trainer the drifted poses the scanner is trying to
+remove.
+
+What the window does **not** do yet, and must not be described as doing:
+
+- start a trainer or monitor its progress,
+- load the trainer's `.ply` and render Gaussians,
+- record a `.k2df`. `record --color` is still a CLI command; adding a Record
+  source to the window is M0.
+
+M1.5 and M1.6 below are the milestones that move those last steps into the
+window. Until they land, the window's viewport is a TSDF mesh/point preview, not
+a splat viewer.
 
 ---
 
@@ -106,7 +182,7 @@ Two more invariants that are ours, not Brush's:
 
 ## 4. How to verify each layer without a sensor
 
-The recurring difficulty is that the interesting failures need hardware. Three
+The recurring difficulty is that the interesting failures need hardware. Four
 harnesses make most of it testable offline:
 
 1. **Synthetic room.** `render_room` in `crates/scan/src/odometry.rs` ray-traces
@@ -118,6 +194,20 @@ harnesses make most of it testable offline:
 3. **Format checks.** `cargo test -p scan dataset` asserts the JSON shape, the
    pose convention (by round-tripping through Brush's own conversion, not a copy
    of our arithmetic), mask semantics and the `init.ply` property set.
+4. **The window without a display.** The GUI's tests are headless: the session
+   worker, a synthetic scan, the dataset export and the software renderer all
+   run without opening a window (`cargo test -p geom -p scan --features gui`).
+   A synthetic GUI run is the cheapest way to exercise the same `finish_scan`
+   dataset path a live scan uses. Start it, then press **Export** or close the
+   window:
+
+   ```sh
+   target/release/scan gui --synthetic --auto-start --frames 12 --voxel 0.04 \
+       --dataset out/ds-synth --out out/synth.ply
+   ```
+
+   This proves the hand-off, not the appearance: the synthetic room is a
+   fixture, and its poses are known rather than tracked from a real scene.
 
 What is *not* yet covered: an actual Brush parse of our output. See M1.
 
@@ -133,10 +223,34 @@ scan. Do not tune acceptance thresholds against it.
 Ordered by what unblocks the most. Each milestone has a definition of done that
 is a measurement, not a feeling.
 
-**Two tracks, because one needs hardware and one does not.** M1 needs the Kinect
-plugged in. **M2.1 does not**, and it is the highest-value work available right
-now: the current recording loses tracking at frame ~20, which makes every pose
-statement from it unreliable. If the sensor is not on the desk, start at M2.1.
+**Three tracks, because they need different things.** M1 needs the Kinect and a
+built Brush. **M0 and M2.1 do not**, and M2.1 is the highest-value work available
+right now: the current recording loses tracking at frame ~20, which makes every
+pose statement from it unreliable. If the sensor is not on the desk, start at
+M0 (if the window is the goal) or M2.1 (if the poses are). M1.5 needs a trainer
+that already opens the dataset, so it comes after M1; M1.6 needs a trained
+result, so it comes after M1.5.
+
+### M0 — Finish the dataset side of the window (mostly done)
+
+The window already has the source picker, the dataset path and the export
+pipeline. What remains is polish that stops the operator dropping back to a
+terminal:
+
+1. **Record source.** Add Record to the source picker, writing a version-2
+   `.k2df` with colour while the preview runs. The CLI already does this; the
+   window needs the same capture loop behind a different transport button.
+2. **Dataset preflight.** At Start, check that the dataset directory is
+   writable and that the chosen source can supply colour. Live and a depth-only
+   replay are rejected now; the writable-directory check is still missing.
+3. **Dataset result card.** After export, show views, initial points and the
+   output path in the telemetry panel, not just in the log.
+4. **Folder picker.** Replace the free-text dataset path with a native
+   directory chooser where a dialog backend exists; keep the text field as the
+   fallback.
+
+**Done when:** a colour capture can be recorded, replayed and exported as a
+dataset entirely from the window, and the result is visible in the window.
 
 ### M1 — Prove the exporter end to end
 
@@ -144,8 +258,10 @@ statement from it unreliable. If the sensor is not on the desk, start at M2.1.
 has never been through the real parser. A silent mismatch invalidates everything
 downstream, and it is cheap to rule out.
 
-1. Plug in the Kinect and take a short colour scan:
+1. Plug in the Kinect and take a short colour scan, either from the CLI:
    `scan live --color --dataset out/ds --frames 60 --out out/ds_scan.ply`
+   or from the window: **Live** + **Colour** + dataset directory, Start, Export.
+   Without a sensor, the synthetic dry run in §4 exercises the same path.
 2. Build Brush (`rustc 1.97` is installed and clears its 1.88 floor; Vulkan
    compute works on this GPU — `cargo run --example vk_check` proves it).
 3. Point Brush at `out/ds` and train.
@@ -156,6 +272,45 @@ it must be recognisably the room.
 
 *Also do:* a 60-frame scan is the right size. Do not spend 300 frames before the
 round trip is proven.
+
+### M1.5 — A trainer job in the window
+
+*Why after M1:* the window should not orchestrate a trainer until the dataset
+has passed through Brush once. Otherwise a GUI bug and a format bug look
+identical.
+
+Add a **Splats** panel:
+
+- trainer executable and arguments (default: a configured Brush command),
+- dataset directory (default: the one just exported),
+- output directory for the trained `.ply`,
+- Start / Cancel,
+- a scrolling log and an iteration/loss readout when the trainer prints one.
+
+Run the trainer as a child process on a worker thread, not the UI thread. The
+existing session-worker pattern already gives the shape: a command channel, a
+shared snapshot for status, and a bounded join on close.
+
+**Done when:** a dataset exported from the window trains from the window,
+Cancel actually stops the child process, and the output path is reported. The
+viewport does not have to show the splats yet.
+
+### M1.6 — Show the trained splats (optional, after M1.5)
+
+The current viewport is a triangle/point z-buffer (`gui/render.rs`). A 3DGS
+result is anisotropic Gaussians; drawing it correctly needs sorted, blended
+billboards or an alpha-composited GPU pass. Do not call the current preview a
+splat viewer before this exists.
+
+Minimum useful version:
+
+- load the trainer's `.ply` (positions, scales, rotations, opacity, colour/SH),
+- render screen-aligned billboards with depth sorting and alpha blending,
+- reuse the existing orbit/pan/zoom camera,
+- toggle between the TSDF mesh and the splat result.
+
+**Done when:** the window shows the trained result beside the mesh it came from,
+and the two agree on pose and scale.
 
 ### M2 — Make the poses good enough
 
@@ -283,12 +438,17 @@ cache already took a 96×80 render from 0.40 s to 0.06 s (6.7×), and it is now
 **Do not** add a GPU raycast yet. The decide-later option is real, but the
 current cost is tolerable offline and the complexity is not.
 
-**M2.4 — Store colour in `.k2df`.** Today a dataset requires a live scan, so
-every pose experiment costs someone holding a sensor. Extending the recording
-format (bump `VERSION`, keep depth-only files readable) to optionally carry
-colour views makes the whole loop offline: record once, replay and re-export
-freely. This is pure workflow leverage and it compounds with M2.2 — you cannot
-iterate on poses cheaply while each iteration needs a fresh capture.
+**M2.4 — (done) Store colour in `.k2df`.** The recording format has a version-2
+payload with the registered colour, `record --color` writes it, and
+`replay --dataset` exports from it. The window's Replay source reads it. The
+remaining work is the M0 Record source, not the format.
+
+**M2.5 — Stop a bad dataset before the trainer starts.** A dataset with 97
+rejected frames is not a training failure; it is a scan the operator should
+redo. Before M1.5 launches a trainer, show the kept-view count, the
+rejected-frame count and the final distance from the start, and refuse to launch
+on a dataset that is obviously broken unless the operator overrides. This is a
+window check over numbers the scanner already has, not a new quality metric.
 
 ### M3 — Lift the resolution ceiling
 
@@ -328,9 +488,11 @@ coupling is proven:
   **SplaTAM**, **MonoGS**, **Gaussian-SLAM** are RGB-D 3DGS SLAM systems. Read
   them before building anything.
 
-The honest sequencing: M1 tells you whether the plumbing works, M2 tells you
-whether the poses are good enough, M3 tells you whether resolution is the
-constraint. Only then is it clear whether M4 is needed at all.
+The honest sequencing: M0 removes the remaining terminal steps from the window,
+M1 tells you whether the plumbing works, M2 tells you whether the poses are good
+enough, M3 tells you whether resolution is the constraint. M1.5 and M1.6 are
+window conveniences that ride on M1; do not let them get ahead of it. Only then
+is it clear whether M4 is needed at all.
 
 ---
 
@@ -352,6 +514,12 @@ Do not benchmark anything from `cargo test` without `--release`.
 Model sizes are the reason a raycast (O(pixels)) was chosen over anything that
 walks the volume: real scans reach **150k blocks / 616 MB**, and allocated blocks
 are 4 KB each because they hold `distance` and `weight` per voxel.
+
+The window adds a cost this table does not include: every `--preview-every`
+frames it extracts a mesh from the TSDF and rasterises it on the CPU. That is
+paid by the operator's frame rate, not by the dataset, and it has not been
+benchmarked separately. Do not assume the numbers above describe a `scan gui`
+session; if preview extraction is hurting capture, raise `--preview-every`.
 
 ---
 
@@ -375,23 +543,45 @@ are 4 KB each because they hold `distance` and `weight` per voxel.
   cover all of them. Worth deciding before tuning gates.
 - **Would gradient normals close the gap on their own?** Plausible and cheap to
   test; it is the first thing in M2.2 for that reason.
+- **Should the window own the trainer or shell out to it?** M1.5 assumes a child
+  process with a log and a Cancel button. Embedding Brush would mean a library
+  API it does not have. Decide after M1 proves the dataset is readable.
+- **What does a useful splat preview cost?** M1.6 needs sorted, alpha-blended
+  billboards. The current CPU rasteriser is enough for a mesh; a million
+  Gaussians may not be. Measure before promising real time.
 
 ---
 
 ## 8. Commands
 
 ```sh
-# Build
+# Build the CLI, and the window
 cargo build --release -p scan
+cargo build --release -p scan --features gui
 
 # Tests (the workspace target does not build here; see §2)
 cargo test -p geom -p scan
+cargo test -p geom -p scan --features gui   # includes the headless window tests
 cargo test --release -p geom -p scan
 
-# Live colour scan straight into a dataset
+# Live colour scan straight into a dataset, from the CLI
 target/release/scan live --color --dataset out/ds --frames 60 --out out/ds_scan.ply
 
-# Offline: replay a recording, no sensor needed
+# The same scan from the window:
+#   scan gui -> Live + Colour + Output/dataset directory: out/ds
+#   Start, then Export. The log reports the dataset hand-off.
+
+# Synthetic dataset and window, no sensor at all (Export or close to write it)
+target/release/scan gui --synthetic --auto-start --frames 24 --voxel 0.02 \
+    --dataset out/ds-synth --out out/synth.ply
+
+# Colour recording -> dataset, then the same recording through the window
+target/release/scan record --color --out out/room_color.k2df --frames 60
+target/release/scan replay --in out/room_color.k2df --dataset out/ds --out out/room.ply
+target/release/scan gui --in out/room_color.k2df --auto-start \
+    --dataset out/ds-gui --out out/room_gui.ply   # Export or close to write it
+
+# Offline: replay a depth recording, no sensor needed
 target/release/scan replay --in out/room.k2df --out out/room.ply
 target/release/scan replay --in out/room.k2df --out out/room.ply --frame-to-model
 
@@ -412,3 +602,12 @@ cargo test --release -p scan frame_to_model_drifts -- --ignored --nocapture
    0.68; the synthetic scene is deliberately harsher than reality.
 5. **A rejected frame is a hole, not a small error.** 97/150 rejected is a
    broken scan even if the resulting trajectory looks smooth.
+6. **The window writes the dataset before the trainer runs.** Training reads the
+   final pose set, not the live scanner. A trainer job must not share the
+   scanner's worker or its pose state.
+7. **Do not call the viewport a splat viewer until it renders splats.** The
+   current preview is a TSDF mesh/point rasteriser; M1.6 is the line between the
+   two.
+8. **A trainer is an external process with its own lifecycle.** Closing the
+   window must not silently kill a running job, and Cancel must actually stop
+   the child process, not just hide its output.

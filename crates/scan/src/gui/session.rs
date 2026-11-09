@@ -721,6 +721,14 @@ fn run_replay(
     commands: &Receiver<Command>,
 ) -> Result<Option<Scanner>, Box<dyn Error>> {
     let recording = recording::read(path)?;
+    if !recording.has_color && config.options.dataset.is_some() {
+        // Fail before spending the replay. `write_dataset` now returns an error
+        // too, but discovering this after a long scan is the wrong time.
+        return Err(
+            "cannot export dataset from this recording: it was captured without colour".into(),
+        );
+    }
+
     let limit = config.options.frames.unwrap_or(usize::MAX);
     let total = recording.frames.len().min(limit);
 
@@ -1118,6 +1126,45 @@ mod tests {
         let (_commands, receiver) = mpsc::channel();
 
         assert!(execute(&config, &shared, &control, &receiver).is_err());
+    }
+
+    #[test]
+    fn a_depth_only_replay_cannot_export_a_dataset() {
+        let path =
+            std::env::temp_dir().join(format!("scan-gui-depth-only-{}.k2df", std::process::id()));
+        let intrinsics = synthetic::intrinsics();
+        let mut writer =
+            recording::FrameWriter::create(&path, intrinsics, 4, 4).expect("create recording");
+        writer
+            .write_frame(0.0, &vec![2.0f32; 16])
+            .expect("write recording");
+        writer.finish().expect("finish recording");
+
+        let mut options = Options::default();
+        options.frames = Some(1);
+        options.dataset = Some(std::env::temp_dir().join("scan-gui-depth-only-ds"));
+        let config = SessionConfig {
+            source: Source::Replay(path.clone()),
+            options,
+            preview_every: 1,
+            playback_fps: 0.0,
+            color_preview_views: 4,
+        };
+
+        let shared = Arc::new(Mutex::new(SessionView::default()));
+        let control = Control::default();
+        let (_commands, receiver) = mpsc::channel();
+
+        let error = match execute(&config, &shared, &control, &receiver) {
+            Ok(_) => panic!("a depth-only replay cannot feed a dataset"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("without colour"), "{error}");
+
+        let _ = std::fs::remove_file(&path);
+        if let Some(dataset) = &config.options.dataset {
+            let _ = std::fs::remove_dir_all(dataset);
+        }
     }
 
     #[test]

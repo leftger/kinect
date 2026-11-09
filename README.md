@@ -479,7 +479,7 @@ platform/linux      udev rule
 cargo test -p geom -p scan --features gui
 ```
 
-192 tests. The geometry is tested against synthetic scenes and known transforms
+193 tests. The geometry is tested against synthetic scenes and known transforms
 rather than against recorded data, so the suite runs without a sensor. The
 window's tests are headless too: they exercise the session worker, a synthetic
 scan and its export, and the software renderer without opening a window. Without
