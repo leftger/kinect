@@ -168,6 +168,11 @@ const MAX_EXTRAPOLATED_GAP: usize = 2;
 pub struct TrackReport {
     /// Camera-to-world pose after this frame. Unchanged if the frame was rejected.
     pub pose: Isometry3<f32>,
+    /// The pose the alignment produced before the acceptance gates. On a
+    /// rejection this is a better submap-origin guess than the unchanged
+    /// committed pose, because it used the frame's own geometry. It is local to
+    /// the current submap, like `pose`.
+    pub candidate: Isometry3<f32>,
     /// True when the pose was accepted and may be fused.
     pub accepted: bool,
     /// Why a tracked frame was rejected, for reporting.
@@ -470,6 +475,20 @@ impl Odometry {
         })
     }
 
+    /// Forget the previous frame and make the next tracked frame a new local
+    /// origin. The scanner calls this at a submap boundary, where the new view
+    /// has no overlap with the old one and the only honest measurement left is
+    /// the new view's own internal motion.
+    pub fn restart(&mut self) {
+        self.previous = None;
+        self.trusted = None;
+        self.started = false;
+        self.guess = Isometry3::identity();
+        self.pose = Isometry3::identity();
+        self.search = Isometry3::identity();
+        self.gap = 0;
+    }
+
     /// Track a depth frame, against the model when one is supplied and the mode
     /// is on, and against the previous frame otherwise.
     pub fn track(&mut self, depth: &DepthImage<'_>, model: Option<&TsdfVolume>) -> TrackReport {
@@ -478,6 +497,7 @@ impl Odometry {
         if current.trackable_points() < self.config.min_points {
             return TrackReport {
                 pose: self.pose,
+                candidate: self.pose,
                 accepted: false,
                 rejection: Some("too little geometry in view"),
                 inlier_ratio: 0.0,
@@ -501,6 +521,7 @@ impl Odometry {
             self.search = self.pose;
             return TrackReport {
                 pose: self.pose,
+                candidate: self.pose,
                 accepted: false,
                 rejection: None,
                 inlier_ratio: 1.0,
@@ -671,6 +692,7 @@ impl Odometry {
 
                 return TrackReport {
                     pose: self.pose,
+                    candidate: self.pose,
                     accepted: true,
                     rejection: None,
                     inlier_ratio: relocalized.inlier_ratio,
@@ -704,6 +726,7 @@ impl Odometry {
 
             return TrackReport {
                 pose: self.pose,
+                candidate,
                 accepted: false,
                 rejection: Some(reason),
                 inlier_ratio,
@@ -733,6 +756,7 @@ impl Odometry {
 
         TrackReport {
             pose: self.pose,
+            candidate,
             accepted: true,
             rejection: None,
             inlier_ratio,

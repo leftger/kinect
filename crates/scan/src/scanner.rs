@@ -5,7 +5,7 @@ use geom::mesh::Mesh;
 use geom::pose_graph::{PoseGraph, PoseGraphParams};
 use geom::texturing::{texture, TexturedMesh, TexturingParams, TexturingReport};
 use geom::tsdf::{IntegrationStats, TsdfParams, TsdfVolume};
-use geom::{DepthImage, Intrinsics};
+use geom::{transform_point, DepthImage, Intrinsics};
 use nalgebra::{Isometry3, Vector3};
 use std::time::{Duration, Instant};
 
@@ -32,6 +32,13 @@ pub struct ScannerConfig {
     /// export uses the same visibility rules and assigns each triangle to one
     /// best source view.
     pub coloring: ColoringParams,
+    /// Start a new submap when a frame cannot be placed in the current one.
+    ///
+    /// The frame becomes the new submap's first frame, fused at the best guess
+    /// the failed alignment produced. Separate volumes keep each fragment clean
+    /// instead of smearing it onto the old model; the boundary is a weak pose
+    /// edge, so loop closure can move the whole submap later.
+    pub submaps: bool,
 }
 
 impl Default for ScannerConfig {
@@ -45,6 +52,7 @@ impl Default for ScannerConfig {
             odometry: OdometryConfig::default(),
             loop_closure: None,
             coloring: ColoringParams::default(),
+            submaps: true,
         }
     }
 }
@@ -58,6 +66,12 @@ pub struct FrameReport {
     pub integration: Option<IntegrationStats>,
     pub blocks: usize,
     pub allocated_bytes: usize,
+    /// The submap this frame belongs to, zero-based.
+    pub submap: usize,
+    /// True when this frame began a new submap.
+    pub new_submap: bool,
+    /// Why the tracker rejected the frame that started this submap, if any.
+    pub submap_reason: Option<&'static str>,
 }
 
 /// A frame kept so the model can be rebuilt once the poses are corrected.
@@ -74,6 +88,7 @@ struct KeptFrame {
     /// the same choice, or the model gains geometry the tracker refused.
     fused: bool,
 }
+
 
 /// The most any single pose may be moved by loop closure before the whole
 /// correction is discarded.
@@ -151,6 +166,8 @@ pub struct Scanner {
     /// fail in completely different ways, so they are measured separately.
     total_tracking: Duration,
     total_fusion: Duration,
+    /// Time spent finalising a finished submap's surface at a boundary.
+    total_submap: Duration,
 
     /// Pose-graph nodes, one per frame in arrival order. Consecutive poses
     /// already encode the odometry measurement: the tracked pose *is* the
@@ -168,6 +185,17 @@ pub struct Scanner {
     color_supplied: usize,
     dimensions: Option<(usize, usize)>,
     closure: Option<ClosureReport>,
+
+    /// Surface from submaps that were finished at a lost track, already
+    /// transformed into the scan's world frame.
+    finished_geometry: Mesh,
+    /// World-from-current-submap. Identity for the first submap.
+    world_from_submap: Isometry3<f32>,
+    /// Parallel to `poses`: true when the edge from the previous pose is a
+    /// submap guess rather than an odometry measurement.
+    pose_boundaries: Vec<bool>,
+    /// Arrival index of each submap's first frame.
+    submap_starts: Vec<usize>,
 }
 
 impl Scanner {
@@ -195,6 +223,7 @@ impl Scanner {
             points: Vec::new(),
             total_tracking: Duration::ZERO,
             total_fusion: Duration::ZERO,
+            total_submap: Duration::ZERO,
             poses: Vec::new(),
             kept: Vec::new(),
             loops,
@@ -202,7 +231,40 @@ impl Scanner {
             color_supplied: 0,
             dimensions: None,
             closure: None,
+            finished_geometry: Mesh::default(),
+            world_from_submap: Isometry3::identity(),
+            pose_boundaries: Vec::new(),
+            submap_starts: Vec::new(),
         }
+    }
+
+    fn fresh_volume(&self) -> TsdfVolume {
+        TsdfVolume::new(TsdfParams {
+            min_depth: self.config.depth_min,
+            max_depth: self.config.depth_max,
+            ..self.config.tsdf
+        })
+    }
+
+    /// Finish the current submap and start a new one at `world_from_submap`.
+    ///
+    /// Extracting the finished surface now, rather than keeping every TSDF
+    /// volume alive, frees the voxel blocks at the boundary. The mesh is baked
+    /// into the world frame; a later loop-closure rebuild regenerates it from
+    /// the retained frames at the corrected poses.
+    fn begin_submap(&mut self, world_from_submap: Isometry3<f32>) {
+        let mesh = self.volume.extract_mesh();
+        append_transformed(&mut self.finished_geometry, mesh, self.world_from_submap);
+        self.volume = self.fresh_volume();
+        self.world_from_submap = world_from_submap;
+        self.submap_starts.push(self.frames);
+    }
+
+    /// The union of every submap's surface, in the world frame.
+    fn geometry(&self) -> Mesh {
+        let mut mesh = self.finished_geometry.clone();
+        append_transformed(&mut mesh, self.volume.extract_mesh(), self.world_from_submap);
+        mesh
     }
 
     /// Feed one depth frame, in metres, row-major, `width * height` long.
@@ -245,6 +307,9 @@ impl Scanner {
         }
 
         let first = self.frames == 0;
+        if first {
+            self.submap_starts.push(0);
+        }
 
         let started = Instant::now();
         // Tracking consumes the depth image directly: the odometry builds its own
@@ -254,19 +319,48 @@ impl Scanner {
         // The volume goes along as well so frame-to-model mode can render the
         // surface it has fused so far and align against that instead of against
         // the previous frame. `Odometry` ignores it unless the mode is on.
-        let track = self.odometry.track(&image, Some(&self.volume));
+        let mut track = self.odometry.track(&image, Some(&self.volume));
         self.total_tracking += started.elapsed();
 
-        // The first frame defines the world frame and is always fused. After
-        // that, only a pose the odometry actually accepted may touch the model.
-        let fuse = first || track.accepted;
+        // A frame the projective tracker cannot place has no overlap with the
+        // current submap. Restart the odometry and make it the first frame of a
+        // new submap. The origin is the candidate the failed alignment produced:
+        // it is local to the old submap, so lift it into the world frame.
+        let mut new_submap = first;
+        let mut submap_reason = None;
+        if !first
+            && self.config.submaps
+            && !track.accepted
+            && track.rejection != Some("too little geometry in view")
+        {
+            submap_reason = track.rejection;
+            let guess = self.world_from_submap * track.candidate;
+            let finalizing = Instant::now();
+            self.begin_submap(guess);
+            self.total_submap += finalizing.elapsed();
+            self.odometry.restart();
+            let retry = Instant::now();
+            track = self.odometry.track(&image, Some(&self.volume));
+            self.total_tracking += retry.elapsed();
+            new_submap = true;
+        }
+
+        // The odometry pose is local to the current submap. Everything the
+        // scanner stores, colours, or exports is in the world frame.
+        let local_pose = track.pose;
+        let pose = self.world_from_submap * local_pose;
+        let candidate = self.world_from_submap * track.candidate;
+
+        // The first frame of the scan or of a submap defines that submap's
+        // origin and is always fused: there is no target to accept it against.
+        let fuse = first || new_submap || track.accepted;
 
         let integration = if fuse {
             self.fused += 1;
-            self.trajectory.push(track.pose.translation.vector);
+            self.trajectory.push(pose.translation.vector);
 
             let started = Instant::now();
-            let stats = self.volume.integrate(&image, &intrinsics, &track.pose);
+            let stats = self.volume.integrate(&image, &intrinsics, &local_pose);
             self.total_fusion += started.elapsed();
 
             Some(stats)
@@ -275,13 +369,14 @@ impl Scanner {
             None
         };
 
-        self.poses.push(track.pose);
+        self.poses.push(pose);
+        self.pose_boundaries.push(new_submap && !first);
         self.dimensions.get_or_insert((width, height));
 
-        // Same rule as fusion: the first frame, or a pose the tracker accepted.
-        // A rejected frame's colour would paint the model from a pose that was
-        // never used to build it. It is still counted, so the summary can say
-        // how many colour frames were dropped with the rejected pose.
+        // Same rule as fusion: the first frame, a submap's first frame, or a
+        // pose the tracker accepted. A rejected frame's colour would paint the
+        // model from a pose that was never used to build it. It is still
+        // counted, so the summary can say how many colour frames were dropped.
         if let Some(color) = color {
             self.color_supplied += 1;
             if fuse {
@@ -290,7 +385,7 @@ impl Scanner {
                     width,
                     height,
                     depth: color.depth.to_vec(),
-                    pose: track.pose,
+                    pose,
                     intrinsics,
                     valid: color.valid.to_vec(),
                     exposure: color.exposure,
@@ -307,7 +402,7 @@ impl Scanner {
         // voxel hashing and, when a candidate turns up, one ICP alignment.
         if let Some(finder) = self.loops.as_mut() {
             if fuse {
-                finder.consider(self.frames, track.pose, &self.points);
+                finder.consider(self.frames, pose, &self.points);
             }
         }
 
@@ -318,14 +413,22 @@ impl Scanner {
             });
         }
 
+        let submap = self.submap_starts.len().saturating_sub(1);
         self.frames += 1;
+
+        // The caller sees world poses, not the odometry's local ones.
+        track.pose = pose;
+        track.candidate = candidate;
 
         FrameReport {
             points: self.points.len(),
             track,
             integration,
-            blocks: self.volume.block_count(),
-            allocated_bytes: self.volume.allocated_bytes(),
+            blocks: self.block_count(),
+            allocated_bytes: self.allocated_bytes(),
+            submap,
+            new_submap,
+            submap_reason,
         }
     }
 
@@ -342,7 +445,11 @@ impl Scanner {
             .unwrap_or_default();
 
         let nodes = self.poses.len();
-        let odometry_edges = nodes.saturating_sub(1);
+        // A submap boundary is a guess, not a measurement; it must not pin the
+        // new submap to the old one's frame.
+        let odometry_edges = (0..nodes.saturating_sub(1))
+            .filter(|index| !self.pose_boundaries.get(index + 1).copied().unwrap_or(false))
+            .count();
 
         let nothing = ClosureReport {
             nodes,
@@ -372,7 +479,12 @@ impl Scanner {
 
         // The odometry edges are free: the tracked pose is the accumulation, so
         // the measurement between neighbours is already encoded in the poses.
+        // A submap boundary is the exception: its relative pose is a guess, so
+        // leaving it out lets a cross-submap loop edge move the whole submap.
         for index in 0..nodes - 1 {
+            if self.pose_boundaries.get(index + 1).copied().unwrap_or(false) {
+                continue;
+            }
             let measurement = self.poses[index].inverse() * self.poses[index + 1];
             graph.add_edge(index, index + 1, measurement, 1.0);
         }
@@ -434,11 +546,15 @@ impl Scanner {
         };
         let intrinsics = self.intrinsics;
 
-        self.volume = TsdfVolume::new(TsdfParams {
-            min_depth: self.config.depth_min,
-            max_depth: self.config.depth_max,
-            ..self.config.tsdf
-        });
+        self.volume = self.fresh_volume();
+        // The rebuild lays every fused frame into one global volume at the
+        // corrected poses, so the cached submap surfaces are now redundant.
+        self.finished_geometry = Mesh::default();
+        self.world_from_submap = Isometry3::identity();
+        self.submap_starts.clear();
+        if self.frames > 0 {
+            self.submap_starts.push(0);
+        }
         self.trajectory.clear();
 
         let mut fused = 0;
@@ -495,10 +611,10 @@ impl Scanner {
     /// the view window keeps the preview bounded. The exported mesh is still
     /// painted from every view by [`Self::export_mesh`].
     ///
-    /// `max_color_views == 0` returns geometry only. A volume with no surface,
-    /// or no colour views, does the same.
+    /// `max_color_views == 0` returns geometry only. A reconstruction with no
+    /// surface, or no colour views, does the same.
     pub fn preview_mesh(&self, max_color_views: usize) -> Mesh {
-        let mut mesh = self.volume.extract_mesh();
+        let mut mesh = self.geometry();
         if mesh.is_empty() || self.color_views.is_empty() || max_color_views == 0 {
             return mesh;
         }
@@ -513,7 +629,7 @@ impl Scanner {
 
     /// The extracted mesh, plus the painter's report when colour views exist.
     fn painted_mesh(&self) -> (Mesh, Option<ColoringReport>) {
-        let mut mesh = self.volume.extract_mesh();
+        let mut mesh = self.geometry();
         if self.color_views.is_empty() {
             return (mesh, None);
         }
@@ -529,17 +645,17 @@ impl Scanner {
         (mesh, Some(report))
     }
 
-    /// Atlas for the colour views, in the volume's own frame.
+    /// Atlas for the colour views, in the scanner's world frame.
     ///
-    /// `None` when texturing is off or the volume has no surface. The result is
-    /// not mirrored: views were captured in this frame, so a caller that wants
-    /// real-world left and right has to [`TexturedMesh::flip_x`] afterwards.
-    /// [`export_mesh`] does that, and only after the atlas exists.
+    /// `None` when texturing is off or the reconstruction has no surface. The
+    /// result is not mirrored: views were captured in this frame, so a caller
+    /// that wants real-world left and right has to [`TexturedMesh::flip_x`]
+    /// afterwards. [`export_mesh`] does that, and only after the atlas exists.
     pub fn textured_mesh(&self) -> Option<(TexturedMesh, TexturingReport)> {
         if self.color_views.is_empty() {
             return None;
         }
-        let mesh = self.volume.extract_mesh();
+        let mesh = self.geometry();
         if mesh.is_empty() {
             return None;
         }
@@ -618,7 +734,12 @@ impl Scanner {
     }
 
     pub fn allocated_bytes(&self) -> usize {
-        self.volume.allocated_bytes()
+        self.volume.allocated_bytes() + self.submap_surface_bytes()
+    }
+
+    /// Memory held by the cached finished-submap surfaces, in bytes.
+    pub fn submap_surface_bytes(&self) -> usize {
+        mesh_bytes(&self.finished_geometry)
     }
 
     /// Cumulative time spent tracking frames.
@@ -631,9 +752,51 @@ impl Scanner {
         self.total_fusion
     }
 
-    pub fn pose(&self) -> Isometry3<f32> {
-        self.odometry.pose()
+    /// Cumulative time spent finalising finished submap surfaces.
+    pub fn total_submap(&self) -> Duration {
+        self.total_submap
     }
+
+    /// How many submaps the frames have been split across.
+    pub fn submaps(&self) -> usize {
+        self.submap_starts.len()
+    }
+
+    /// Zero-based arrival index of each submap's first frame.
+    pub fn submap_starts(&self) -> &[usize] {
+        &self.submap_starts
+    }
+
+    /// The current frame's pose in the scan's world frame.
+    pub fn pose(&self) -> Isometry3<f32> {
+        self.poses
+            .last()
+            .copied()
+            .unwrap_or_else(|| self.world_from_submap * self.odometry.pose())
+    }
+}
+
+/// Append `mesh`, transformed, to `target`.
+///
+/// Indices are rebased; colours are left out because the caller paints the
+/// merged surface from the colour views after every submap is in place.
+fn append_transformed(target: &mut Mesh, mesh: Mesh, transform: Isometry3<f32>) {
+    let base = target.vertices.len() as u32;
+    target
+        .vertices
+        .extend(mesh.vertices.into_iter().map(|vertex| transform_point(&transform, &vertex)));
+    target.triangles.extend(mesh.triangles.into_iter().map(|triangle| {
+        [
+            triangle[0] + base,
+            triangle[1] + base,
+            triangle[2] + base,
+        ]
+    }));
+}
+
+fn mesh_bytes(mesh: &Mesh) -> usize {
+    mesh.vertices.len() * std::mem::size_of::<Vector3<f32>>()
+        + mesh.triangles.len() * std::mem::size_of::<[u32; 3]>()
 }
 
 #[cfg(test)]
@@ -655,14 +818,22 @@ mod tests {
         }
     }
 
-    /// Render a rectangular room interior from the origin, ray-tracing the five
-    /// walls analytically. `NaN` where a ray escapes.
-    ///
-    /// A flat wall would not do: a single plane leaves three degrees of freedom
-    /// unobservable, and a small patch also collapses to a handful of points at
-    /// the coarse ICP level. A box interior is what the scanner actually expects
-    /// to see, and it has plenty of structure in all three directions.
+    /// Render a rectangular room interior from the origin.
     fn room_frame(width: usize, height: usize, intrinsics: &Intrinsics) -> Vec<f32> {
+        room_frame_from(width, height, intrinsics, &Vector3::zeros(), 0.0)
+    }
+
+    /// Render the room interior from `eye`, yawed about the vertical axis.
+    ///
+    /// The stored depth is the camera-frame z of the hit, so this is a valid
+    /// depth image for a pose whose rotation is that yaw.
+    fn room_frame_from(
+        width: usize,
+        height: usize,
+        intrinsics: &Intrinsics,
+        eye: &Vector3<f32>,
+        yaw: f32,
+    ) -> Vec<f32> {
         const MIN_X: f32 = -1.0;
         const MAX_X: f32 = 1.0;
         const MIN_Y: f32 = -0.8;
@@ -677,16 +848,19 @@ mod tests {
             (Vector3::new(0.0, -1.0, 0.0), -MAX_Y),
             (Vector3::new(0.0, 0.0, -1.0), -MAX_Z),
         ];
+        let rotation =
+            nalgebra::UnitQuaternion::from_axis_angle(&Vector3::y_axis(), yaw);
 
         let mut frame = vec![f32::NAN; width * height];
 
         for y in 0..height {
             for x in 0..width {
-                let direction = Vector3::new(
+                let local = Vector3::new(
                     (x as f32 + 0.5 - intrinsics.cx) / intrinsics.fx,
                     (y as f32 + 0.5 - intrinsics.cy) / intrinsics.fy,
                     1.0,
                 );
+                let direction = rotation * local;
 
                 let mut nearest = f32::INFINITY;
                 for (normal, offset) in &planes {
@@ -695,12 +869,12 @@ mod tests {
                         continue;
                     }
 
-                    let t = offset / denominator;
+                    let t = (offset - normal.dot(eye)) / denominator;
                     if t <= 0.0 || t >= nearest {
                         continue;
                     }
 
-                    let hit = direction * t;
+                    let hit = *eye + direction * t;
                     let inside = hit.x >= MIN_X
                         && hit.x <= MAX_X
                         && hit.y >= MIN_Y
@@ -713,7 +887,7 @@ mod tests {
                 }
 
                 if nearest.is_finite() {
-                    // dir.z is 1, so t is already the z of the hit point.
+                    // The local ray has z = 1, so t is the camera-frame depth.
                     frame[y * width + x] = nearest;
                 }
             }
@@ -824,6 +998,43 @@ mod tests {
         assert_eq!(scanner.frames(), 4);
         assert_eq!(scanner.fused(), 4);
         assert_eq!(scanner.rejected(), 0);
+    }
+
+    #[test]
+    fn a_lost_view_starts_a_second_submap() {
+        let mut scanner = scanner();
+        let front = room_frame(WIDTH, HEIGHT, &intrinsics());
+        let side = room_frame_from(
+            WIDTH,
+            HEIGHT,
+            &intrinsics(),
+            &Vector3::zeros(),
+            std::f32::consts::FRAC_PI_2,
+        );
+
+        let first = scanner.add_frame(&front, WIDTH, HEIGHT);
+        assert!(first.integration.is_some());
+
+        let transition = scanner.add_frame(&side, WIDTH, HEIGHT);
+        assert!(
+            transition.new_submap,
+            "the side view should not track the front view"
+        );
+        assert_eq!(transition.submap, 1);
+        assert!(transition.integration.is_some(), "the submap origin is fused");
+
+        let confirmed = scanner.add_frame(&side, WIDTH, HEIGHT);
+        assert!(!confirmed.new_submap);
+        assert!(
+            confirmed.integration.is_some(),
+            "the side view should track itself"
+        );
+
+        assert_eq!(scanner.frames(), 3);
+        assert_eq!(scanner.submaps(), 2);
+        assert_eq!(scanner.fused(), 3);
+        assert_eq!(scanner.rejected(), 0);
+        assert!(!scanner.mesh().is_empty());
     }
 
     #[test]

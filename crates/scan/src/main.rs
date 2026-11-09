@@ -121,6 +121,11 @@ struct Options {
     /// gates decide whether to trust it. Costs a cloud build on rejected
     /// frames only, so a clean scan pays nothing.
     relocalize: bool,
+    /// Start a new submap when a frame cannot be placed in the current one.
+    /// The frame becomes the new submap's first frame at the failed alignment's
+    /// candidate pose. On by default; `--no-submaps` restores the old
+    /// drop-only behaviour for comparison.
+    submaps: bool,
     /// Export a Nerfstudio dataset for a Gaussian-splatting trainer: the colour
     /// views, their masks, `transforms.json`, and an initial point cloud.
     /// Needs `--color`, because the dataset is built from the colour views.
@@ -150,6 +155,7 @@ impl Default for Options {
             unmirror: true,
             frame_to_model: false,
             relocalize: false,
+            submaps: true,
             dataset: None,
         }
     }
@@ -262,6 +268,7 @@ fn parse_args(
             "--no-mirror" | "--unmirror" => options.unmirror = true,
             "--frame-to-model" => options.frame_to_model = true,
             "--relocalize" => options.relocalize = true,
+            "--no-submaps" => options.submaps = false,
             "--dataset" => {
                 options.dataset = Some(PathBuf::from(next_value(&mut args, "--dataset")?))
             }
@@ -447,6 +454,10 @@ fn usage_text() -> String {
          \x20               the previous view; strict inlier and residual gates\n\
          \x20               decide whether to trust it. Pays a cloud build on\n\
          \x20               rejected frames only, so a clean scan is unaffected.\n\
+         \x20 --no-submaps  Do not start a new submap when a frame cannot be\n\
+         \x20               placed in the current one. Submaps are on by default:\n\
+         \x20               the boundary keeps the fragments separate instead of\n\
+         \x20               dropping frames or smearing them onto the old model.\n\
          \x20 --mirror      Keep the raw sensor mirror orientation instead of flipping\n\
          \x20               X to match real-world coordinates (un-mirrored by default).\n\
          \x20               A dataset is always written in the sensor frame, so this\n\
@@ -782,6 +793,7 @@ fn scanner_config(options: &Options) -> ScannerConfig {
             relocalize: options.relocalize,
             ..OdometryConfig::default()
         },
+        submaps: options.submaps,
         coloring: ColoringParams {
             mode: options.color_mode,
             depth_tolerance: options.color_depth_tolerance,
@@ -899,13 +911,21 @@ fn print_progress(index: usize, report: &FrameReport) {
     } else {
         ""
     };
+    let submap = if report.new_submap {
+        match report.submap_reason {
+            Some(reason) => format!("  SUBMAP {} ({reason})", report.submap + 1),
+            None => format!("  SUBMAP {}", report.submap + 1),
+        }
+    } else {
+        String::new()
+    };
 
     // `move` is the recovered sensor motion for this frame and `iters` the total
     // ICP iterations spent on it: together they are the quickest way to spot a
     // jump that the acceptance gates should have caught, or a solve that is
     // burning its whole budget without settling.
     println!(
-        "[scan] {:>4}  pts {:>6}  inliers {:>5.1}%  rmse {:>5.1} mm  move {:>5.1} cm  iters {:>3}  pos [{:>6.3} {:>6.3} {:>6.3}]  {outcome}{recovered}{relocalized}",
+        "[scan] {:>4}  pts {:>6}  inliers {:>5.1}%  rmse {:>5.1} mm  move {:>5.1} cm  iters {:>3}  pos [{:>6.3} {:>6.3} {:>6.3}]  {outcome}{recovered}{relocalized}{submap}",
         index,
         report.points,
         report.track.inlier_ratio * 100.0,
@@ -994,30 +1014,47 @@ pub(crate) fn finish(
 ) -> Result<FinishSummary, Box<dyn Error>> {
     println!();
     println!(
-        "[scan] frames: {} (fused {}, skipped {})",
+        "[scan] frames: {} (fused {}, skipped {}, submaps {})",
         scanner.frames(),
         scanner.fused(),
-        scanner.rejected()
+        scanner.rejected(),
+        scanner.submaps()
     );
+    if scanner.submaps() > 1 {
+        let starts = scanner
+            .submap_starts()
+            .iter()
+            .map(|index| (index + 1).to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        println!("[scan] submap starts: {starts}");
+    }
 
     let frames = scanner.frames().max(1) as f64;
     println!(
-        "[scan] time per frame: tracking {:.0} ms, fusion {:.0} ms",
+        "[scan] time per frame: tracking {:.0} ms, fusion {:.0} ms, submap {:.0} ms",
         scanner.total_tracking().as_secs_f64() * 1000.0 / frames,
         scanner.total_fusion().as_secs_f64() * 1000.0 / frames,
+        scanner.total_submap().as_secs_f64() * 1000.0 / frames,
     );
     print_color_views(scanner);
     println!(
-        "[scan] TSDF: {} blocks, {:.1} MB",
+        "[scan] memory: {} TSDF blocks, {:.1} MB total ({:.1} MB submap surfaces)",
         scanner.block_count(),
-        scanner.allocated_bytes() as f64 / 1e6
+        scanner.allocated_bytes() as f64 / 1e6,
+        scanner.submap_surface_bytes() as f64 / 1e6,
     );
 
     // Final position is the quickest sanity check on drift: for a loop that
     // returns to its start, this should be back near the origin.
     let final_position = scanner.pose().translation.vector;
+    let position_note = if scanner.submaps() > 1 {
+        " (current submap origin guess)"
+    } else {
+        ""
+    };
     println!(
-        "[scan] final position [{:.3} {:.3} {:.3}] m, {:.3} m from origin",
+        "[scan] final position [{:.3} {:.3} {:.3}] m, {:.3} m from origin{position_note}",
         final_position.x,
         final_position.y,
         final_position.z,
@@ -1284,6 +1321,20 @@ mod tests {
                 .expect("parse");
         assert!(options.relocalize);
         assert!(scanner_config(&options).odometry.relocalize);
+    }
+
+    #[test]
+    fn submaps_are_on_by_default_and_can_be_disabled() {
+        let (_, options) =
+            parse_args(words(&["replay", "--in", "capture.k2df"])).expect("parse");
+        assert!(options.submaps);
+        assert!(scanner_config(&options).submaps);
+
+        let (_, options) =
+            parse_args(words(&["replay", "--in", "capture.k2df", "--no-submaps"]))
+                .expect("parse");
+        assert!(!options.submaps);
+        assert!(!scanner_config(&options).submaps);
     }
 
     #[test]

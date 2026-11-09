@@ -121,13 +121,13 @@ Add `--color` to paint a live mesh. `--out scan.ply` keeps per-vertex colour; `-
 ```
 scan gui    [--in FILE | --synthetic] [--auto-start] [--frames N]
             [--out mesh.ply] [--dataset DIR] [--color] [--preview-every N]
-            [--playback-fps F]
+            [--playback-fps F] [--no-submaps]
 scan live   [--frames N] [--out mesh.ply] [--voxel M] [--no-filter] [--color]
             [--color-mode best|blend|average] [--color-depth-tolerance M]
-            [--gpu] [--loop-closure] [--viewer] [--dataset DIR]
+            [--gpu] [--loop-closure] [--viewer] [--dataset DIR] [--no-submaps]
 scan record  --out capture.k2df [--frames N] [--no-filter] [--drain-color] [--gpu] [--color]
 scan replay  --in capture.k2df [--out mesh.ply] [--voxel M] [--frames N] [--loop-closure]
-            [--relocalize] [--dataset DIR]
+            [--relocalize] [--no-submaps] [--dataset DIR]
 ```
 
 - `gui` opens the scanner window. Pick a live sensor, Record, a recording, or
@@ -148,10 +148,19 @@ scan replay  --in capture.k2df [--out mesh.ply] [--voxel M] [--frames N] [--loop
   dataset. A depth-only recording cannot.
 - `--relocalize` is an experimental spatial search for rejected frames. It
   aligns the frame's voxel cloud to the last accepted frame's cloud and accepts
-  only a strict fit (≥55% inliers, ≤25 mm RMSE). On `out/room.k2df` it recovers
-  0 of the 73 rejected frames — they are first views of surfaces the last frame
+  only a strict fit (≥55% inliers, ≤25 mm RMSE). On `out/room.k2df` with
+  `--no-submaps` it recovers 0 of the 73 rejected frames — they are first views
+  of surfaces the last frame
   never saw — and costs about 4.8x the tracking time. Off by default; see
   `GAUSSIAN_SPLATTING.md` §5, M2.1 for the measurements.
+- Submaps are on by default. When the tracker cannot place a frame and the
+  spatial search does not recover it, that frame starts a new submap at the
+  failed alignment's candidate pose; tracking and fusion continue locally. On
+  `out/room.k2df` this turns 77 fused / 73 skipped into 150 / 0 across 19
+  fragments, using 220 MB instead of 464 MB, but no revisit is verified, so the
+  fragments stay at guessed origins. Finalising each submap extracts its
+  surface, about a second at each boundary. `--no-submaps` restores the single
+  model and the skipped frames. See `GAUSSIAN_SPLATTING.md` §5, M2.1b.
 
 Useful options:
 
@@ -222,7 +231,8 @@ The window has four parts:
   recording, or the synthetic room. The source and the parameters are locked
   once a scan starts; Reset returns to the picker.
 - **Reconstruction and output**: frames, voxel size, colour and its mode,
-  colour-depth tolerance, filters, loop closure, frame-to-model, GPU decode,
+  colour-depth tolerance, filters, loop closure, frame-to-model, submaps, GPU
+  decode,
   mirror, preview interval, playback rate, the output path, and the optional
   dataset directory. The extension selects the mesh format exactly as it does
   on the command line.
@@ -515,11 +525,11 @@ platform/linux      udev rule
 cargo test -p geom -p scan --features gui
 ```
 
-197 tests. The geometry is tested against synthetic scenes and known transforms
+199 tests. The geometry is tested against synthetic scenes and known transforms
 rather than against recorded data, so the suite runs without a sensor. The
 window's tests are headless too: they exercise the session worker, a synthetic
 scan and its export, and the software renderer without opening a window. Without
-`--features gui` the suite is 180 tests.
+`--features gui` the suite is 182 tests.
 
 Two tests need hardware and are ignored by default:
 

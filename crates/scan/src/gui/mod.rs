@@ -103,6 +103,7 @@ struct UiConfig {
     color_depth_tolerance: f32,
     loop_closure: bool,
     frame_to_model: bool,
+    submaps: bool,
     gpu: bool,
     unmirror: bool,
     out: String,
@@ -122,6 +123,7 @@ impl UiConfig {
             color_depth_tolerance: options.color_depth_tolerance,
             loop_closure: options.loop_closure,
             frame_to_model: options.frame_to_model,
+            submaps: options.submaps,
             gpu: options.gpu,
             unmirror: options.unmirror,
             out: options
@@ -294,6 +296,7 @@ impl ScannerApp {
         options.color_depth_tolerance = self.config.color_depth_tolerance;
         options.loop_closure = self.config.loop_closure;
         options.frame_to_model = self.config.frame_to_model;
+        options.submaps = self.config.submaps;
         options.gpu = self.config.gpu;
         options.unmirror = self.config.unmirror;
         options.viewer = false;
@@ -536,6 +539,10 @@ impl ScannerApp {
 
                     ui.label("Frame to model");
                     ui.checkbox(&mut self.config.frame_to_model, "slow, less drift");
+                    ui.end_row();
+
+                    ui.label("Submaps");
+                    ui.checkbox(&mut self.config.submaps, "restart when tracking is lost");
                     ui.end_row();
 
                     ui.label("GPU decode");
@@ -782,6 +789,7 @@ impl ScannerApp {
             );
             stat(ui, "fused", snapshot.fused.to_string());
             stat(ui, "rejected", snapshot.rejected.to_string());
+            stat(ui, "submaps", snapshot.submaps.to_string());
             stat(
                 ui,
                 "position",
@@ -802,6 +810,7 @@ impl ScannerApp {
                 format!("{:.0} ms/frame", snapshot.tracking_ms),
             );
             stat(ui, "fusion", format!("{:.0} ms/frame", snapshot.fusion_ms));
+            stat(ui, "submap", format!("{:.0} ms/frame", snapshot.submap_ms));
             if self.preview_fps > 0.1 {
                 stat(ui, "preview", format!("{:.1} fps", self.preview_fps));
             }

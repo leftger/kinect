@@ -96,12 +96,13 @@ reduce drift — see §5, M2.
   wants NASM, pulled in by `kinect-one`'s default features). Pre-existing and
   unrelated; use `-p geom -p scan`.
 - **`out/room.k2df` still defeats the tracker around frame 22.** The default
-  frame-to-frame path now fuses 77 of 150 frames (73 rejected) after the
-  bounded-gap recovery, but the failures are first views of surfaces the last
-  frame never saw. The spatial search (`--relocalize`) recovers none of them:
-  there is no overlap to align to (see §5, M2.1). The next fix is a submap
-  boundary (M2.1b), not a wider search. No drift comparison means anything on a
-  capture that loses tracking.
+  frame-to-frame path fuses 77 of 150 frames, and the failures are first views of
+  surfaces the last frame never saw. The spatial search (`--relocalize`) recovers
+  none of them: there is no overlap to align to (see §5, M2.1). Submaps now keep
+  those views (150/150 fused across 19 fragments), but no revisit is verified on
+  this capture, so the fragments stay at guessed origins. A merge needs a
+  capture with a genuine loop. No drift comparison means anything on a capture
+  that loses tracking.
 
 ### The window's role
 
@@ -225,13 +226,12 @@ Ordered by what unblocks the most. Each milestone has a definition of done that
 is a measurement, not a feeling.
 
 **Three tracks, because they need different things.** M1 needs the Kinect and a
-built Brush. **M0 and M2.1b do not**, and M2.1b is the highest-value work
-available right now: the current recording loses tracking at frame ~22, which
-makes every pose statement from it unreliable. The spatial search (M2.1) is
-measured and does not recover it; the next fix is a submap boundary. If the
-sensor is not on the desk, start at M0 (if the window is the goal) or M2.1b (if
-the poses are). M1.5 needs a trainer that already opens the dataset, so it comes
-after M1; M1.6 needs a trained
+built Brush. **M0 and M2.1b do not**, and M2.1b is now in: 150/150 frames land in
+19 submaps, but no revisit is verified, so the fragments remain at guessed
+origins. The next pose work is a capture with a genuine loop (to demonstrate the
+merge), then M2.2 drift. If the sensor is not on the desk, start at M0 (if the
+window is the goal) or the submap merge work (if the poses are). M1.5 needs a
+trainer that already opens the dataset, so it comes after M1; M1.6 needs a trained
 result, so it comes after M1.5.
 
 ### M0 — Finish the dataset side of the window (done, except the folder picker)
@@ -413,15 +413,38 @@ guess with a good-looking residual. It was removed. For the same reason the
 fast-motion acceptance is restricted to `gap == 0`, where the reference pose is
 trusted; `--relocalize` is kept as an opt-in diagnostic.
 
-**M2.1b — Start a new submap when there is no overlap.** The honest fix for this
-capture is not a pose; it is a submap boundary. When re-localisation against the
-last trusted cloud fails, keep the new view as a second submap with its own local
-origin, continue tracking and fusing inside it, and merge the submaps later
-through loop closure when a genuine revisit appears. The scanner currently has
-one world frame and one TSDF; a submap needs a second volume (or a transform to
-the first) and a keyframe map. Done when `out/room.k2df` accounts for every
-frame in some submap (none silently dropped) and the recorded/synthetic
-regression tests still pass.
+**M2.1b — Submaps on a lost track (done, structurally).** When the projective
+tracker rejects a frame and the spatial search does not save it, the scanner now
+starts a new submap: the rejected frame becomes the new submap's first frame at
+the failed alignment's candidate pose, the odometry restarts at that local
+origin, and fusion continues into a fresh TSDF. A finished submap is extracted
+to a world-space mesh and its volume is dropped. The boundary edge is omitted
+from the pose graph, so a cross-submap loop edge can move the whole submap
+instead of being pinned by the guess.
+
+Results on `out/room.k2df`:
+
+| | `--no-submaps` | default |
+| --- | --- | --- |
+| fused / skipped | 77 / 73 | **150 / 0** |
+| submaps | 1 | **19** |
+| memory | 463.8 MB | **220.7 MB** |
+| tracking / fusion / submap | 152 / 108 / 0 ms per frame | 91 / 205 / 142 ms per frame |
+| final position | 2.822 m | 1.778 m (current submap guess) |
+
+Every frame is now accounted for. The `fused` count is no longer a quality
+metric: it means "surfaced in some submap", not "tracked into the first one".
+The per-frame log prints each boundary with its rejection reason. Finalising a
+submap extracts its surface; that is the 142 ms/frame average submap cost,
+concentrated in roughly a second at each boundary.
+
+The remaining limitation is the merge. Loop closure on this capture verifies no
+revisits, so the 19 fragments stay at their candidate-pose origins and the
+exported mesh is 5.66 M vertices / 10.1 M triangles with an 8.05 x 5.43 x 5.44 m
+extent — a set of locally clean fragments, not a single room. A capture that
+returns somewhere it has already been is needed to demonstrate a cross-submap
+loop edge moving a whole fragment; the pose-graph plumbing is in place, but the
+data is not.
 
 **Still needed: a capture with ground truth.** A deliberate slow walk out and
 back is the single most valuable piece of test data this project could have; every

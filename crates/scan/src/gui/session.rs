@@ -132,11 +132,13 @@ pub(crate) struct SessionView {
     pub frames_done: usize,
     pub fused: usize,
     pub rejected: usize,
+    pub submaps: usize,
     pub position: [f32; 3],
     pub blocks: usize,
     pub allocated_bytes: usize,
     pub tracking_ms: f32,
     pub fusion_ms: f32,
+    pub submap_ms: f32,
     pub scene: Option<Arc<PreviewScene>>,
     pub scene_id: u64,
     pub message: String,
@@ -159,11 +161,13 @@ impl Default for SessionView {
             frames_done: 0,
             fused: 0,
             rejected: 0,
+            submaps: 0,
             position: [0.0; 3],
             blocks: 0,
             allocated_bytes: 0,
             tracking_ms: 0.0,
             fusion_ms: 0.0,
+            submap_ms: 0.0,
             scene: None,
             scene_id: 0,
             message: String::new(),
@@ -196,11 +200,13 @@ impl SessionView {
             frames_done: self.frames_done,
             fused: self.fused,
             rejected: self.rejected,
+            submaps: self.submaps,
             position: self.position,
             blocks: self.blocks,
             allocated_bytes: self.allocated_bytes,
             tracking_ms: self.tracking_ms,
             fusion_ms: self.fusion_ms,
+            submap_ms: self.submap_ms,
             scene: self.scene.clone(),
             scene_id: self.scene_id,
             message: self.message.clone(),
@@ -232,11 +238,13 @@ pub(crate) struct SessionSnapshot {
     pub frames_done: usize,
     pub fused: usize,
     pub rejected: usize,
+    pub submaps: usize,
     pub position: [f32; 3],
     pub blocks: usize,
     pub allocated_bytes: usize,
     pub tracking_ms: f32,
     pub fusion_ms: f32,
+    pub submap_ms: f32,
     pub scene: Option<Arc<PreviewScene>>,
     pub scene_id: u64,
     pub message: String,
@@ -620,12 +628,14 @@ impl SessionState {
         view.frames_done = self.frame;
         view.fused = self.scanner.fused();
         view.rejected = self.scanner.rejected();
+        view.submaps = self.scanner.submaps();
         view.blocks = report.blocks;
         view.allocated_bytes = report.allocated_bytes;
 
         let frames = self.scanner.frames().max(1) as f64;
         view.tracking_ms = (self.scanner.total_tracking().as_secs_f64() * 1000.0 / frames) as f32;
         view.fusion_ms = (self.scanner.total_fusion().as_secs_f64() * 1000.0 / frames) as f32;
+        view.submap_ms = (self.scanner.total_submap().as_secs_f64() * 1000.0 / frames) as f32;
 
         let position = self.scanner.pose().translation.vector;
         view.position = if self.options.unmirror {
