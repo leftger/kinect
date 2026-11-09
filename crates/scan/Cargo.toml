@@ -22,9 +22,9 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
 # Only needed to enumerate OpenCL platforms and pick a device for `gpu-decode`.
 ocl = { version = "0.19.7", optional = true }
 
-# Drives the live viewer window for `viewer`. Built against the glow backend
-# rather than the default wgpu one, so it does not pull a second wgpu version in
-# alongside the one `wgpu-decode` uses.
+# Drives the scanner window for `gui` (and the older `viewer` alias). Built
+# against the glow backend rather than the default wgpu one, so it does not pull
+# a second wgpu version in alongside the one `wgpu-decode` uses.
 eframe = { version = "0.36", default-features = false, features = [
     "default_fonts",
     "glow",
@@ -58,8 +58,13 @@ gpu-decode = ["dep:ocl", "kinect-one/opencl_depth"]
 # helps the odometry rather than just saving time.
 wgpu-decode = ["dep:wgpu", "dep:pollster"]
 
-# A live window showing the scan as it builds. Needs a display.
-viewer = ["dep:eframe"]
+# The scanner window: source picker, live 3D preview, transport controls and
+# export. Needs a display.
+gui = ["dep:eframe"]
+
+# The old name for `gui`, kept so an existing `--features viewer` build keeps
+# working.
+viewer = ["gui"]
 
 # The Vulkan diagnostics need wgpu, which is optional, so they are only built
 # when the feature is on. `required-features` is cleaner than cfg-guarding each

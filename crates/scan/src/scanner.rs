@@ -1,6 +1,6 @@
 //! The scan pipeline: depth frame -> odometry -> TSDF fusion.
 
-use geom::coloring::{colorize, ColorMode, ColorView, ColoringParams, ColoringReport};
+use geom::coloring::{colorize, ColorView, ColoringParams, ColoringReport};
 use geom::mesh::Mesh;
 use geom::pose_graph::{PoseGraph, PoseGraphParams};
 use geom::texturing::{texture, TexturedMesh, TexturingParams, TexturingReport};
@@ -486,6 +486,31 @@ impl Scanner {
         self.painted_mesh().0
     }
 
+    /// Geometry for the live preview, optionally painted from the most recent
+    /// `max_color_views` colour views.
+    ///
+    /// The full painter walks every stored view for every vertex, which is the
+    /// right trade for a file and the wrong one for a preview that has to keep up
+    /// with capture: the cost would grow with the length of the scan. Limiting
+    /// the view window keeps the preview bounded. The exported mesh is still
+    /// painted from every view by [`Self::export_mesh`].
+    ///
+    /// `max_color_views == 0` returns geometry only. A volume with no surface,
+    /// or no colour views, does the same.
+    pub fn preview_mesh(&self, max_color_views: usize) -> Mesh {
+        let mut mesh = self.volume.extract_mesh();
+        if mesh.is_empty() || self.color_views.is_empty() || max_color_views == 0 {
+            return mesh;
+        }
+
+        let start = self.color_views.len().saturating_sub(max_color_views);
+        let views = &self.color_views[start..];
+        let normals = mesh.vertex_normals();
+        let (colors, _) = colorize(&mesh.vertices, &normals, views, &self.config.coloring);
+        mesh.colors = Some(colors);
+        mesh
+    }
+
     /// The extracted mesh, plus the painter's report when colour views exist.
     fn painted_mesh(&self) -> (Mesh, Option<ColoringReport>) {
         let mut mesh = self.volume.extract_mesh();
@@ -614,6 +639,7 @@ impl Scanner {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use geom::coloring::ColorMode;
 
     /// Reduced-resolution version of the real sensor's optics: the same ~70 degree
     /// field of view with far fewer pixels, so the tests stay quick.

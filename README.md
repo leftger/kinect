@@ -15,12 +15,15 @@ gaps. Read this section before the code.
 
 **Works**
 
-- Live capture, recording, and replay of depth frames at 512x424
+- Live capture, recording, and replay of depth frames at 512x424, with optional colour
 - Frame-to-frame odometry recovered from depth only, 81 ms per frame
 - TSDF fusion and triangle-mesh extraction, written as binary PLY
 - Trajectory export, which is the quickest way to see how badly a scan drifted
 - Loop closure and pose-graph optimisation, wired and tested
 - Optional live colour, painted onto the mesh as per-vertex PLY colour or as a texture atlas (OBJ, glTF, or a single GLB)
+- A scanner window (`scan gui`) with an interactive 3D preview, source picker,
+  start/pause/stop, parameters and export. It can run the synthetic room or a
+  recording, so the real-time path works with no sensor attached.
 
 **Found by profiling, and fixed**
 
@@ -89,6 +92,15 @@ is Vulkan.
 cargo build --release -p scan --features wgpu-decode
 ```
 
+The scanner window needs the `gui` feature. The old name, `viewer`, is an alias
+so an existing build command keeps working. The window uses the glow backend
+(Wayland and X11 on Linux), not wgpu, so it can be combined with `wgpu-decode`
+without pulling a second GPU stack in.
+
+```
+cargo build --release -p scan --features gui
+```
+
 The scanner binary is `target/release/scan`. To check that the sensor works
 before using the scanner, `cargo run --release -p probe`.
 
@@ -103,17 +115,27 @@ Add `--color` to paint a live mesh. `--out scan.ply` keeps per-vertex colour; `-
 ## Use
 
 ```
+scan gui    [--in FILE | --synthetic] [--auto-start] [--frames N]
+            [--out mesh.ply] [--color] [--preview-every N] [--playback-fps F]
 scan live   [--frames N] [--out mesh.ply] [--voxel M] [--no-filter] [--color]
             [--color-mode best|blend|average] [--color-depth-tolerance M]
             [--gpu] [--loop-closure] [--viewer]
-scan record  --out capture.k2df [--frames N] [--no-filter] [--drain-color] [--gpu]
+scan record  --out capture.k2df [--frames N] [--no-filter] [--drain-color] [--gpu] [--color]
 scan replay  --in capture.k2df [--out mesh.ply] [--voxel M] [--frames N] [--loop-closure]
 ```
 
+- `gui` opens the scanner window. Pick a live sensor, a recording, or the
+  synthetic room; start, pause, stop, adjust parameters, and export. The 3D
+  viewport updates as frames fuse. It needs a build with `--features gui` and a
+  display, but not a sensor: `scan gui --synthetic --auto-start` runs the whole
+  real-time path on a machine with nothing plugged in.
 - `live` captures and reconstructs as it goes.
-- `record` stores depth frames to a file for offline work. A recording is
-  deterministic, so replaying a prefix of it is a repeatable test case.
-- `replay` reconstructs from a recording and needs no sensor.
+- `record` stores frames to a file for offline work. With `--color` it stores
+  the registered colour too; without it the recording is depth only. A
+  recording is deterministic, so replaying a prefix of it is a repeatable test
+  case.
+- `replay` reconstructs from a recording and needs no sensor. If the recording
+  carries colour, the mesh is painted from it.
 
 Useful options:
 
@@ -130,10 +152,11 @@ Useful options:
   about 1.66 MiB, and about 1 GiB at 600 views. It only helps a scan that
   returns somewhere it has already been.
 - `--color` captures the colour stream during `live` and paints the finished
-  mesh. Off by default, because that stream is slower than depth. It does not
-  apply to `replay`: a `.k2df` recording is depth only, so there is no colour
-  to paint. `--drain-color` on `record` reads and discards colour packets and
-  still does not store them.
+  mesh. Off by default, because that stream is slower than depth. `record
+  --color` stores the registered colour in the `.k2df` file; `replay` paints
+  from it when present, and a depth-only recording has no colour to paint.
+  `--drain-color` on `record` reads and discards colour packets and does not
+  store them.
 - `--color-mode` is `best` (the default), `blend`, or `average`. It sets
   per-vertex PLY colour. A texture atlas gives each triangle one best source
   view. See [Colour](#colour).
@@ -143,11 +166,18 @@ Useful options:
 - `--out` selects the file by extension. `.ply` is per-vertex colour. `.obj`
   also writes a sibling `.mtl` and `.png`. `.gltf` also writes a sibling `.bin`
   and `.png`. `.glb` is the geometry and the PNG in one file.
-- `--viewer` opens a live window showing the scan as it builds: the reconstruction
-  so far, the frame count, the tracked position and the model size. Needs a build
-  with `--features viewer` and a display. The window backend in that feature is
-  Wayland and X11. Closing the window stops the scan, and the mesh is written
-  as usual.
+- `--viewer` opens the scanner window on the live source and starts immediately.
+  It is the same window as `scan gui`; the old picture-only viewer is gone. Needs
+  a build with `--features gui` (or the `viewer` alias) and a display. Closing
+  the window stops the scan and exports it.
+- `--synthetic` on `gui` selects the analytic room instead of the sensor.
+- `--auto-start` on `gui` starts the selected source when the window opens.
+  `live --viewer` does this too.
+- `--preview-every N` on `gui` extracts a preview mesh every N frames, default
+  `2`. One updates every frame and costs the most; a larger value keeps capture
+  faster and the preview coarser.
+- `--playback-fps F` on `gui` paces replay and synthetic playback, default `10`.
+  Zero runs as fast as the reconstruction allows.
 - `--gpu` decodes depth on the GPU during `live` and `record`. `replay` reads
   depth that was already decoded, so the flag does nothing there. Needs a build
   with `--features wgpu-decode`. OpenCL (`--features gpu-decode`) is the other
@@ -155,6 +185,44 @@ Useful options:
 - `--mirror` keeps the raw sensor mirror orientation instead of flipping X (un-mirrored by default).
 
 A trajectory PLY is written alongside the mesh as `<out>.trajectory.ply`.
+
+## The scanner window
+
+```
+scan gui --synthetic --auto-start --frames 60 --out out/room.ply
+scan gui --in out/capture.k2df --auto-start --voxel 0.02
+scan gui --color --out out/room.obj
+```
+
+The window has four parts:
+
+- **Source**: live sensor, a `.k2df` recording, or the synthetic room. The
+  source and the parameters are locked once a scan starts; Reset returns to the
+  picker.
+- **Reconstruction and output**: frames, voxel size, colour and its mode,
+  colour-depth tolerance, filters, loop closure, frame-to-model, GPU decode,
+  mirror, preview interval, playback rate, and the output path. The extension
+  selects the format exactly as it does on the command line.
+- **3D viewport**: drag to orbit, right-drag (or middle-drag) to pan, scroll to
+  zoom, double-click or *Fit view* to frame the model. The surface is extracted
+  from the TSDF every `--preview-every` frames, so it refines as the scan
+  proceeds. The latest depth frame is drawn as coloured points, the camera path
+  as a cyan line, and the current sensor as a yellow frustum.
+- **Telemetry**: frames, fused and rejected counts, position, TSDF size,
+  tracking and fusion time, preview rate, the worker's log and any error.
+
+*Start* runs the selected source. *Pause* stops consuming frames without
+losing the scanner; *Resume* continues. *Stop* ends the capture but keeps the
+scanner in memory so the finished model can be inspected and exported.
+*Export* writes it, and if the scan is still running it stops first. *Reset*
+throws the scan away. Closing the window exports an unexported scan rather
+than losing it, so Reset is the explicit discard.
+
+The preview is rasterised on the CPU into an ordinary egui texture. That keeps
+the window independent of the GPU decoder and testable without a display; at a
+few frames per second the cost is not the bottleneck. The mesh is painted from
+only the most recent colour views for preview, while the exported mesh still
+uses every view.
 
 ## How it works
 
@@ -185,11 +253,12 @@ cleaner quads at the cost of some detail.
 
 ## Colour
 
-`--color` is live-only. It captures the colour stream, registers each frame into
-the depth camera's grid, and paints the finished mesh from those views. A
-`.k2df` recording stores processed depth and nothing else, so `record`,
-`--drain-color`, and `replay` cannot paint. Passing `--color` to `replay` says
-so and then reconstructs the depth.
+`--color` captures the colour stream during `live`, registers each frame into
+the depth camera's grid, and paints the finished mesh from those views.
+`record --color` stores the registered colour in the `.k2df` file, so `replay`
+can paint from it; a recording made without `--color` is depth only and has no
+colour to paint. `--drain-color` reads and discards colour packets without
+storing them.
 
 ```
 scan live --color --frames 300 --out scan.ply
@@ -197,6 +266,7 @@ scan live --color --color-mode blend --color-depth-tolerance 0.03 --out scan.ply
 scan live --color --loop-closure --out room.obj
 scan live --color --out room.glb
 scan live --color --out room.gltf
+scan record --color --out capture.k2df
 scan replay --in capture.k2df --out mesh.ply
 ```
 
@@ -395,7 +465,9 @@ crates/geom         driver-independent geometry: voxel hashing, normals,
                     point-to-plane ICP, projective association, TSDF, surface
                     nets, colouring, texture atlases, PLY/OBJ/glTF/GLB output,
                     pose-graph optimisation
-crates/scan         the scanner: capture, recording, odometry, fusion, CLI
+crates/scan         the scanner: capture, recording, odometry, fusion, CLI,
+                    and the scanner window (source picker, 3D preview,
+                    transport, export)
 crates/probe        bring-up probe: confirms the sensor streams on this machine
 vendor/kinect-one   vendored libfreenect2 port, with patches
 platform/linux      udev rule
@@ -404,11 +476,14 @@ platform/linux      udev rule
 ## Tests
 
 ```
-cargo test -p geom -p scan
+cargo test -p geom -p scan --features gui
 ```
 
-133 tests. The geometry is tested against synthetic scenes and known transforms
-rather than against recorded data, so the suite runs without a sensor.
+192 tests. The geometry is tested against synthetic scenes and known transforms
+rather than against recorded data, so the suite runs without a sensor. The
+window's tests are headless too: they exercise the session worker, a synthetic
+scan and its export, and the software renderer without opening a window. Without
+`--features gui` the suite is 179 tests.
 
 Two tests need hardware and are ignored by default:
 

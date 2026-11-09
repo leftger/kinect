@@ -5,20 +5,28 @@
 //! extracted as a triangle mesh.
 //!
 //! ```text
+//! scan gui    [--in FILE | --synthetic] [--frames N] [--out mesh.ply] [--color]
+//!             [--auto-start] [--preview-every N] [--playback-fps F]
 //! scan live   [--frames N] [--out mesh.ply] [--voxel M] [--no-filter] [--color]
 //!             [--color-mode best|blend|average] [--color-depth-tolerance M]
 //!             [--gpu] [--loop-closure] [--viewer] [--dataset DIR]
-//! scan record  --out capture.k2df [--frames N] [--no-filter] [--drain-color] [--gpu]
+//! scan record  --out capture.k2df [--frames N] [--no-filter] [--drain-color] [--gpu] [--color]
 //! scan replay  --in capture.k2df [--out mesh.ply] [--voxel M] [--frames N] [--loop-closure]
 //! ```
 //!
+//! `gui` is the same scanner with a window: choose the source, start, pause,
+//! stop, and export. It can replay a recording or run the synthetic room, so the
+//! real-time path is usable on a machine with no sensor.
+//!
 //! `record` and `replay` exist so that odometry can be tuned against
 //! byte-identical input instead of a live sensor: the scene changes between live
-//! runs, so two parameter sets never see the same data. A `.k2df` file stores
-//! depth only, so `--color` paints a live scan and does nothing on replay.
+//! runs, so two parameter sets never see the same data. A `.k2df` file may carry
+//! colour or be depth only; `replay` paints from the colour views when the
+//! recording has them.
 //!
 //! `--dataset` turns a colour scan into something a Gaussian-splatting trainer
-//! can read; see [`dataset`]. It needs `live --color`, for the same reason.
+//! can read; see [`dataset`]. It needs colour views, from `live --color` or a
+//! colour recording replayed with `--dataset`.
 
 mod capture;
 mod dataset;
@@ -27,8 +35,8 @@ mod odometry;
 mod recording;
 mod scanner;
 mod synthetic;
-#[cfg(feature = "viewer")]
-mod viewer;
+#[cfg(feature = "gui")]
+mod gui;
 #[cfg(feature = "wgpu-decode")]
 mod wgpu_depth;
 
@@ -87,6 +95,14 @@ struct Options {
     color_depth_tolerance: f32,
     /// Open a live window showing the scan as it builds.
     viewer: bool,
+    /// GUI source: use the analytic room instead of a sensor. Needs `gui`.
+    synthetic: bool,
+    /// GUI: start the selected source as soon as the window opens.
+    auto_start: bool,
+    /// GUI: extract and publish a preview mesh every N frames.
+    preview_every: usize,
+    /// GUI: replay and synthetic frames per second. Zero is unthrottled.
+    playback_fps: f32,
     /// Un-mirror the reconstruction horizontally so real-world left and right match.
     /// True by default: the Kinect v2 sensor reads out mirrored frames.
     unmirror: bool,
@@ -121,6 +137,10 @@ impl Default for Options {
             color_mode: ColoringParams::default().mode,
             color_depth_tolerance: ColoringParams::default().depth_tolerance,
             viewer: false,
+            synthetic: false,
+            auto_start: false,
+            preview_every: 2,
+            playback_fps: 10.0,
             unmirror: true,
             frame_to_model: false,
             dataset: None,
@@ -130,6 +150,8 @@ impl Default for Options {
 
 #[derive(Debug)]
 enum Command {
+    /// The scanner window: source picker, live preview, transport and export.
+    Gui,
     Live,
     Record,
     Replay,
@@ -141,6 +163,7 @@ enum Command {
 async fn run() -> Result<(), Box<dyn Error>> {
     let (command, options) = parse_args(std::env::args().skip(1))?;
     match command {
+        Command::Gui => gui(&options),
         Command::Live => live(&options).await,
         Command::Record => record(&options).await,
         Command::Replay => replay(&options),
@@ -163,6 +186,7 @@ fn parse_args(
     }
 
     let command = match command.as_str() {
+        "gui" | "app" => Command::Gui,
         "live" => Command::Live,
         "record" => Command::Record,
         "replay" => Command::Replay,
@@ -209,6 +233,22 @@ fn parse_args(
             }
             "--drain-color" => options.drain_color = true,
             "--viewer" => options.viewer = true,
+            "--synthetic" => options.synthetic = true,
+            "--auto-start" => options.auto_start = true,
+            "--preview-every" => {
+                let every: usize = next_value(&mut args, "--preview-every")?.parse()?;
+                if every == 0 {
+                    return Err("--preview-every must be at least 1".into());
+                }
+                options.preview_every = every;
+            }
+            "--playback-fps" => {
+                let fps: f32 = next_value(&mut args, "--playback-fps")?.parse()?;
+                if !(fps.is_finite() && fps >= 0.0) {
+                    return Err("--playback-fps must be a finite number of zero or more".into());
+                }
+                options.playback_fps = fps;
+            }
             "--loop-closure" => options.loop_closure = true,
             "--gpu" => options.gpu = true,
             "--mirror" => options.unmirror = false,
@@ -250,8 +290,27 @@ fn parse_args(
             Command::Replay => {}
             // `synth` renders its own colour, so it needs no stream and no flag.
             Command::Synth => {}
+            // The window has its own source picker. It refuses a live dataset
+            // without colour before the scan, and a replay or synthetic source
+            // either has colour views or reports their absence at export.
+            Command::Gui => {}
             Command::Help => {}
         }
+    }
+
+    // A GUI source is either a sensor, a recording, or the synthetic room.
+    // Asking for two at once is a typo, not a preference.
+    if options.synthetic && options.input.is_some() {
+        return Err("--synthetic and --in select different GUI sources".into());
+    }
+    if options.synthetic && !matches!(command, Command::Gui) {
+        return Err("--synthetic only applies to `scan gui`".into());
+    }
+    if options.auto_start
+        && !matches!(command, Command::Gui)
+        && !(matches!(command, Command::Live) && options.viewer)
+    {
+        return Err("--auto-start only applies to `scan gui` or `live --viewer`".into());
     }
 
     Ok((command, options))
@@ -285,14 +344,21 @@ fn usage_text() -> String {
         "scan - handheld 3D scanner for the Kinect v2\n\
          \n\
          USAGE:\n\
+         \x20 scan gui    [--in FILE | --synthetic] [--auto-start] [--frames N]\n\
+         \x20             [--out mesh.ply] [--color] [--preview-every N]\n\
+         \x20             [--playback-fps F]\n\
          \x20 scan live   [--frames N] [--out mesh.ply] [--voxel M] [--no-filter] [--color]\n\
          \x20             [--color-mode best|blend|average] [--color-depth-tolerance M]\n\
          \x20             [--gpu] [--loop-closure] [--viewer] [--dataset DIR]\n\
          \x20 scan record  --out capture.k2df [--frames N] [--no-filter] [--drain-color] [--gpu]\n\
+         \x20             [--color]\n\
          \x20 scan replay  --in capture.k2df [--out mesh.ply] [--voxel M] [--frames N]\n\
          \x20             [--loop-closure]\n\
          \n\
          COMMANDS:\n\
+         \x20 gui      Open the scanner window: pick a source, scan, export.\n\
+         \x20          It can replay a recording or run a synthetic room, so it\n\
+         \x20          needs no sensor. Needs `--features gui` and a display.\n\
          \x20 live     Capture from the sensor and reconstruct as you go.\n\
          \x20 record   Capture depth frames to a file, for offline tuning.\n\
          \x20 replay   Reconstruct from a recording. Needs no sensor.\n\
@@ -305,14 +371,25 @@ fn usage_text() -> String {
          \x20 --out FILE    Output mesh (default scan.ply). The extension selects\n\
          \x20               the format: .ply (per-vertex colour), .obj (plus .mtl\n\
          \x20               and .png), .gltf (plus .bin and .png), or .glb (one file).\n\
-         \x20 --in FILE     Recording to replay. A .k2df file is depth only.\n\
+         \x20 --in FILE     Recording to replay. A .k2df file may carry colour\n\
+         \x20               or be depth only. With `gui`, preselects replay.\n\
+         \x20 --synthetic   On `gui`: use the analytic room, no sensor needed.\n\
+         \x20 --auto-start  On `gui`: start the selected source when the window\n\
+         \x20               opens. `live --viewer` does this too.\n\
+         \x20 --preview-every N\n\
+         \x20               On `gui`: extract a preview mesh every N frames\n\
+         \x20               (default 2). One updates every frame, at a cost.\n\
+         \x20 --playback-fps F\n\
+         \x20               On `gui`: replay and synthetic playback rate (default\n\
+         \x20               10). Zero runs as fast as the reconstruction allows.\n\
          \x20 --voxel M     TSDF voxel size in metres (default 0.01). Sets the\n\
          \x20               truncation band to 4x this.\n\
          \x20 --no-filter   Disable the decoder's bilateral/edge filters: roughly\n\
          \x20               doubles frame rate, keeps more junk points.\n\
          \x20 --color       On live: capture colour and paint the mesh. Off by\n\
          \x20               default. The colour stream is slower than depth.\n\
-         \x20               Replay cannot paint: the recording has no colour.\n\
+         \x20               On record: store the registered colour in the .k2df\n\
+         \x20               file, so replay can paint from it.\n\
          \x20 --color-mode MODE\n\
          \x20               Per-vertex PLY colour: best (default), blend, or\n\
          \x20               average. best keeps the highest-scoring visible\n\
@@ -341,8 +418,11 @@ fn usage_text() -> String {
          \x20               be rebuilt, and each colour view is about 1.66 MiB\n\
          \x20               (about 1 GiB at 600 views). Only helps a scan that\n\
          \x20               returns somewhere it has already been.\n\
-         \x20 --viewer      Open a live window. Needs `--features viewer` and a\n\
-         \x20               display. Closing the window stops the scan.\n\
+         \x20 --viewer      Open the scanner window on the live source and start\n\
+         \x20               immediately. The same window as `scan gui`, and the\n\
+         \x20               same feature. Needs `--features gui` (or the older\n\
+         \x20               `viewer` alias) and a display. Closing the window\n\
+         \x20               stops the scan and exports it.\n\
          \x20 --frame-to-model\n\
          \x20               Track each frame against a render of the fused model\n\
          \x20               instead of against the previous frame. Frame-to-frame\n\
@@ -357,7 +437,8 @@ fn usage_text() -> String {
          \x20               X to match real-world coordinates (un-mirrored by default).\n\
          \x20               A dataset is always written in the sensor frame, so this\n\
          \x20               does not apply to --dataset.\n\
-         \x20 --dataset DIR With --color on live: also write a dataset a Gaussian-\n\
+         \x20 --dataset DIR With colour views (live --color, or a colour recording):\n\
+         \x20               also write a dataset a Gaussian-\n\
          \x20               splatting trainer can read. DIR gains images/ (the\n\
          \x20               registered colour, one PNG per kept view), masks/ (white\n\
          \x20               where registration copied a colour sample, so the trainer\n\
@@ -367,31 +448,50 @@ fn usage_text() -> String {
          \x20               Images are at depth resolution, 512x424, not the colour\n\
          \x20               sensor's own size: registration copies colour into the\n\
          \x20               depth grid, and that is what keeps the intrinsics and the\n\
-         \x20               poses exact. Needs `live`: a .k2df recording has no colour.\n\
+         \x20               poses exact. A depth-only recording cannot: it has no\n\
+         \x20               colour views.\n\
          \n\
          A trajectory PLY is written alongside the mesh as <out>.trajectory.ply,\n\
          which is the quickest way to see how badly the pose has drifted."
     )
 }
 
+fn gui(options: &Options) -> Result<(), Box<dyn Error>> {
+    #[cfg(feature = "gui")]
+    return gui::run(options);
+
+    #[cfg(not(feature = "gui"))]
+    {
+        let _ = options;
+        Err("this build has no scanner window; rebuild with `--features gui`".into())
+    }
+}
+
 async fn live(options: &Options) -> Result<(), Box<dyn Error>> {
     if options.viewer {
-        #[cfg(feature = "viewer")]
-        return viewer::run(options);
+        #[cfg(feature = "gui")]
+        {
+            // `--viewer` is the live source, started immediately. It shares the
+            // whole window with `scan gui`, so there is one preview to maintain.
+            let mut options = options.clone();
+            options.auto_start = true;
+            return gui::run(&options);
+        }
 
-        #[cfg(not(feature = "viewer"))]
-        return Err("this build has no viewer; rebuild with `--features viewer`".into());
+        #[cfg(not(feature = "gui"))]
+        return Err("this build has no scanner window; rebuild with `--features gui`".into());
     }
 
     let mut scanner = run_live(options, |_, _| true).await?;
     finish_scan(&mut scanner, options)
 }
 
-/// The live capture loop, shared by the plain path and the viewer window.
+/// The live capture loop behind the plain `live` command.
 ///
-/// `on_frame` runs after each frame is integrated and returns whether to keep
-/// going. The plain path ignores it; the viewer uses it to hand the scan thread's
-/// latest picture to the GUI, and to stop when the window closes.
+/// The scanner window does not use this loop: it needs pause, stop, preview and
+/// export, so it runs its own worker in `gui::session`. `on_frame` runs after
+/// each frame is integrated and returns whether to keep going; `live` always
+/// returns `true`.
 pub(crate) async fn run_live<F>(
     options: &Options,
     mut on_frame: F,
@@ -676,7 +776,7 @@ fn scanner_config(options: &Options) -> ScannerConfig {
     }
 }
 
-/// Close loops, then write the mesh. Live, replay, and the viewer window all
+/// Close loops, then write the mesh. Live, replay, and the scanner window all
 /// end here, so closing the window still corrects the trajectory before export.
 pub(crate) fn finish_scan(scanner: &mut Scanner, options: &Options) -> Result<(), Box<dyn Error>> {
     close_loops(scanner, options);
@@ -1130,8 +1230,10 @@ mod tests {
         assert!(usage.contains("masks/"), "{usage}");
         // The resolution ceiling is stated rather than discovered.
         assert!(usage.contains("512x424"), "{usage}");
-        // And that a recording cannot be turned into one after the fact.
-        assert!(usage.contains(".k2df recording has no colour"), "{usage}");
+        // And that a depth-only recording cannot be turned into one after the
+        // fact, while a colour recording can.
+        assert!(usage.contains("depth-only recording cannot"), "{usage}");
+        assert!(usage.contains("colour recording"), "{usage}");
     }
 
     #[test]
@@ -1168,10 +1270,76 @@ mod tests {
     }
 
     #[test]
+    fn gui_flags_are_parsed_and_carry_a_source() {
+        let (command, options) = parse_args(words(&[
+            "gui",
+            "--synthetic",
+            "--auto-start",
+            "--preview-every",
+            "5",
+            "--playback-fps",
+            "7.5",
+        ]))
+        .expect("parse");
+
+        assert!(matches!(command, Command::Gui));
+        assert!(options.synthetic);
+        assert!(options.auto_start);
+        assert_eq!(options.preview_every, 5);
+        assert!((options.playback_fps - 7.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn gui_source_flags_conflict_is_rejected() {
+        let error = parse_args(words(&["gui", "--synthetic", "--in", "capture.k2df"]))
+            .expect_err("two sources");
+        assert!(
+            error.to_string().contains("different GUI sources"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn synthetic_outside_the_window_is_rejected() {
+        let error = parse_args(words(&["live", "--synthetic"])).expect_err("not the gui");
+        assert!(
+            error.to_string().contains("only applies to `scan gui`"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn bad_gui_preview_and_playback_values_are_rejected() {
+        let every = parse_args(words(&["gui", "--preview-every", "0"])).expect_err("zero");
+        assert!(every.to_string().contains("at least 1"), "{every}");
+
+        for value in ["-1", "nan", "inf"] {
+            let fps =
+                parse_args(words(&["gui", "--playback-fps", value])).expect_err(value);
+            assert!(
+                fps.to_string().contains("zero or more"),
+                "{value}: {fps}"
+            );
+        }
+    }
+
+    #[test]
+    fn usage_documents_the_window_and_its_options() {
+        let usage = usage_text();
+        assert!(usage.contains("scan gui"), "{usage}");
+        assert!(usage.contains("Open the scanner window"), "{usage}");
+        assert!(usage.contains("--synthetic"), "{usage}");
+        assert!(usage.contains("--auto-start"), "{usage}");
+        assert!(usage.contains("--preview-every N"), "{usage}");
+        assert!(usage.contains("--playback-fps F"), "{usage}");
+        assert!(usage.contains("needs no sensor"), "{usage}");
+    }
+
+    #[test]
     fn finish_scan_closes_loops_before_an_empty_mesh_returns() {
         // No surface, so `finish` returns before it writes a file. Closure is
         // recorded only when loop closure actually ran, which has to happen
-        // first: the viewer, live, and replay paths all end in `finish_scan`.
+        // first: the window, live, and replay paths all end in `finish_scan`.
         let intrinsics = Intrinsics {
             fx: 1.0,
             fy: 1.0,
