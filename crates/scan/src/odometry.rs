@@ -6,11 +6,11 @@
 //! for the cases projective association cannot serve (aligning keyframes that are
 //! far apart, which is what loop closure will need).
 
-use geom::icp::IcpParams;
+use geom::icp::{align, IcpCloud, IcpParams, IcpResult};
 use geom::projective::{align_level, DepthPyramid};
 use geom::tsdf::{RaycastImage, TsdfVolume};
 use geom::{DepthImage, Intrinsics};
-use nalgebra::Isometry3;
+use nalgebra::{Isometry3, Translation3, UnitQuaternion, Vector3};
 
 /// One resolution of the alignment pyramid.
 #[derive(Clone, Copy, Debug)]
@@ -88,6 +88,42 @@ pub struct OdometryConfig {
     /// which is unusable in a live scan but irrelevant offline in `replay`,
     /// where it is meant to be used.
     pub frame_to_model: bool,
+
+    /// Try a spatial alignment against the last accepted frame when the
+    /// projective tracker rejects a frame.
+    ///
+    /// Projective association can only match a point where it projects into
+    /// the previous depth image; it cannot look for a surface that has left
+    /// the frame. A spatial ICP over a voxel-hashed cloud can, because the
+    /// correspondence is a nearest-neighbour search rather than a projection.
+    /// It costs a cloud build on each rejected frame, so it is opt-in until the
+    /// real-capture benchmark justifies making it the default.
+    pub relocalize: bool,
+    /// Downsample size for the re-localisation clouds, in metres.
+    pub relocalize_voxel: f32,
+    /// Normal-estimation radius for the re-localisation clouds, in metres.
+    pub relocalize_normal_radius: f32,
+    /// Correspondence radius for the spatial search, in metres. This is the
+    /// wide search the projective ladder cannot use without matching the wrong
+    /// surface through a pixel.
+    pub relocalize_radius: f32,
+    /// Minimum inlier ratio for a spatial re-localisation.
+    pub relocalize_min_inlier_ratio: f32,
+    /// Maximum RMS point-to-plane residual for a spatial re-localisation.
+    pub relocalize_max_rmse: f32,
+    /// Absolute sanity bound on a re-localisation translation, in metres.
+    pub relocalize_max_translation: f32,
+    /// Absolute sanity bound on a re-localisation rotation, in radians.
+    pub relocalize_max_rotation: f32,
+
+    /// A frame with at least this inlier ratio and at most `max_rmse` may be
+    /// accepted even when its motion exceeds the ordinary per-frame limits.
+    /// The fit, not the motion model, is what says the pose is known.
+    pub fast_motion_inlier_ratio: f32,
+    /// Absolute bound on a fast-motion translation, in metres.
+    pub fast_motion_max_translation: f32,
+    /// Absolute bound on a fast-motion rotation, in radians.
+    pub fast_motion_max_rotation: f32,
 }
 
 impl Default for OdometryConfig {
@@ -105,6 +141,17 @@ impl Default for OdometryConfig {
             max_translation: 0.20,
             max_rotation: 0.35,
             frame_to_model: false,
+            relocalize: false,
+            relocalize_voxel: 0.04,
+            relocalize_normal_radius: 0.12,
+            relocalize_radius: 0.25,
+            relocalize_min_inlier_ratio: 0.55,
+            relocalize_max_rmse: 0.025,
+            relocalize_max_translation: 1.0,
+            relocalize_max_rotation: 1.2,
+            fast_motion_inlier_ratio: 0.80,
+            fast_motion_max_translation: 0.50,
+            fast_motion_max_rotation: 1.0,
         }
     }
 }
@@ -139,6 +186,51 @@ pub struct TrackReport {
     /// keep; reported because a scan that is only recovering should look like
     /// one rather than like a scan that is tracking.
     pub recovered: usize,
+    /// True when a spatial search accepted a frame the projective tracker
+    /// would have rejected.
+    pub relocalized: bool,
+}
+
+/// The last accepted frame, kept as the target for spatial re-localisation.
+///
+/// The cloud is built lazily: a scan that tracks cleanly never pays for it.
+struct TrustedFrame {
+    width: usize,
+    height: usize,
+    depth: Vec<f32>,
+    pose: Isometry3<f32>,
+    cloud: Option<IcpCloud>,
+}
+
+impl TrustedFrame {
+    fn new(width: usize, height: usize, depth: &[f32], pose: Isometry3<f32>) -> Self {
+        Self {
+            width,
+            height,
+            depth: depth.to_vec(),
+            pose,
+            cloud: None,
+        }
+    }
+}
+
+/// A spatial re-localisation that passed the strict gates.
+struct Relocalized {
+    pose: Isometry3<f32>,
+    motion: Isometry3<f32>,
+    inlier_ratio: f32,
+    rmse: f32,
+    iterations: usize,
+    recovered: usize,
+}
+
+/// Scale a motion by `1 / steps`, using the small-angle approximation for the
+/// rotation. After a multi-frame recovery this gives the next frame a sensible
+/// constant-velocity guess instead of predicting the whole gap again.
+fn average_motion(motion: Isometry3<f32>, steps: f32) -> Isometry3<f32> {
+    let translation = motion.translation.vector / steps;
+    let rotation = UnitQuaternion::from_scaled_axis(motion.rotation.scaled_axis() / steps);
+    Isometry3::from_parts(Translation3::from(translation), rotation)
 }
 
 /// Depth odometry, aligned either frame to frame or frame to model.
@@ -160,6 +252,9 @@ pub struct Odometry {
     /// the next alignment without rebuilding anything. Also the fallback target
     /// whenever the model cannot be rendered.
     previous: Option<DepthPyramid>,
+    /// The last accepted frame, kept for spatial re-localisation. Its cloud is
+    /// built lazily, so a clean scan never pays for it.
+    trusted: Option<TrustedFrame>,
     /// Whether a frame has defined the world frame yet. Distinct from
     /// `previous` being set, which survives a frame that was too sparse to use.
     started: bool,
@@ -198,6 +293,7 @@ impl Odometry {
             intrinsics,
             config,
             previous: None,
+            trusted: None,
             started: false,
             guess: Isometry3::identity(),
             pose: Isometry3::identity(),
@@ -248,6 +344,132 @@ impl Odometry {
         ))
     }
 
+    /// Try to recover a frame the projective tracker rejected by aligning its
+    /// cloud to the last accepted frame's cloud with a spatial search.
+    ///
+    /// When the rejected frame is the first view of a surface the last frame
+    /// never saw, there is no overlap to find and the strict gates reject every
+    /// candidate. That is the honest outcome: this path is opt-in and does not
+    /// invent a pose without a fit.
+    ///
+    /// The correspondence radius is deliberately wider than the projective
+    /// ladder's, because it is a nearest-neighbour search rather than a pixel
+    /// lookup. That also makes it easier to match the wrong surface, hence the
+    /// strict inlier and residual gates: the motion model is not what decides
+    /// whether to trust this, the fit is.
+    fn try_relocalize(
+        &mut self,
+        depth: &DepthImage<'_>,
+        candidate: Isometry3<f32>,
+        projective_iterations: usize,
+    ) -> Option<Relocalized> {
+        if !self.config.relocalize {
+            return None;
+        }
+        let debug = std::env::var_os("SCAN_DEBUG_RELOCALIZE").is_some();
+
+        let voxel = self.config.relocalize_voxel;
+        let normal_radius = self.config.relocalize_normal_radius;
+        let radius = self.config.relocalize_radius;
+        let intrinsics = self.intrinsics;
+        let origin = Vector3::zeros();
+
+        let current_points = depth.to_points(&intrinsics);
+        let current_cloud = IcpCloud::build(&current_points, voxel, normal_radius, radius, &origin);
+        if current_cloud.len() < self.config.min_points / 4 {
+            return None;
+        }
+
+        let params = IcpParams {
+            max_correspondence_distance: radius,
+            huber_delta: self.config.huber_delta,
+            max_iterations: self.config.max_iterations.max(30),
+            ..IcpParams::default()
+        };
+
+        // The last accepted frame's cloud is smaller and
+        // cheaper, but it only covers the view the sensor has just left.
+        let (result, trusted_pose, target_len, initial) = {
+            let trusted = self.trusted.as_mut()?;
+            if trusted.cloud.is_none() {
+                let points = DepthImage::new(trusted.width, trusted.height, &trusted.depth)
+                    .to_points(&intrinsics);
+                trusted.cloud = Some(IcpCloud::build(
+                    &points,
+                    voxel,
+                    normal_radius,
+                    radius,
+                    &origin,
+                ));
+            }
+
+            let target = trusted.cloud.as_ref()?;
+            let initial = trusted.pose.inverse() * candidate;
+            (
+                align(&current_cloud, target, initial, &params),
+                trusted.pose,
+                target.len(),
+                initial,
+            )
+        };
+
+        if debug {
+            eprintln!(
+                "[relocalize] frame source {} target {} init_move {:.3} init_rot {:.3} corr {} ({:.3}) rmse {:.4} move {:.3} rot {:.3} iters {} converged {}",
+                current_cloud.len(),
+                target_len,
+                initial.translation.vector.norm(),
+                initial.rotation.angle(),
+                result.correspondences,
+                result.inlier_ratio,
+                result.rmse,
+                result.transform.translation.vector.norm(),
+                result.transform.rotation.angle(),
+                result.iterations,
+                result.converged,
+            );
+        }
+
+        let pose = trusted_pose * result.transform;
+        let motion = trusted_pose.inverse() * pose;
+        self.accept_relocalized(result, pose, motion, projective_iterations)
+    }
+
+    /// Apply the strict spatial gates. The absolute motion caps are only a
+    /// sanity bound; the inlier ratio and residual are what decide.
+    fn accept_relocalized(
+        &self,
+        result: IcpResult,
+        pose: Isometry3<f32>,
+        motion: Isometry3<f32>,
+        projective_iterations: usize,
+    ) -> Option<Relocalized> {
+        if result.correspondences < self.config.min_points / 4 {
+            return None;
+        }
+        if result.inlier_ratio < self.config.relocalize_min_inlier_ratio {
+            return None;
+        }
+        if result.rmse > self.config.relocalize_max_rmse {
+            return None;
+        }
+        if motion.translation.vector.norm() > self.config.relocalize_max_translation {
+            return None;
+        }
+        if motion.rotation.angle() > self.config.relocalize_max_rotation {
+            return None;
+        }
+
+        Some(Relocalized {
+            pose,
+            motion,
+            inlier_ratio: result.inlier_ratio,
+            rmse: result.rmse,
+            iterations: projective_iterations + result.iterations,
+            recovered: self.gap,
+        })
+    }
+
     /// Track a depth frame, against the model when one is supplied and the mode
     /// is on, and against the previous frame otherwise.
     pub fn track(&mut self, depth: &DepthImage<'_>, model: Option<&TsdfVolume>) -> TrackReport {
@@ -263,12 +485,19 @@ impl Odometry {
                 iterations: 0,
                 translation: 0.0,
                 recovered: 0,
+                relocalized: false,
             };
         }
 
         if !self.started {
             self.started = true;
             self.previous = Some(current);
+            self.trusted = Some(TrustedFrame::new(
+                depth.width,
+                depth.height,
+                depth.depth,
+                self.pose,
+            ));
             self.search = self.pose;
             return TrackReport {
                 pose: self.pose,
@@ -279,6 +508,7 @@ impl Odometry {
                 iterations: 0,
                 translation: 0.0,
                 recovered: 0,
+                relocalized: false,
             };
         }
 
@@ -393,6 +623,20 @@ impl Odometry {
             Some("too few inliers")
         } else if rmse > self.config.max_rmse {
             Some("residual too large")
+        } else if self.gap == 0 && inlier_ratio >= self.config.fast_motion_inlier_ratio {
+            // The fit itself is confident. Do not let the motion model veto a
+            // fast pan or sidestep; only an absolute sanity bound applies.
+            // This is safe only when the reference pose is trusted. After a
+            // rejection the candidate is anchored at a stale pose, and a good
+            // fit to the rejected frame says nothing about where the pair sits
+            // in the world.
+            if jump.translation.vector.norm() > self.config.fast_motion_max_translation {
+                Some("fast motion went too far")
+            } else if jump.rotation.angle() > self.config.fast_motion_max_rotation {
+                Some("fast motion turned too far")
+            } else {
+                None
+            }
         } else if translation > self.config.max_translation {
             Some("implausible translation")
         } else if rotation > self.config.max_rotation {
@@ -406,6 +650,38 @@ impl Odometry {
         };
 
         if let Some(reason) = rejection {
+            // Before giving up, try the search the projective tracker cannot
+            // make: a spatial ICP against the last accepted frame. The
+            // projective candidate, even when it
+            // failed a gate, is a better starting pose than the motion model
+            // because it already used this frame's geometry.
+            if let Some(relocalized) = self.try_relocalize(depth, candidate, iterations) {
+                let steps = (relocalized.recovered + 1) as f32;
+                self.gap = 0;
+                self.pose = relocalized.pose;
+                self.search = relocalized.pose;
+                self.previous = Some(current);
+                self.trusted = Some(TrustedFrame::new(
+                    depth.width,
+                    depth.height,
+                    depth.depth,
+                    relocalized.pose,
+                ));
+                self.guess = average_motion(relocalized.motion, steps);
+
+                return TrackReport {
+                    pose: self.pose,
+                    accepted: true,
+                    rejection: None,
+                    inlier_ratio: relocalized.inlier_ratio,
+                    rmse: relocalized.rmse,
+                    iterations: relocalized.iterations,
+                    translation: relocalized.motion.translation.vector.norm(),
+                    recovered: relocalized.recovered,
+                    relocalized: true,
+                };
+            }
+
             // The *committed* pose does not move: the recovered motion is not
             // trustworthy, so recording a gap is more honest than inventing a
             // pose. The frame is simply not fused.
@@ -435,6 +711,7 @@ impl Odometry {
                 iterations,
                 translation,
                 recovered: 0,
+                relocalized: false,
             };
         }
 
@@ -447,6 +724,12 @@ impl Odometry {
         self.search = candidate;
         self.guess = motion;
         self.previous = Some(current);
+        self.trusted = Some(TrustedFrame::new(
+            depth.width,
+            depth.height,
+            depth.depth,
+            self.pose,
+        ));
 
         TrackReport {
             pose: self.pose,
@@ -457,6 +740,7 @@ impl Odometry {
             iterations,
             translation,
             recovered,
+            relocalized: false,
         }
     }
 }
@@ -626,6 +910,37 @@ mod tests {
         );
         assert!(pose.translation.vector.y.abs() < 0.02);
         assert!(pose.translation.vector.z.abs() < 0.03);
+    }
+
+    #[test]
+    fn spatial_icp_aligns_a_small_pair_of_room_views() {
+        let intrinsics = intrinsics();
+        let first = render_room(Vector3::zeros());
+        let second = render_room(Vector3::new(0.05, 0.0, 0.0));
+        let first_points = DepthImage::new(WIDTH, HEIGHT, &first).to_points(&intrinsics);
+        let second_points = DepthImage::new(WIDTH, HEIGHT, &second).to_points(&intrinsics);
+        let origin = Vector3::zeros();
+        let target = IcpCloud::build(&first_points, 0.04, 0.12, 0.25, &origin);
+        let source = IcpCloud::build(&second_points, 0.04, 0.12, 0.25, &origin);
+
+        let result = align(
+            &source,
+            &target,
+            Isometry3::identity(),
+            &IcpParams {
+                max_correspondence_distance: 0.25,
+                max_iterations: 30,
+                ..IcpParams::default()
+            },
+        );
+
+        assert!(result.inlier_ratio > 0.5, "{}", result.inlier_ratio);
+        assert!(result.rmse < 0.01, "rmse {}", result.rmse);
+        assert!(
+            (result.transform.translation.vector.x - 0.05).abs() < 0.01,
+            "recovered {:?}",
+            result.transform.translation.vector
+        );
     }
 
     #[test]

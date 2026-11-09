@@ -95,13 +95,13 @@ reduce drift — see §5, M2.
 - **`cargo test --workspace` does not build on this machine** (`turbojpeg-sys`
   wants NASM, pulled in by `kinect-one`'s default features). Pre-existing and
   unrelated; use `-p geom -p scan`.
-- **`out/room.k2df` defeats both trackers.** Run through `scan replay`, both
-  modes lock out within the first 25 frames and never recover: frame-to-model
-  first rejects at frame 19, frame-to-frame at frame 22, and the pose then sits
-  frozen for the rest of the capture (97 of 150 frames rejected). Whatever
-  happens around frame 19–22 is a hard tracking failure, not drift. See §5,
-  M2.1 — this is now the first thing to fix, because no drift comparison means
-  anything on a capture that loses tracking.
+- **`out/room.k2df` still defeats the tracker around frame 22.** The default
+  frame-to-frame path now fuses 77 of 150 frames (73 rejected) after the
+  bounded-gap recovery, but the failures are first views of surfaces the last
+  frame never saw. The spatial search (`--relocalize`) recovers none of them:
+  there is no overlap to align to (see §5, M2.1). The next fix is a submap
+  boundary (M2.1b), not a wider search. No drift comparison means anything on a
+  capture that loses tracking.
 
 ### The window's role
 
@@ -225,11 +225,13 @@ Ordered by what unblocks the most. Each milestone has a definition of done that
 is a measurement, not a feeling.
 
 **Three tracks, because they need different things.** M1 needs the Kinect and a
-built Brush. **M0 and M2.1 do not**, and M2.1 is the highest-value work available
-right now: the current recording loses tracking at frame ~20, which makes every
-pose statement from it unreliable. If the sensor is not on the desk, start at
-M0 (if the window is the goal) or M2.1 (if the poses are). M1.5 needs a trainer
-that already opens the dataset, so it comes after M1; M1.6 needs a trained
+built Brush. **M0 and M2.1b do not**, and M2.1b is the highest-value work
+available right now: the current recording loses tracking at frame ~22, which
+makes every pose statement from it unreliable. The spatial search (M2.1) is
+measured and does not recover it; the next fix is a submap boundary. If the
+sensor is not on the desk, start at M0 (if the window is the goal) or M2.1b (if
+the poses are). M1.5 needs a trainer that already opens the dataset, so it comes
+after M1; M1.6 needs a trained
 result, so it comes after M1.5.
 
 ### M0 — Finish the dataset side of the window (done, except the folder picker)
@@ -334,16 +336,12 @@ Two separate problems are visible in that table and they need different fixes,
 and **the first one dominates**: on this capture both trackers lose the plot
 early, so the table's endpoint distances are not measuring drift at all.
 
-**M2.1 — Stop losing tracking. This is the first priority.** `scan replay` on
-`out/room.k2df` shows both modes healthy for about eighteen frames (inlier
-ratios 75–92%) and then collapsing:
-
-| | Frame-to-frame | Frame-to-model |
-| --- | --- | --- |
-| First rejection | frame 22 (19.9% inliers) | frame 19 (35.9% inliers) |
-| Then | 78.7% but "implausible rotation", then 3.2%, 201 cm of motion | 28.6%, 25.2%, never recovers |
-| Total rejected | 97 of 150 | 9 and climbing, then locked out |
-| Pose after | frozen at [0.517 0.134 0.104] | frozen at [0.361 0.077 0.136] |
+**M2.1 — Stop losing tracking. This is the first priority.** The bounded-gap
+recovery below is in; `scan replay` on `out/room.k2df` now reports **77 fused /
+73 skipped** and ends 2.822 m from origin. The first failure is frame 22 (17.7%
+inliers); frame 23 then matches frame 22 at 88.0% but is rejected as an
+"implausible rotation" because its absolute pose is still anchored at the last
+trusted frame. The rejection map for the capture is:
 
 **What frames 1–22 are not:** they are not a fast pan, and not junk depth. The
 depth decoder clips every frame at 4.50 m, and no frame in the capture has a
@@ -365,38 +363,69 @@ frames 101-150:  .X..XX.XX....XX.X......XXXXXXXXXX.X.XXXXXXXXXX.XXX
 *and* the committed pose stood still, which is right — the motion was not
 trusted — but nothing could then make up the difference: `pose * transform` adds
 a single inter-frame step per *accepted* frame, so falling one frame behind was
-permanent. The arithmetic confirms it: 53 accepted frames at roughly 2.4 cm each
-predicts 1.259 m of path, which is exactly what the run reported. A separate
-search origin now advances by the motion model even when the committed pose does
-not, with the extrapolation capped at two frames and a recovery bounded to a jump
-that allowance justifies. On this capture: **57 fused frames instead of 53, path
-1.894 m → 3.065 m, largest single step 40 cm** (198 cm without the bound).
+permanent. A separate search origin now advances by the motion model even when
+the committed pose does not, with the extrapolation capped at two frames and a
+recovery bounded to a jump that allowance justifies. That removed the permanent
+one-frame offset: the capture now fuses **77 of 150** frames (not 53) and ends
+2.822 m from origin. It does not make the failing frames track.
 
-**Still open, and it is the main problem.** 93 of 150 frames are still rejected.
-The recovery is bounded and helps at the margin; it does not make the failing
-frames track. What follows from the evidence above:
+**Still open, and it is the main problem.** 73 of 150 frames are still rejected.
+The bounded recovery stops one rejection from becoming permanent; it does not
+make the failing frames track. An earlier attempt at an eighth-resolution 0.40 m
+pyramid level was *much worse* (19 fused frames): a radius that wide lets the
+coarse level match the wrong surface and the finer levels refine a wrong answer.
+The ladder in `Level::handheld_default` is at the point where widening it costs
+more than it buys, so the next attempt used a separate spatial search instead.
 
-1. **The failure is not "no correspondence within the radius".** That was the
-   obvious reading of inlier ratios near 3%, and the obvious fix — an
-   eighth-resolution pyramid level at 0.40 m — is *much worse*: 19 fused frames
-   instead of 57. A radius that wide lets the coarse level match the wrong
-   surface outright and the finer levels then refine a wrong answer. The ladder
-   in `Level::handheld_default` is at the point where widening it costs more
-   than it buys, and that is now recorded there so nobody retries it.
-2. **So the frames are either genuinely far apart in viewpoint, or the scene is
-   hard to match** (repetitive structure, or largely planar). Distinguishing
-   those needs a capture with slower motion: if every frame matches at 5 cm/frame
-   and none do at 15 cm/frame, it is motion. **This capture cannot answer it.**
-3. **The real fix is a search, not a guess.** Projective association cannot look
-   for a surface that has left the frame; `geom::icp::align` with a `VoxelCloud`
-   can, and its module comment already says it exists for "aligning keyframes
-   that are far apart". Re-localising a lost frame against the last trusted cloud
-   with a wide *spatial* search, gated by a strict inlier requirement rather than
-   by the motion model, is the principled version of what the bounded
-   extrapolation only approximates.
-4. **Get a capture with a ground truth.** A deliberate slow walk out and back is
-   the single most valuable piece of test data this project could have, and every
-   pose number in this document is currently unfalsifiable without it.
+**M2.1 search — measured, and it does not recover this capture.** Implemented as
+`scan replay --relocalize` (off by default): on rejection, build a voxel-hashed
+cloud of the last accepted frame (4 cm voxels, 12 cm normals), run
+`geom::icp::align` with a 25 cm correspondence radius and up to 30 iterations,
+and accept only at ≥55% inliers, ≤25 mm RMSE, and absolute translation/rotation
+caps. Results on `out/room.k2df`:
+
+| | default | `--relocalize` |
+| --- | --- | --- |
+| fused / skipped | 77 / 73 | 77 / 73 |
+| accepted relocalisations | — | 0 |
+| tracking | 136 ms/frame | 651 ms/frame |
+| final position | 2.822 m | 2.822 m |
+
+The debug trace explains why. On the transition frames the spatial search finds
+48–98% correspondences inside 25 cm, but the RMS point-to-plane residual is
+10–13 cm and the solve does not converge. Widening the radius to 50 cm raises the
+inlier ratios to about 95% and the residual to 13–19 cm; still no convergence.
+The strict gates refuse every candidate, which is the right outcome: the rejected
+frame is the first view of a surface the last accepted frame never saw, so there
+is no overlapping surface to align to. This capture falsifies the "wider search"
+hypothesis: the failures are missing overlap, not a narrow projective window.
+`spatial_icp_aligns_a_small_pair_of_room_views` covers the cloud pipeline, so a
+failure here is a data problem, not a broken search.
+
+**What the next frame proves — and why it is not enough.** Frame 23 matches frame
+22 at 88% / 15 mm, and later pairs do the same. That is a good *relative*
+measurement, but it does not anchor the pair in the world: the fit says where the
+pair sits relative to itself, not where it sits relative to the trusted
+trajectory. A deferred-fusion experiment that fused the rejected frame at
+`pose(next) * motion^-1` raised the fused count from 77 to 108, but the pose
+inherited the stale search origin, so the geometry would have been placed by a
+guess with a good-looking residual. It was removed. For the same reason the
+fast-motion acceptance is restricted to `gap == 0`, where the reference pose is
+trusted; `--relocalize` is kept as an opt-in diagnostic.
+
+**M2.1b — Start a new submap when there is no overlap.** The honest fix for this
+capture is not a pose; it is a submap boundary. When re-localisation against the
+last trusted cloud fails, keep the new view as a second submap with its own local
+origin, continue tracking and fusing inside it, and merge the submaps later
+through loop closure when a genuine revisit appears. The scanner currently has
+one world frame and one TSDF; a submap needs a second volume (or a transform to
+the first) and a keyframe map. Done when `out/room.k2df` accounts for every
+frame in some submap (none silently dropped) and the recorded/synthetic
+regression tests still pass.
+
+**Still needed: a capture with ground truth.** A deliberate slow walk out and
+back is the single most valuable piece of test data this project could have; every
+pose number in this document is currently unfalsifiable without it.
 
 **M2.2 — Then drift.** Frame-to-model is implemented but **not yet shown to
 help, and on this recording it does worse** — it locks out three frames earlier

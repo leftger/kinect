@@ -115,6 +115,12 @@ struct Options {
     /// where wall clock does not matter and the poses it produces are the ones
     /// a scan is ultimately graded on.
     frame_to_model: bool,
+    /// When the projective tracker rejects a frame, retry it as a spatial ICP
+    /// against the last accepted frame's cloud. The wide search can recover
+    /// motion that has left the previous view; strict inlier and residual
+    /// gates decide whether to trust it. Costs a cloud build on rejected
+    /// frames only, so a clean scan pays nothing.
+    relocalize: bool,
     /// Export a Nerfstudio dataset for a Gaussian-splatting trainer: the colour
     /// views, their masks, `transforms.json`, and an initial point cloud.
     /// Needs `--color`, because the dataset is built from the colour views.
@@ -143,6 +149,7 @@ impl Default for Options {
             playback_fps: 10.0,
             unmirror: true,
             frame_to_model: false,
+            relocalize: false,
             dataset: None,
         }
     }
@@ -254,6 +261,7 @@ fn parse_args(
             "--mirror" => options.unmirror = false,
             "--no-mirror" | "--unmirror" => options.unmirror = true,
             "--frame-to-model" => options.frame_to_model = true,
+            "--relocalize" => options.relocalize = true,
             "--dataset" => {
                 options.dataset = Some(PathBuf::from(next_value(&mut args, "--dataset")?))
             }
@@ -433,6 +441,12 @@ fn usage_text() -> String {
          \x20               default and most useful with `replay`, where wall clock\n\
          \x20               does not matter and the poses are what the scan is graded\n\
          \x20               on.\n\
+         \x20 --relocalize  When the projective tracker rejects a frame, retry it\n\
+         \x20               as a spatial ICP against the last accepted frame's\n\
+         \x20               cloud. The wider search can recover motion that left\n\
+         \x20               the previous view; strict inlier and residual gates\n\
+         \x20               decide whether to trust it. Pays a cloud build on\n\
+         \x20               rejected frames only, so a clean scan is unaffected.\n\
          \x20 --mirror      Keep the raw sensor mirror orientation instead of flipping\n\
          \x20               X to match real-world coordinates (un-mirrored by default).\n\
          \x20               A dataset is always written in the sensor frame, so this\n\
@@ -765,6 +779,7 @@ fn scanner_config(options: &Options) -> ScannerConfig {
         loop_closure: options.loop_closure.then(LoopClosureConfig::default),
         odometry: OdometryConfig {
             frame_to_model: options.frame_to_model,
+            relocalize: options.relocalize,
             ..OdometryConfig::default()
         },
         coloring: ColoringParams {
@@ -879,13 +894,18 @@ fn print_progress(index: usize, report: &FrameReport) {
         0 => String::new(),
         gap => format!("  RECOVERED a {gap}-frame gap"),
     };
+    let relocalized = if report.track.relocalized {
+        "  RELOCALIZED"
+    } else {
+        ""
+    };
 
     // `move` is the recovered sensor motion for this frame and `iters` the total
     // ICP iterations spent on it: together they are the quickest way to spot a
     // jump that the acceptance gates should have caught, or a solve that is
     // burning its whole budget without settling.
     println!(
-        "[scan] {:>4}  pts {:>6}  inliers {:>5.1}%  rmse {:>5.1} mm  move {:>5.1} cm  iters {:>3}  pos [{:>6.3} {:>6.3} {:>6.3}]  {outcome}{recovered}",
+        "[scan] {:>4}  pts {:>6}  inliers {:>5.1}%  rmse {:>5.1} mm  move {:>5.1} cm  iters {:>3}  pos [{:>6.3} {:>6.3} {:>6.3}]  {outcome}{recovered}{relocalized}",
         index,
         report.points,
         report.track.inlier_ratio * 100.0,
@@ -1251,6 +1271,19 @@ mod tests {
         let (command, options) = parse_args(words(&["replay", "--in", "capture.k2df", "--dataset", "out/d"])).expect("parse");
         assert!(matches!(command, Command::Replay));
         assert_eq!(options.dataset, Some(PathBuf::from("out/d")));
+    }
+
+    #[test]
+    fn relocalize_is_opt_in_and_reaches_the_scanner_config() {
+        let (_, options) =
+            parse_args(words(&["replay", "--in", "capture.k2df"])).expect("parse");
+        assert!(!options.relocalize);
+
+        let (_, options) =
+            parse_args(words(&["replay", "--in", "capture.k2df", "--relocalize"]))
+                .expect("parse");
+        assert!(options.relocalize);
+        assert!(scanner_config(&options).odometry.relocalize);
     }
 
     #[test]

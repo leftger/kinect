@@ -127,7 +127,7 @@ scan live   [--frames N] [--out mesh.ply] [--voxel M] [--no-filter] [--color]
             [--gpu] [--loop-closure] [--viewer] [--dataset DIR]
 scan record  --out capture.k2df [--frames N] [--no-filter] [--drain-color] [--gpu] [--color]
 scan replay  --in capture.k2df [--out mesh.ply] [--voxel M] [--frames N] [--loop-closure]
-            [--dataset DIR]
+            [--relocalize] [--dataset DIR]
 ```
 
 - `gui` opens the scanner window. Pick a live sensor, Record, a recording, or
@@ -146,6 +146,12 @@ scan replay  --in capture.k2df [--out mesh.ply] [--voxel M] [--frames N] [--loop
 - `replay` reconstructs from a recording and needs no sensor. If the recording
   carries colour, the mesh is painted from it and `--dataset DIR` can write a
   dataset. A depth-only recording cannot.
+- `--relocalize` is an experimental spatial search for rejected frames. It
+  aligns the frame's voxel cloud to the last accepted frame's cloud and accepts
+  only a strict fit (≥55% inliers, ≤25 mm RMSE). On `out/room.k2df` it recovers
+  0 of the 73 rejected frames — they are first views of surfaces the last frame
+  never saw — and costs about 4.8x the tracking time. Off by default; see
+  `GAUSSIAN_SPLATTING.md` §5, M2.1 for the measurements.
 
 Useful options:
 
@@ -509,11 +515,11 @@ platform/linux      udev rule
 cargo test -p geom -p scan --features gui
 ```
 
-196 tests. The geometry is tested against synthetic scenes and known transforms
+197 tests. The geometry is tested against synthetic scenes and known transforms
 rather than against recorded data, so the suite runs without a sensor. The
 window's tests are headless too: they exercise the session worker, a synthetic
 scan and its export, and the software renderer without opening a window. Without
-`--features gui` the suite is 179 tests.
+`--features gui` the suite is 180 tests.
 
 Two tests need hardware and are ignored by default:
 
