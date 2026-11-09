@@ -7,12 +7,14 @@ This is a plan, not a summary. It records what is verified, what is not, the
 things that silently break, and the order to do the rest in. Numbers in it were
 measured on this machine unless marked otherwise.
 
-> **Status after the scanner window.** `scan gui` now owns the capture and the
-> dataset hand-off. The window can scan a live sensor (optionally writing a
-> `.k2df` as it reconstructs), replay a colour recording, or run the synthetic
-> room, and it can write the dataset on Export. It does not launch a trainer or
-> render splats. This document marks that boundary explicitly: what already
-> lives in the window, and what the window should own next.
+> **Status after the scanner window and Splats panel.** `scan gui` now owns the
+> capture, the dataset hand-off, and the trainer job. The window can scan a live
+> sensor (optionally writing a `.k2df` as it reconstructs), replay a colour
+> recording, or run the synthetic room; it writes the dataset on Export, then
+> launches a configured Brush command as a child process, streams its log, and
+> cancels it. It still does not render the trained splats. This document marks
+> that boundary explicitly: what already lives in the window, and what should
+> come next.
 
 ---
 
@@ -61,8 +63,10 @@ live-only workflow; the old M2.4 is done.
 
 **Scanner window** (`crates/scan/src/gui/`). `scan gui` and `live --viewer`
 open the same window: live/record/replay/synthetic sources, start/pause/stop/
-reset/export, a navigable TSDF preview, the dataset field, and a dataset result
-card after Export. It does not train a model or render splats.
+reset/export, a navigable TSDF preview, the dataset field, a dataset result
+card after Export, and a Splats panel that launches a configured Brush child
+process. It does not render splats. `Scanner::quality` marks unmerged submaps
+or heavy frame loss as not trainable before the panel starts a trainer.
 
 **`TsdfVolume::raycast`** (`crates/geom/src/tsdf.rs`). Renders the fused surface
 as a depth image, which is what any frame-to-model work needs.
@@ -86,9 +90,9 @@ reduce drift — see §5, M2.
   has no dataset to write. `live --color`, `record --color` and the synthetic
   room do. The window checks live and Record at Start and rejects a depth-only
   replay before it starts.
-- **The window stops at the dataset boundary.** It does not start Brush, monitor
-  a training job, or load the trained `.ply`. That last mile is still a terminal
-  command; see §5, M1.5.
+- **The window launches the trainer but does not render splats.** The Splats
+  panel runs a child process and reports the exported `.ply`; loading that file
+  into the viewport is still M1.6.
 - **The paths are still text fields.** The dataset and recording paths are
   preflighted at Start, but there is no native folder picker yet; that is the
   one M0 item left.
@@ -99,22 +103,23 @@ reduce drift — see §5, M2.
   frame-to-frame path fuses 77 of 150 frames, and the failures are first views of
   surfaces the last frame never saw. The spatial search (`--relocalize`) recovers
   none of them: there is no overlap to align to (see §5, M2.1). Submaps now keep
-  those views (150/150 fused across 19 fragments), but no revisit is verified on
-  this capture, so the fragments stay at guessed origins. A merge needs a
-  capture with a genuine loop. No drift comparison means anything on a capture
-  that loses tracking.
+  those views (150/150 fused across 19 fragments). A synthetic front-side-return
+  test verifies a cross-submap loop edge and a 0.20 m rebuild correction; this
+  capture has no verified revisit, so its fragments stay at guessed origins. A
+  real closed-loop capture is still needed. No drift comparison means anything
+  on a capture that loses tracking.
 
 ### The window's role
 
-The window is the scanner's front end, not the trainer's. The boundary is
-deliberate and matches the split in §1:
+The window owns the scanner front end and the trainer job, but not the splat
+renderer. The boundary is deliberate and matches the split in §1:
 
 ```text
 scan gui (live | replay | synthetic)
   -> tracking + fusion + colour views
   -> final poses after loop closure
   -> dataset (transforms.json, images/, masks/, init.ply)
-  -> external trainer (Brush)
+  -> trainer child process (Brush, from the Splats panel)
   -> splat .ply
   -> external viewer, or the window after M1.6
 ```
@@ -211,7 +216,24 @@ harnesses make most of it testable offline:
    This proves the hand-off, not the appearance: the synthetic room is a
    fixture, and its poses are known rather than tracked from a real scene.
 
-What is *not* yet covered: an actual Brush parse of our output. See M1.
+**Brush parse and a short train (synthetic, done).** The headless form of the
+same export is `scan synth`:
+
+```sh
+target/release/scan synth --dataset out/ds-synth --frames 24 --out out/synth.ply
+~/Projects/brush/target/release/brush-cli out/ds-synth \
+    --total-train-iters 100 --export-every 100 \
+    --export-path /tmp/brush-synth --export-name export.ply
+```
+
+Brush loaded all 24 views, ran 100 iterations and wrote a 119 MB PLY with
+504,178 splats and the expected position/scale/rotation/opacity/SH properties.
+The 24-frame synthetic run also crossed a submap boundary at frame 23, so the
+parse covers a dataset with two fragments. This proves the format and trainer
+hand-off; it does not prove that a real capture renders recognisably, because
+the synthetic room is a fixture and its poses are known rather than tracked.
+
+What is *not* yet covered: a real capture through Brush. See M1.
 
 **Beware the synthetic case.** The synthetic trajectory reports an inlier ratio
 of 0.683 for frame-to-model; real captures report 0.76–0.89. The synthetic scene
@@ -225,14 +247,14 @@ scan. Do not tune acceptance thresholds against it.
 Ordered by what unblocks the most. Each milestone has a definition of done that
 is a measurement, not a feeling.
 
-**Three tracks, because they need different things.** M1 needs the Kinect and a
-built Brush. **M0 and M2.1b do not**, and M2.1b is now in: 150/150 frames land in
-19 submaps, but no revisit is verified, so the fragments remain at guessed
-origins. The next pose work is a capture with a genuine loop (to demonstrate the
-merge), then M2.2 drift. If the sensor is not on the desk, start at M0 (if the
-window is the goal) or the submap merge work (if the poses are). M1.5 needs a
-trainer that already opens the dataset, so it comes after M1; M1.6 needs a trained
-result, so it comes after M1.5.
+**Three tracks, because they need different things.** M1's real half needs the
+Kinect; Brush is built and the synthetic half is proven. **M0 and M2.1b do not
+need hardware.** M2.1b is now in: 150/150 frames land in 19 submaps, and a
+synthetic front-side-return test proves the loop edge moves a submap and rebuilds
+one model; a real capture with a genuine loop is still needed for the real-data
+case. The next pose work is that capture, then M2.2 drift. If the sensor is not
+on the desk, the M0 folder picker, M1.5's interactive click-through, and M1.6 are
+the remaining software work; M1.6 needs a trained result.
 
 ### M0 — Finish the dataset side of the window (done, except the folder picker)
 
@@ -262,21 +284,23 @@ is met with the text fields; the folder picker is polish.
 
 ### M1 — Prove the exporter end to end
 
-*Why first:* the dataset format was implemented from reading Brush's source and
-has never been through the real parser. A silent mismatch invalidates everything
-downstream, and it is cheap to rule out.
+*Why first:* a silent format mismatch invalidates everything downstream, and it
+is cheap to rule out. The synthetic parse/train in §4 now clears the format;
+what remains is a real capture.
 
-1. Plug in the Kinect and take a short colour scan, either from the CLI:
+1. **Synthetic format proof — done.** `scan synth` wrote a 24-view colour
+   dataset, and the installed `brush-cli` loaded it, trained 100 iterations and
+   exported a 504,178-splat PLY. The same run crossed a submap boundary, so the
+   parse covers a two-fragment dataset too.
+2. **Real capture.** Plug in the Kinect and take a short colour scan, either
+   from the CLI:
    `scan live --color --dataset out/ds --frames 60 --out out/ds_scan.ply`
    or from the window: **Live** + **Colour** + dataset directory, Start, Export.
-   Without a sensor, the synthetic dry run in §4 exercises the same path.
-2. Build Brush (`rustc 1.97` is installed and clears its 1.88 floor; Vulkan
-   compute works on this GPU — `cargo run --example vk_check` proves it).
-3. Point Brush at `out/ds` and train.
+3. Point Brush at a real `out/ds` and train.
 
-**Done when:** Brush loads the dataset without error and produces a `.ply` of
+**Done when:** a real capture loads without error and produces a `.ply` of
 splats that renders recognisably. Expect it to look *wrong* — poses drift — but
-it must be recognisably the room.
+it must be recognisably the room. The synthetic half is already done.
 
 *Also do:* a 60-frame scan is the right size. Do not spend 300 frames before the
 round trip is proven.
@@ -284,20 +308,30 @@ round trip is proven.
 ### M1.5 — A trainer job in the window
 
 *Why after M1:* the window should not orchestrate a trainer until the dataset
-has passed through Brush once. Otherwise a GUI bug and a format bug look
-identical.
+has passed through Brush once. The synthetic Brush run in §4 clears the format;
+the panel can now assume a readable dataset.
 
-Add a **Splats** panel:
+**Implemented.** The **Splats** panel in `scan gui` has:
 
-- trainer executable and arguments (default: a configured Brush command),
-- dataset directory (default: the one just exported),
-- output directory for the trained `.ply`,
-- Start / Cancel,
-- a scrolling log and an iteration/loss readout when the trainer prints one.
+- trainer executable (default `brush-cli`), dataset directory, output
+  directory, and iteration count;
+- Start / Cancel, status, elapsed time, and a scrolling log;
+- Brush-shaped arguments (`<dataset> --total-train-iters N --export-every N
+  --export-path DIR --export-name export.ply`);
+- the dataset directory auto-filled from the last export, with a **use last
+  export** button;
+- an exported dataset with quality warnings is marked *not trainable* and
+  Start requires **Train anyway**.
 
-Run the trainer as a child process on a worker thread, not the UI thread. The
-existing session-worker pattern already gives the shape: a command channel, a
-shared snapshot for status, and a bounded join on close.
+`gui/trainer.rs` runs the child on its own thread, merges stdout and stderr
+into a bounded 240-line log, kills the child on Cancel, and joins it when the
+window closes. Three headless tests cover a missing dataset, a successful run
+that writes the PLY, and cancellation.
+
+**Still open:** the full click-through with the real `brush-cli` (a display and
+a manual start, not a sensor), arbitrary extra trainer arguments, and parsing a
+loss value rather than showing raw lines. The worker covers the process-control
+half; the synthetic Brush run covers the command half.
 
 **Done when:** a dataset exported from the window trains from the window,
 Cancel actually stops the child process, and the output path is reported. The
@@ -438,13 +472,17 @@ The per-frame log prints each boundary with its rejection reason. Finalising a
 submap extracts its surface; that is the 142 ms/frame average submap cost,
 concentrated in roughly a second at each boundary.
 
-The remaining limitation is the merge. Loop closure on this capture verifies no
-revisits, so the 19 fragments stay at their candidate-pose origins and the
+The synthetic test `a_revisit_merges_submaps_at_the_corrected_pose` now
+demonstrates the merge: front views, a side view that forces a boundary, and a
+returned front view 20 cm to the right form three submaps. Loop closure verifies
+the return, the boundary edge is skipped, and the pose graph moves the third
+submap by 0.1995 m and rebuilds one model. That is the plumbing working.
+
+The remaining limitation is real data. Loop closure on `out/room.k2df` verifies
+no revisits, so its 19 fragments stay at their candidate-pose origins and the
 exported mesh is 5.66 M vertices / 10.1 M triangles with an 8.05 x 5.43 x 5.44 m
-extent — a set of locally clean fragments, not a single room. A capture that
-returns somewhere it has already been is needed to demonstrate a cross-submap
-loop edge moving a whole fragment; the pose-graph plumbing is in place, but the
-data is not.
+extent — a set of locally clean fragments, not a single room. A real capture
+that returns somewhere it has already been is still needed.
 
 **Still needed: a capture with ground truth.** A deliberate slow walk out and
 back is the single most valuable piece of test data this project could have; every
@@ -501,12 +539,19 @@ payload with the registered colour, `record --color` writes it, and
 `replay --dataset` exports from it. The window's Record source writes it and its
 Replay source reads it, so the offline loop is closed.
 
-**M2.5 — Stop a bad dataset before the trainer starts.** A dataset with 97
-rejected frames is not a training failure; it is a scan the operator should
-redo. Before M1.5 launches a trainer, show the kept-view count, the
-rejected-frame count and the final distance from the start, and refuse to launch
-on a dataset that is obviously broken unless the operator overrides. This is a
-window check over numbers the scanner already has, not a new quality metric.
+**M2.5 — Stop a bad dataset before the trainer starts (implemented for the
+last export).** A dataset with many rejected frames, or several unmerged
+submaps, is not a training failure; it is a scan the operator should redo.
+`Scanner::quality()` now returns frames, fused, rejected, submaps, loop edges,
+rebuilt/refused, final distance, and a list of warnings. The CLI prints
+`quality: trainable` or `NOT trainable` with each warning; the GUI dataset card
+shows the same; the Splats panel disables a plain Start on a warned dataset and
+requires **Train anyway**.
+
+The remaining gap is an arbitrary dataset path typed into the Splats panel:
+quality is known for the just-exported dataset, not for a directory chosen from
+an earlier run. Re-inspecting an arbitrary dataset needs a small manifest or a
+replay of its `transforms.json`, which is future work.
 
 ### M3 — Lift the resolution ceiling
 

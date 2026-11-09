@@ -123,6 +123,7 @@ pub(crate) struct DatasetSummary {
     pub views: usize,
     pub points: usize,
     pub skipped: usize,
+    pub warnings: Vec<String>,
 }
 
 /// The state the GUI reads every repaint.
@@ -504,6 +505,7 @@ fn export_scanner(scanner: &mut Scanner, options: &Options, shared: &Arc<Mutex<S
     match crate::finish_scan_with_report(scanner, options) {
         Ok(summary) => {
             let written = summary.output.display().to_string();
+            let warnings = summary.quality.warnings.clone();
             let dataset_log = summary.dataset.as_ref().map(|report| {
                 format!(
                     "dataset: {} views, {} initial points in {}",
@@ -522,12 +524,16 @@ fn export_scanner(scanner: &mut Scanner, options: &Options, shared: &Arc<Mutex<S
                 views: report.views,
                 points: report.points,
                 skipped: report.skipped,
+                warnings: warnings.clone(),
             });
             view.finished = Some(Instant::now());
             view.error = None;
             view.log(format!("exported {written}"));
             if let Some(line) = dataset_log {
                 view.log(line);
+            }
+            for warning in &warnings {
+                view.log(format!("dataset warning: {warning}"));
             }
         }
         Err(error) => {

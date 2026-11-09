@@ -21,6 +21,7 @@
 
 mod render;
 mod session;
+mod trainer;
 
 use std::error::Error;
 use std::path::{Path, PathBuf};
@@ -36,6 +37,7 @@ use crate::{Options, DEFAULT_FRAMES};
 
 use render::{Camera, PreviewScene, Renderer};
 use session::{SessionConfig, SessionHandle, SessionSnapshot, Source, Status};
+use trainer::{TrainerConfig, TrainerHandle, TrainerStatus, TrainerView};
 
 /// Which source the controls are set to. The worker gets the resolved [`Source`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -142,6 +144,27 @@ impl UiConfig {
     }
 }
 
+/// The Splats panel's editable state.
+struct TrainerUi {
+    program: String,
+    dataset: String,
+    output: String,
+    iterations: usize,
+    allow_unmerged: bool,
+}
+
+impl Default for TrainerUi {
+    fn default() -> Self {
+        Self {
+            program: "brush-cli".to_string(),
+            dataset: String::new(),
+            output: "out/splat-export".to_string(),
+            iterations: 30_000,
+            allow_unmerged: false,
+        }
+    }
+}
+
 /// Open the scanner window.
 pub(crate) fn run(options: &Options) -> Result<(), Box<dyn Error>> {
     let source = if options.synthetic {
@@ -183,6 +206,9 @@ struct ScannerApp {
     record_path: String,
     session: Option<SessionHandle>,
     snapshot: SessionSnapshot,
+    trainer: Option<TrainerHandle>,
+    trainer_config: TrainerUi,
+    trainer_error: Option<String>,
     scene: Option<Arc<PreviewScene>>,
     scene_id: u64,
     camera: Camera,
@@ -205,6 +231,9 @@ impl ScannerApp {
             record_path: "capture.k2df".to_string(),
             session: None,
             snapshot: SessionSnapshot::default(),
+            trainer: None,
+            trainer_config: TrainerUi::default(),
+            trainer_error: None,
             scene: None,
             scene_id: 0,
             camera: Camera::default(),
@@ -236,6 +265,12 @@ impl ScannerApp {
         if finished {
             if let Some(mut session) = self.session.take() {
                 session.join();
+            }
+        }
+
+        if self.trainer_config.dataset.is_empty() {
+            if let Some(dataset) = &self.snapshot.dataset {
+                self.trainer_config.dataset = dataset.dir.display().to_string();
             }
         }
 
@@ -659,6 +694,191 @@ impl ScannerApp {
         if let Some(error) = &self.form_error {
             ui.colored_label(egui::Color32::LIGHT_RED, error);
         }
+
+        ui.separator();
+        self.splats_panel(ui);
+    }
+
+    fn splats_panel(&mut self, ui: &mut egui::Ui) {
+        let view = self
+            .trainer
+            .as_ref()
+            .map(|trainer| trainer.snapshot())
+            .unwrap_or_default();
+        let last_dataset = self.snapshot.dataset.as_ref().map(|d| d.dir.clone());
+        let selected_dataset = self.trainer_config.dataset.trim().to_string();
+        let warnings = self
+            .snapshot
+            .dataset
+            .as_ref()
+            .filter(|dataset| dataset.dir.display().to_string() == selected_dataset)
+            .map(|dataset| dataset.warnings.clone())
+            .unwrap_or_default();
+
+        ui.heading("Splats");
+        ui.small(
+            "Run Brush on an exported dataset. The trainer is a child process, \
+             separate from the scan worker.",
+        );
+
+        let mut use_last = false;
+        egui::Grid::new("trainer-fields")
+            .num_columns(2)
+            .show(ui, |ui| {
+                ui.label("Trainer");
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.trainer_config.program)
+                        .hint_text("brush-cli"),
+                );
+                ui.end_row();
+
+                ui.label("Dataset");
+                ui.vertical(|ui| {
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.trainer_config.dataset)
+                            .hint_text("out/ds-synth"),
+                    );
+                    if last_dataset.is_some() && ui.small_button("use last export").clicked() {
+                        use_last = true;
+                    }
+                });
+                ui.end_row();
+
+                ui.label("Output");
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.trainer_config.output)
+                        .hint_text("out/splat-export"),
+                );
+                ui.end_row();
+
+                ui.label("Iterations");
+                ui.add(
+                    egui::DragValue::new(&mut self.trainer_config.iterations)
+                        .range(1..=1_000_000)
+                        .speed(100.0),
+                );
+                ui.end_row();
+            });
+
+        if use_last {
+            if let Some(dir) = last_dataset {
+                self.trainer_config.dataset = dir.display().to_string();
+                self.trainer_error = None;
+            }
+        }
+
+        if !warnings.is_empty() {
+            ui.colored_label(
+                egui::Color32::LIGHT_RED,
+                "This exported dataset is not trainable:",
+            );
+            for warning in &warnings {
+                ui.colored_label(
+                    egui::Color32::from_rgb(240, 200, 90),
+                    format!("  {warning}"),
+                );
+            }
+            ui.checkbox(
+                &mut self.trainer_config.allow_unmerged,
+                "Train anyway",
+            );
+        }
+
+        let running = view.status.active();
+        let mut start = false;
+        let mut cancel = false;
+        ui.horizontal(|ui| {
+            if running {
+                if ui.button("Cancel").clicked() {
+                    cancel = true;
+                }
+            } else if ui.button("Train").clicked() {
+                start = true;
+            }
+            ui.label(format!("{}: {}", view.status.label(), view.message));
+            if running {
+                if let Some(started) = view.started {
+                    ui.label(format!("{:.1} s", started.elapsed().as_secs_f32()));
+                }
+            }
+        });
+        if let Some(output) = &view.output {
+            ui.monospace(output.display().to_string());
+        }
+        if let Some(error) = &self.trainer_error {
+            ui.colored_label(egui::Color32::LIGHT_RED, error);
+        }
+        if !view.log.is_empty() {
+            egui::ScrollArea::vertical()
+                .max_height(110.0)
+                .show(ui, |ui| {
+                    for line in &view.log {
+                        ui.monospace(line);
+                    }
+                });
+        }
+
+        if cancel {
+            if let Some(trainer) = &self.trainer {
+                trainer.cancel();
+            }
+        }
+        if start {
+            self.start_trainer(&warnings);
+        }
+    }
+
+    fn start_trainer(&mut self, warnings: &[String]) {
+        self.trainer_error = None;
+        if !warnings.is_empty() && !self.trainer_config.allow_unmerged {
+            self.trainer_error = Some(
+                "the exported dataset is not trainable; tick Train anyway to override"
+                    .to_string(),
+            );
+            return;
+        }
+
+        let program = self.trainer_config.program.trim().to_string();
+        let dataset = self.trainer_config.dataset.trim().to_string();
+        let output = self.trainer_config.output.trim().to_string();
+        if program.is_empty() {
+            self.trainer_error = Some("trainer executable is empty".to_string());
+            return;
+        }
+        if dataset.is_empty() {
+            self.trainer_error = Some("choose a dataset directory".to_string());
+            return;
+        }
+        if output.is_empty() {
+            self.trainer_error = Some("choose an output directory".to_string());
+            return;
+        }
+
+        // Brush resolves a relative `--export-path` against the dataset's
+        // parent, which is surprising for a field the operator typed in the
+        // window. Make it absolute so the reported path is where the file lands.
+        let output = PathBuf::from(output);
+        let output = if output.is_absolute() {
+            output
+        } else {
+            std::env::current_dir()
+                .map(|cwd| cwd.join(&output))
+                .unwrap_or(output)
+        };
+
+        let config = TrainerConfig {
+            program,
+            dataset: PathBuf::from(dataset),
+            output,
+            iterations: self.trainer_config.iterations,
+        };
+        match TrainerHandle::start(config) {
+            Ok(handle) => {
+                self.trainer = Some(handle);
+                self.trainer_error = None;
+            }
+            Err(error) => self.trainer_error = Some(error),
+        }
     }
 
     fn viewport(&mut self, ui: &mut egui::Ui) {
@@ -830,6 +1050,15 @@ impl ScannerApp {
                         format!("{} views skipped", dataset.skipped),
                     );
                 }
+                if !dataset.warnings.is_empty() {
+                    ui.colored_label(egui::Color32::LIGHT_RED, "NOT trainable");
+                    for warning in &dataset.warnings {
+                        ui.colored_label(
+                            egui::Color32::from_rgb(240, 200, 90),
+                            format!("warning: {warning}"),
+                        );
+                    }
+                }
             });
         }
 
@@ -939,6 +1168,15 @@ impl eframe::App for ScannerApp {
 
 impl Drop for ScannerApp {
     fn drop(&mut self) {
+        if let Some(mut trainer) = self.trainer.take() {
+            trainer.cancel();
+            if !trainer.join_timeout(Duration::from_secs(5)) {
+                eprintln!(
+                    "scan gui: the trainer did not stop within 5 s; leaving it to process exit"
+                );
+            }
+        }
+
         let Some(mut session) = self.session.take() else {
             return;
         };

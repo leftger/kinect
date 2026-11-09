@@ -27,7 +27,8 @@ gaps. Read this section before the code.
   record a `.k2df` while reconstructing.
 - Gaussian-splatting dataset export (`--dataset DIR`, or the window's output
   field): posed colour views, masks and a coloured `init.ply` for an external
-  trainer. No trainer is bundled; see [GAUSSIAN_SPLATTING.md](GAUSSIAN_SPLATTING.md).
+  trainer. The window's Splats panel can launch a configured Brush command; no
+  trainer is bundled. See [GAUSSIAN_SPLATTING.md](GAUSSIAN_SPLATTING.md).
 
 **Found by profiling, and fixed**
 
@@ -194,8 +195,9 @@ Useful options:
 - `--dataset DIR` also writes a Nerfstudio dataset for a Gaussian-splatting
   trainer: `transforms.json`, posed `images/`, `masks/`, and a coloured
   `init.ply`. It needs colour views, so use `live --color`, or `record --color`
-  and replay. The window preflights the path and reports the result. This repo
-  does not train splats; see [GAUSSIAN_SPLATTING.md](GAUSSIAN_SPLATTING.md).
+  and replay. The window preflights the path and reports the result; its Splats
+  panel can launch a configured trainer, but this repo does not implement one.
+  See [GAUSSIAN_SPLATTING.md](GAUSSIAN_SPLATTING.md).
 - `--viewer` opens the scanner window on the live source and starts immediately.
   It is the same window as `scan gui`; the old picture-only viewer is gone. Needs
   a build with `--features gui` (or the `viewer` alias) and a display. Closing
@@ -225,25 +227,29 @@ scan gui --color --out out/room.obj
 scan gui --color --dataset out/room-ds --out out/room.ply
 ```
 
-The window has four parts:
+The window has five parts:
 
 - **Source**: live sensor, Record (capture while writing a `.k2df`), a `.k2df`
   recording, or the synthetic room. The source and the parameters are locked
   once a scan starts; Reset returns to the picker.
 - **Reconstruction and output**: frames, voxel size, colour and its mode,
   colour-depth tolerance, filters, loop closure, frame-to-model, submaps, GPU
-  decode,
-  mirror, preview interval, playback rate, the output path, and the optional
-  dataset directory. The extension selects the mesh format exactly as it does
-  on the command line.
+  decode, mirror, preview interval, playback rate, the output path, and the
+  optional dataset directory. The extension selects the mesh format exactly as
+  it does on the command line.
 - **3D viewport**: drag to orbit, right-drag (or middle-drag) to pan, scroll to
   zoom, double-click or *Fit view* to frame the model. The surface is extracted
   from the TSDF every `--preview-every` frames, so it refines as the scan
   proceeds. The latest depth frame is drawn as coloured points, the camera path
   as a cyan line, and the current sensor as a yellow frustum.
-- **Telemetry**: frames, fused and rejected counts, position, TSDF size,
-  tracking and fusion time, preview rate, the worker's log, and the exported
-  mesh and dataset summary after Export.
+- **Telemetry**: frames, fused, rejected and submap counts, position, TSDF size,
+  tracking, fusion and submap-finalisation time, preview rate, the worker's log,
+  and the exported mesh and dataset summary after Export.
+- **Splats**: after an export, run Brush on the dataset as a child process.
+  Editable executable, dataset, output directory and iteration count, with
+  Start/Cancel and a streamed log. An exported dataset with unmerged submaps or
+  too many rejected frames is marked *not trainable*; Start then requires
+  **Train anyway**.
 
 *Start* runs the selected source. *Pause* stops consuming frames without
 losing the scanner; *Resume* continues. *Stop* ends the capture but keeps the
@@ -261,8 +267,27 @@ The optional **dataset directory** writes the Gaussian-splatting hand-off:
 Nerfstudio/Brush trainer can start from. It needs colour views, so tick Colour
 on a live or Record source, or replay a recording made with `record --color`.
 Start preflights the path; Export shows the view and initial-point counts in
-the telemetry panel. The window does not run the trainer; see
+the telemetry panel. The Splats panel can then run a configured Brush child
+process; it does not render the trained splats yet. See
 [GAUSSIAN_SPLATTING.md](GAUSSIAN_SPLATTING.md).
+
+**Brush smoke test without a sensor.** The dataset has been through the real
+Brush parser and trainer on this machine:
+
+```sh
+scan synth --dataset out/ds-synth --frames 24 --out out/synth.ply
+brush-cli out/ds-synth --total-train-iters 100 --export-every 100 \
+    --export-path /tmp/brush-synth --export-name export.ply
+```
+
+Brush loaded all 24 views and wrote a 119 MB PLY with 504,178 splats and the
+expected position/scale/rotation/opacity/SH properties. The 24-frame synthetic
+run also crosses a submap boundary at frame 23, so the parse covers a dataset
+with two fragments. This proves the format and trainer hand-off; it does not
+prove that a real room renders recognisably, which still needs a real capture.
+The synthetic fixture is harsher than a handheld scan, so the quality check
+marks this run *not trainable*; that is expected for a format smoke test, not a
+verdict on the exporter.
 
 The preview is rasterised on the CPU into an ordinary egui texture. That keeps
 the window independent of the GPU decoder and testable without a display; at a
@@ -314,7 +339,12 @@ scan live --color --out room.glb
 scan live --color --out room.gltf
 scan record --color --out capture.k2df
 scan replay --in capture.k2df --out mesh.ply
+scan synth --dataset out/ds-synth --frames 24 --out out/synth.ply
 ```
+
+`scan synth` needs no sensor or display: it renders the analytic room, writes
+the mesh, and writes a colour dataset. It is the cheapest way to exercise the
+Brush hand-off on a machine with no Kinect attached.
 
 The colour is registered as each frame arrives
 (`Registration::undistort_depth_and_color`), so a view is a 512x424 RGB image
@@ -525,11 +555,11 @@ platform/linux      udev rule
 cargo test -p geom -p scan --features gui
 ```
 
-199 tests. The geometry is tested against synthetic scenes and known transforms
+203 tests. The geometry is tested against synthetic scenes and known transforms
 rather than against recorded data, so the suite runs without a sensor. The
 window's tests are headless too: they exercise the session worker, a synthetic
-scan and its export, and the software renderer without opening a window. Without
-`--features gui` the suite is 182 tests.
+scan and its export, the trainer child-process worker, and the software renderer
+without opening a window. Without `--features gui` the suite is 183 tests.
 
 Two tests need hardware and are ignored by default:
 
@@ -546,10 +576,12 @@ cargo test --release -p scan --features wgpu-decode -- --ignored --nocapture
    100 ms, ahead of tracking at 35 ms and decode at about 50 ms. It scales with
    the size of the model, so it is also what makes large `--voxel 0.01` scans
    slow rather than merely memory-hungry.
-2. **Exercise loop closure on a real loop.** It is implemented and tested
-   against synthetic scans, but the property that has been verified is only that
-   it does not damage a correct trajectory. A capture that walks out and returns
-   to its start would show whether it removes drift.
+2. **Exercise loop closure on a real loop.** The synthetic
+   `a_revisit_merges_submaps_at_the_corrected_pose` test now verifies a
+   cross-submap revisit: front, side and returned-front views form three submaps,
+   the loop edge moves the third by 0.20 m, and the rebuild produces one model.
+   A real capture that walks out and returns is still needed to show that it
+   removes drift and makes a better room.
 3. **File the `undistort_depth` bug upstream**, since it affects anyone using the
    port on real hardware.
 4. **The GPU decoder frees the CPU and does not shorten the scan.** Either find

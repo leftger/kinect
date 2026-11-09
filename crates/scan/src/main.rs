@@ -51,7 +51,7 @@ use geom::tsdf::TsdfParams;
 use loop_closure::LoopClosureConfig;
 use nalgebra::Vector3;
 use odometry::OdometryConfig;
-use scanner::{ExportMesh, FrameColor, FrameReport, Scanner, ScannerConfig};
+use scanner::{ExportMesh, FrameColor, FrameReport, ScanQuality, Scanner, ScannerConfig};
 
 const DEFAULT_FRAMES: usize = 60;
 
@@ -369,6 +369,7 @@ fn usage_text() -> String {
          \x20             [--color]\n\
          \x20 scan replay  --in capture.k2df [--out mesh.ply] [--voxel M] [--frames N]\n\
          \x20             [--loop-closure]\n\
+         \x20 scan synth   --dataset DIR [--frames N] [--out mesh.ply] [--voxel M]\n\
          \n\
          COMMANDS:\n\
          \x20 gui      Open the scanner window: pick a source, scan, export.\n\
@@ -377,6 +378,8 @@ fn usage_text() -> String {
          \x20 live     Capture from the sensor and reconstruct as you go.\n\
          \x20 record   Capture depth frames to a file, for offline tuning.\n\
          \x20 replay   Reconstruct from a recording. Needs no sensor.\n\
+         \x20 synth    Render the analytic room and write a colour dataset. Needs\n\
+         \x20          no sensor or display; the result feeds Brush directly.\n\
          \n\
          OPTIONS:\n\
          \x20 --frames N    With live/record: frames to capture (default {DEFAULT_FRAMES}).\n\
@@ -816,6 +819,8 @@ pub(crate) struct FinishSummary {
     pub mesh: Option<(usize, usize)>,
     /// Present when `--dataset` was set and a surface existed.
     pub dataset: Option<dataset::DatasetReport>,
+    /// Pre-training sanity check, including unmerged-submap warnings.
+    pub quality: ScanQuality,
 }
 
 /// Close loops, then write the mesh. Live, replay, and the scanner window all
@@ -1061,6 +1066,19 @@ pub(crate) fn finish(
         final_position.norm()
     );
 
+    let quality = scanner.quality();
+    if quality.trainable() {
+        println!("[scan] quality: trainable");
+    } else {
+        println!(
+            "[scan] quality: NOT trainable ({} warning(s))",
+            quality.warnings.len()
+        );
+        for warning in &quality.warnings {
+            println!("[scan] warning: {warning}");
+        }
+    }
+
     let out = options
         .out
         .clone()
@@ -1077,6 +1095,7 @@ pub(crate) fn finish(
             output: out,
             mesh: None,
             dataset: None,
+            quality: quality.clone(),
         });
     };
 
@@ -1159,6 +1178,7 @@ pub(crate) fn finish(
         output: out,
         mesh: mesh_summary,
         dataset: dataset_report,
+        quality,
     })
 }
 
@@ -1450,6 +1470,8 @@ mod tests {
     fn usage_documents_the_window_and_its_options() {
         let usage = usage_text();
         assert!(usage.contains("scan gui"), "{usage}");
+        assert!(usage.contains("scan synth"), "{usage}");
+        assert!(usage.contains("analytic room"), "{usage}");
         assert!(usage.contains("Open the scanner window"), "{usage}");
         assert!(usage.contains("--synthetic"), "{usage}");
         assert!(usage.contains("--auto-start"), "{usage}");

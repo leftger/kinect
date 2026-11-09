@@ -124,6 +124,31 @@ pub struct ClosureReport {
     pub rebuilt: bool,
 }
 
+/// A pre-training sanity check of the reconstruction.
+///
+/// This is not a quality metric: it only distinguishes a scan that can be
+/// handed to a trainer from one that is obviously broken. The warnings are
+/// shown before a dataset is launched, not used to silently discard data.
+#[derive(Clone, Debug)]
+pub struct ScanQuality {
+    pub frames: usize,
+    pub fused: usize,
+    pub rejected: usize,
+    pub submaps: usize,
+    pub loop_edges: usize,
+    pub rebuilt: bool,
+    pub refused: bool,
+    pub final_distance: f32,
+    pub warnings: Vec<String>,
+}
+
+impl ScanQuality {
+    /// True when a trainer has a coherent reconstruction to start from.
+    pub fn trainable(&self) -> bool {
+        self.warnings.is_empty()
+    }
+}
+
 /// Colour for one frame, already registered into the depth grid.
 ///
 /// Borrowed because the capture that produced it still owns the buffers. The
@@ -598,6 +623,58 @@ impl Scanner {
             .unwrap_or(0)
     }
 
+    /// A pre-training sanity check. Call after `close_loops` so the submap
+    /// count reflects any correction that was actually rebuilt.
+    pub fn quality(&self) -> ScanQuality {
+        let closure = self.closure();
+        let loop_edges = closure.map(|report| report.loop_edges).unwrap_or(0);
+        let rebuilt = closure.map(|report| report.rebuilt).unwrap_or(false);
+        let refused = closure.map(|report| report.refused).unwrap_or(false);
+
+        let mut warnings = Vec::new();
+        if self.frames == 0 {
+            warnings.push("no frames were captured".to_string());
+        } else if self.fused == 0 {
+            warnings.push("no frames were fused".to_string());
+        } else if self.fused * 2 < self.frames {
+            warnings.push(format!(
+                "only {} of {} frames were fused",
+                self.fused, self.frames
+            ));
+        }
+        if self.frames > 0 && self.rejected > 0 && self.rejected * 3 >= self.frames {
+            warnings.push(format!(
+                "{} of {} frames were rejected",
+                self.rejected, self.frames
+            ));
+        }
+        if self.submaps() > 1 {
+            warnings.push(format!(
+                "{} submaps remain unmerged; a trainer will see disjoint fragments",
+                self.submaps()
+            ));
+        }
+        if refused {
+            warnings.push(
+                "loop closure found a correction but refused it as implausible; \
+                 the poses remain uncorrected"
+                    .to_string(),
+            );
+        }
+
+        ScanQuality {
+            frames: self.frames,
+            fused: self.fused,
+            rejected: self.rejected,
+            submaps: self.submaps(),
+            loop_edges,
+            rebuilt,
+            refused,
+            final_distance: self.pose().translation.vector.norm(),
+            warnings,
+        }
+    }
+
     pub fn mesh(&self) -> Mesh {
         self.painted_mesh().0
     }
@@ -958,6 +1035,10 @@ mod tests {
         );
         assert!(max.x - min.x > 1.5, "width only {}", max.x - min.x);
         assert!(max.y - min.y > 1.0, "height only {}", max.y - min.y);
+
+        let quality = scanner.quality();
+        assert!(quality.trainable(), "{:?}", quality.warnings);
+        assert_eq!(quality.submaps, 1);
     }
 
     #[test]
@@ -1035,6 +1116,15 @@ mod tests {
         assert_eq!(scanner.fused(), 3);
         assert_eq!(scanner.rejected(), 0);
         assert!(!scanner.mesh().is_empty());
+
+        let quality = scanner.quality();
+        assert!(!quality.trainable());
+        assert_eq!(quality.submaps, 2);
+        assert!(
+            quality.warnings.iter().any(|warning| warning.contains("unmerged")),
+            "{:?}",
+            quality.warnings
+        );
     }
 
     #[test]
@@ -1097,6 +1187,84 @@ mod tests {
             "the rebuild produced no surface"
         );
         assert_eq!(scanner.fused(), 6, "the rebuild dropped frames");
+    }
+
+    #[test]
+    fn a_revisit_merges_submaps_at_the_corrected_pose() {
+        let mut scanner = scanner_with_loops();
+        let front = room_frame(WIDTH, HEIGHT, &intrinsics());
+        let side = room_frame_from(
+            WIDTH,
+            HEIGHT,
+            &intrinsics(),
+            &Vector3::zeros(),
+            std::f32::consts::FRAC_PI_2,
+        );
+
+        // The return view is the front view again, but from 20 cm to the right.
+        // Its submap is born at the failed alignment's guess (here, the origin),
+        // so only the loop edge can put it in the right place.
+        let returned = room_frame_from(
+            WIDTH,
+            HEIGHT,
+            &intrinsics(),
+            &Vector3::new(0.2, 0.0, 0.0),
+            0.0,
+        );
+
+        let mut boundaries = Vec::new();
+        for _ in 0..2 {
+            boundaries.push(scanner.add_frame(&front, WIDTH, HEIGHT).new_submap);
+        }
+        for _ in 0..2 {
+            boundaries.push(scanner.add_frame(&side, WIDTH, HEIGHT).new_submap);
+        }
+        for _ in 0..3 {
+            boundaries.push(scanner.add_frame(&returned, WIDTH, HEIGHT).new_submap);
+        }
+
+        assert_eq!(
+            boundaries,
+            [true, false, true, false, true, false, false],
+            "the side and return views should each start a submap"
+        );
+        assert_eq!(scanner.submaps(), 3);
+        assert_eq!(scanner.fused(), 7);
+        assert_eq!(scanner.rejected(), 0);
+        assert!(
+            scanner.loops() > 0,
+            "the return view was not verified as a revisit"
+        );
+
+        let report = scanner.close_loops();
+
+        assert!(
+            report.loop_edges > 0,
+            "no loop edge reached the pose graph"
+        );
+        assert!(report.rebuilt, "the corrected model was not rebuilt");
+        assert!(!report.refused, "the correction was refused");
+        assert!(
+            (report.max_correction - 0.2).abs() < 0.05,
+            "the submap moved {:.3} m, expected about 0.2 m",
+            report.max_correction
+        );
+        assert_eq!(scanner.submaps(), 1, "the rebuild did not merge");
+        assert_eq!(scanner.fused(), 7, "the rebuild dropped frames");
+        assert_eq!(scanner.rejected(), 0);
+
+        let position = scanner.pose().translation.vector;
+        assert!(
+            (position - Vector3::new(0.2, 0.0, 0.0)).norm() < 0.05,
+            "the corrected return pose is {position:?}"
+        );
+        assert!(!scanner.mesh().is_empty(), "the merged model is empty");
+
+        let quality = scanner.quality();
+        assert!(quality.trainable(), "{:?}", quality.warnings);
+        assert_eq!(quality.submaps, 1);
+        assert!(quality.loop_edges > 0);
+        assert!(quality.rebuilt);
     }
 
     #[test]
