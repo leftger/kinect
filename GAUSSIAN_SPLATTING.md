@@ -12,7 +12,8 @@ measured on this machine unless marked otherwise.
 > sensor (optionally writing a `.k2df` as it reconstructs), replay a colour
 > recording, or run the synthetic room; it writes the dataset on Export, then
 > launches a configured Brush command as a child process, streams its log, and
-> cancels it. It still does not render the trained splats. This document marks
+> cancels it. The Splats panel can load the trained `.ply` into a basic
+> isotropic DC preview; full anisotropic/SH rendering remains M1.6. This document marks
 > that boundary explicitly: what already lives in the window, and what should
 > come next.
 
@@ -65,8 +66,9 @@ live-only workflow; the old M2.4 is done.
 open the same window: live/record/replay/synthetic sources, start/pause/stop/
 reset/export, a navigable TSDF preview, the dataset field, a dataset result
 card after Export, and a Splats panel that launches a configured Brush child
-process. It does not render splats. `Scanner::quality` marks unmerged submaps
-or heavy frame loss as not trainable before the panel starts a trainer.
+process and loads a trained `.ply` into a basic isotropic DC splat preview.
+`Scanner::quality` marks unmerged submaps or heavy frame loss as not trainable
+before the panel starts a trainer.
 
 **`TsdfVolume::raycast`** (`crates/geom/src/tsdf.rs`). Renders the fused surface
 as a depth image, which is what any frame-to-model work needs.
@@ -90,9 +92,9 @@ reduce drift — see §5, M2.
   has no dataset to write. `live --color`, `record --color` and the synthetic
   room do. The window checks live and Record at Start and rejects a depth-only
   replay before it starts.
-- **The window launches the trainer but does not render splats.** The Splats
-  panel runs a child process and reports the exported `.ply`; loading that file
-  into the viewport is still M1.6.
+- **The splat preview is basic.** It loads Brush's `.ply` and renders sorted,
+  alpha-blended isotropic DC billboards. Full anisotropic covariance, higher SH
+  bands, and a verified pose/scale match with the mesh remain M1.6.
 - **The paths are still text fields.** The dataset and recording paths are
   preflighted at Start, but there is no native folder picker yet; that is the
   one M0 item left.
@@ -121,7 +123,7 @@ scan gui (live | replay | synthetic)
   -> dataset (transforms.json, images/, masks/, init.ply)
   -> trainer child process (Brush, from the Splats panel)
   -> splat .ply
-  -> external viewer, or the window after M1.6
+  -> basic preview in the window, external viewer, or full viewer after M1.6
 ```
 
 | Step | Current owner | Where it lives |
@@ -253,8 +255,9 @@ need hardware.** M2.1b is now in: 150/150 frames land in 19 submaps, and a
 synthetic front-side-return test proves the loop edge moves a submap and rebuilds
 one model; a real capture with a genuine loop is still needed for the real-data
 case. The next pose work is that capture, then M2.2 drift. If the sensor is not
-on the desk, the M0 folder picker, M1.5's interactive click-through, and M1.6 are
-the remaining software work; M1.6 needs a trained result.
+on the desk, the M0 folder picker and M1.5's interactive click-through remain;
+the basic M1.6 preview is in, while full anisotropic/SH alignment needs a
+trained result and a real mesh comparison.
 
 ### M0 — Finish the dataset side of the window (done, except the folder picker)
 
@@ -337,19 +340,30 @@ half; the synthetic Brush run covers the command half.
 Cancel actually stops the child process, and the output path is reported. The
 viewport does not have to show the splats yet.
 
-### M1.6 — Show the trained splats (optional, after M1.5)
+### M1.6 — Show the trained splats (basic implemented)
 
-The current viewport is a triangle/point z-buffer (`gui/render.rs`). A 3DGS
-result is anisotropic Gaussians; drawing it correctly needs sorted, blended
-billboards or an alpha-composited GPU pass. Do not call the current preview a
-splat viewer before this exists.
+The current viewport is still a CPU rasteriser, but the Splats panel can now
+load a Brush `.ply` and display it. `gui/splat.rs` parses the binary
+little-endian 3DGS layout, decodes log scales, logit opacity and the DC colour
+term, and ignores the 45 `f_rest` fields. `gui/render.rs::render_splats` sorts
+the splats far-to-near and alpha-blends **isotropic circular billboards** using
+the largest linear axis as the screen radius. The viewport has a Mesh/Splats
+toggle and a Fit-splats button.
 
-Minimum useful version:
+Measured on the synthetic Brush export (504,178 splats):
 
-- load the trainer's `.ply` (positions, scales, rotations, opacity, colour/SH),
-- render screen-aligned billboards with depth sorting and alpha blending,
-- reuse the existing orbit/pan/zoom camera,
-- toggle between the TSDF mesh and the splat result.
+| Operation | Debug | Release |
+| --- | --- | --- |
+| Load and decode the PLY | 0.86 s | not separately measured |
+| Render 320×240 | 2.97 s | **336 ms** |
+
+The render only runs when the camera changes, so this is usable as a static
+preview, not a real-time splat renderer.
+
+**Still open:** the isotropic footprint ignores the quaternion and the true 2D
+covariance, only the DC SH band is used, coordinates are displayed as exported
+with no verified alignment to the scanner mesh, and sorting/blending are CPU
+only. The done condition below is therefore **not yet met**:
 
 **Done when:** the window shows the trained result beside the mesh it came from,
 and the two agree on pose and scale.

@@ -21,6 +21,7 @@
 
 mod render;
 mod session;
+mod splat;
 mod trainer;
 
 use std::error::Error;
@@ -37,6 +38,7 @@ use crate::{Options, DEFAULT_FRAMES};
 
 use render::{Camera, PreviewScene, Renderer};
 use session::{SessionConfig, SessionHandle, SessionSnapshot, Source, Status};
+use splat::SplatCloud;
 use trainer::{TrainerConfig, TrainerHandle, TrainerStatus, TrainerView};
 
 /// Which source the controls are set to. The worker gets the resolved [`Source`].
@@ -211,6 +213,10 @@ struct ScannerApp {
     trainer_error: Option<String>,
     scene: Option<Arc<PreviewScene>>,
     scene_id: u64,
+    splat: Option<SplatCloud>,
+    splat_path: String,
+    splat_error: Option<String>,
+    show_splats: bool,
     camera: Camera,
     renderer: Renderer,
     texture: Option<egui::TextureHandle>,
@@ -236,6 +242,10 @@ impl ScannerApp {
             trainer_error: None,
             scene: None,
             scene_id: 0,
+            splat: None,
+            splat_path: String::new(),
+            splat_error: None,
+            show_splats: false,
             camera: Camera::default(),
             renderer: Renderer::new(800, 600),
             texture: None,
@@ -280,7 +290,7 @@ impl ScannerApp {
                 self.scene_id = self.snapshot.scene_id;
                 self.dirty = true;
 
-                if self.auto_fit {
+                if self.auto_fit && !self.show_splats {
                     // Wait for the first scene that actually has a surface.
                     // An early frame can be empty, and consuming the flag then
                     // would leave the camera pointing at the origin forever.
@@ -440,6 +450,15 @@ impl ScannerApp {
     }
 
     fn fit_view(&mut self) {
+        if self.show_splats {
+            if let Some(splat) = &self.splat {
+                let (min, max) = splat.bounds;
+                self.camera.fit(min, max);
+                self.dirty = true;
+                return;
+            }
+        }
+
         let Some(scene) = &self.scene else {
             return;
         };
@@ -722,6 +741,8 @@ impl ScannerApp {
         );
 
         let mut use_last = false;
+        let mut load_splat = false;
+        let mut use_trainer_output = false;
         egui::Grid::new("trainer-fields")
             .num_columns(2)
             .show(ui, |ui| {
@@ -759,6 +780,50 @@ impl ScannerApp {
                 );
                 ui.end_row();
             });
+
+        ui.horizontal(|ui| {
+            ui.label("Splat file");
+            ui.add(
+                egui::TextEdit::singleline(&mut self.splat_path)
+                    .hint_text("export.ply from the trainer"),
+            );
+            if ui.button("Load").clicked() {
+                load_splat = true;
+            }
+            if view.output.is_some() && ui.small_button("use trainer output").clicked() {
+                use_trainer_output = true;
+            }
+        });
+        if use_trainer_output {
+            if let Some(output) = &view.output {
+                self.splat_path = output.display().to_string();
+                load_splat = true;
+            }
+        }
+        if load_splat {
+            self.load_splat();
+        }
+        if let Some(error) = &self.splat_error {
+            ui.colored_label(egui::Color32::LIGHT_RED, error);
+        }
+        let splat_summary = self
+            .splat
+            .as_ref()
+            .map(|splat| (splat.len(), splat.bounds));
+        if let Some((count, bounds)) = splat_summary {
+            ui.horizontal(|ui| {
+                ui.label(format!("{count} splats"));
+                let before = self.show_splats;
+                ui.checkbox(&mut self.show_splats, "Show splats");
+                if before != self.show_splats {
+                    self.dirty = true;
+                }
+                if ui.button("Fit splats").clicked() {
+                    self.camera.fit(bounds.0, bounds.1);
+                    self.dirty = true;
+                }
+            });
+        }
 
         if use_last {
             if let Some(dir) = last_dataset {
@@ -881,6 +946,25 @@ impl ScannerApp {
         }
     }
 
+    fn load_splat(&mut self) {
+        self.splat_error = None;
+        let path = self.splat_path.trim();
+        if path.is_empty() {
+            self.splat_error = Some("choose a splat .ply file".to_string());
+            return;
+        }
+
+        match SplatCloud::load(Path::new(path)) {
+            Ok(cloud) => {
+                self.camera.fit(cloud.bounds.0, cloud.bounds.1);
+                self.splat = Some(cloud);
+                self.show_splats = true;
+                self.dirty = true;
+            }
+            Err(error) => self.splat_error = Some(error),
+        }
+    }
+
     fn viewport(&mut self, ui: &mut egui::Ui) {
         // The toolbar has to be laid out before the image claims all the
         // remaining space, or it ends up painted outside the panel.
@@ -892,7 +976,21 @@ impl ScannerApp {
                 self.camera = Camera::default();
                 self.dirty = true;
             }
-            if let Some(scene) = &self.scene {
+            if self.splat.is_some() {
+                ui.separator();
+                let before = self.show_splats;
+                ui.selectable_value(&mut self.show_splats, false, "Mesh");
+                ui.selectable_value(&mut self.show_splats, true, "Splats");
+                if before != self.show_splats {
+                    self.dirty = true;
+                }
+            }
+            if self.show_splats {
+                if let Some(splat) = &self.splat {
+                    ui.separator();
+                    ui.small(format!("{} splats", splat.len()));
+                }
+            } else if let Some(scene) = &self.scene {
                 ui.separator();
                 ui.small(format!(
                     "{} triangles, {} points",
@@ -940,7 +1038,15 @@ impl ScannerApp {
         }
 
         if self.dirty {
-            let image = if let Some(scene) = &self.scene {
+            let image = if self.show_splats {
+                if let Some(splat) = &self.splat {
+                    let rgba = self.renderer.render_splats(splat, &self.camera);
+                    egui::ColorImage::from_rgba_unmultiplied([width, height], rgba)
+                } else {
+                    let rgba = self.renderer.render(&PreviewScene::empty(), &self.camera);
+                    egui::ColorImage::from_rgba_unmultiplied([width, height], rgba)
+                }
+            } else if let Some(scene) = &self.scene {
                 let rgba = self.renderer.render(scene, &self.camera);
                 egui::ColorImage::from_rgba_unmultiplied([width, height], rgba)
             } else {

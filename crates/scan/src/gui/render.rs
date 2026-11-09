@@ -14,6 +14,8 @@
 use geom::mesh::Mesh;
 use nalgebra::Vector3;
 
+use super::splat::SplatCloud;
+
 /// One point from the most recent depth frame, already in world space.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct PreviewPoint {
@@ -263,6 +265,69 @@ impl Renderer {
         &self.rgba
     }
 
+    /// Render a trained splat cloud as sorted, alpha-blended circular billboards.
+    ///
+    /// This is a deliberately conservative viewer: each splat uses its largest
+    /// linear axis as an isotropic screen radius. It does not reconstruct the
+    /// full anisotropic covariance or evaluate higher SH bands. The point is to
+    /// see the trained result beside the mesh and check pose and scale, not to
+    /// claim a production 3DGS renderer.
+    pub fn render_splats(&mut self, cloud: &SplatCloud, camera: &Camera) -> &[u8] {
+        self.clear_background();
+        let view = camera.view(self.width, self.height);
+
+        let mut order: Vec<(f32, usize)> = cloud
+            .splats
+            .iter()
+            .enumerate()
+            .filter_map(|(index, splat)| {
+                let z = (splat.position - view.eye).dot(&view.forward);
+                (z > 1e-3).then_some((z, index))
+            })
+            .collect();
+        order.sort_by(|a, b| b.0.total_cmp(&a.0));
+
+        for (z, index) in order {
+            let splat = &cloud.splats[index];
+            let delta = splat.position - view.eye;
+            let sx = view.cx + view.focal * delta.dot(&view.right) / z;
+            let sy = view.cy - view.focal * delta.dot(&view.up) / z;
+            let sigma = (view.focal * splat.scale / z).clamp(0.5, 48.0);
+            let radius = (sigma * 3.0).ceil();
+            let sigma_inv = 1.0 / (sigma * sigma);
+
+            let x0 = ((sx - radius).floor() as isize).max(0);
+            let x1 = ((sx + radius).ceil() as isize).min(self.width as isize - 1);
+            let y0 = ((sy - radius).floor() as isize).max(0);
+            let y1 = ((sy + radius).ceil() as isize).min(self.height as isize - 1);
+            if x0 > x1 || y0 > y1 {
+                continue;
+            }
+
+            for py in y0..=y1 {
+                let dy = py as f32 + 0.5 - sy;
+                for px in x0..=x1 {
+                    let dx = px as f32 + 0.5 - sx;
+                    let alpha = splat.opacity * (-0.5 * (dx * dx + dy * dy) * sigma_inv).exp();
+                    if alpha <= 0.001 {
+                        continue;
+                    }
+
+                    let pixel = ((py as usize) * self.width + px as usize) * 4;
+                    let inverse = 1.0 - alpha;
+                    for channel in 0..3 {
+                        let dst = self.rgba[pixel + channel] as f32 / 255.0;
+                        self.rgba[pixel + channel] =
+                            ((splat.color[channel] * alpha + dst * inverse) * 255.0)
+                                .clamp(0.0, 255.0) as u8;
+                    }
+                }
+            }
+        }
+
+        &self.rgba
+    }
+
     fn clear_background(&mut self) {
         for (index, pixel) in self.rgba.chunks_exact_mut(4).enumerate() {
             let y = index / self.width;
@@ -480,6 +545,7 @@ impl Renderer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::gui::splat::Splat;
 
     fn camera_looking_at(target: Vector3<f32>, distance: f32) -> Camera {
         Camera {
@@ -580,5 +646,76 @@ mod tests {
 
         assert!((camera.target - Vector3::zeros()).norm() < 1e-6);
         assert!(camera.distance > 0.2 && camera.distance < 100.0);
+    }
+
+    #[test]
+    fn a_splat_in_front_of_the_camera_is_visible() {
+        let position = Vector3::zeros();
+        let cloud = SplatCloud {
+            splats: vec![Splat {
+                position,
+                scale: 0.1,
+                opacity: 1.0,
+                color: [1.0, 0.0, 0.0],
+            }],
+            bounds: (position, position),
+        };
+        let camera = camera_looking_at(Vector3::zeros(), 3.0);
+        let mut renderer = Renderer::new(64, 64);
+        let rgba = renderer.render_splats(&cloud, &camera);
+        let centre = (32 * 64 + 32) * 4;
+
+        assert!(
+            rgba[centre] > 200 && rgba[centre + 1] < 50,
+            "a red splat should cover the centre: {:?}",
+            &rgba[centre..centre + 3]
+        );
+    }
+
+    #[test]
+    fn a_splat_behind_the_camera_is_not_drawn() {
+        let position = Vector3::new(0.0, 0.0, 10.0);
+        let cloud = SplatCloud {
+            splats: vec![Splat {
+                position,
+                scale: 0.1,
+                opacity: 1.0,
+                color: [1.0, 0.0, 0.0],
+            }],
+            bounds: (position, position),
+        };
+        let camera = camera_looking_at(Vector3::zeros(), 3.0);
+        let mut renderer = Renderer::new(64, 64);
+        let rgba = renderer.render_splats(&cloud, &camera);
+        let centre = (32 * 64 + 32) * 4;
+
+        assert!(
+            rgba[centre] < 80,
+            "a splat behind the camera should leave the background: {:?}",
+            &rgba[centre..centre + 3]
+        );
+    }
+
+    #[test]
+    #[ignore = "set SCAN_SPLAT_PLY to a trained Brush export"]
+    fn renders_a_real_brush_export() {
+        use std::time::Instant;
+
+        let path = std::env::var("SCAN_SPLAT_PLY").expect("SCAN_SPLAT_PLY");
+        let cloud = SplatCloud::load(std::path::Path::new(&path)).expect("load Brush PLY");
+        let mut camera = Camera::default();
+        camera.fit(cloud.bounds.0, cloud.bounds.1);
+
+        let mut renderer = Renderer::new(320, 240);
+        let started = Instant::now();
+        let rgba = renderer.render_splats(&cloud, &camera);
+        println!(
+            "rendered {} splats at 320x240 in {:?}",
+            cloud.len(),
+            started.elapsed()
+        );
+
+        assert_eq!(rgba.len(), 320 * 240 * 4);
+        assert!(rgba.chunks_exact(4).all(|pixel| pixel[3] == 255));
     }
 }

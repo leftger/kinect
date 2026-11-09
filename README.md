@@ -86,6 +86,9 @@ Build on the machine that will run the scanner. The USB backend is selected
 at compile time, so a Mac binary does not become a Linux binary by being
 copied across.
 
+The workspace uses Rust 2024 edition and resolver 3, so it needs rustc 1.85 or
+newer; the manifests keep `rust-version = "1.85"` as the floor.
+
 ```
 cargo build --release -p scan
 ```
@@ -249,7 +252,9 @@ The window has five parts:
   Editable executable, dataset, output directory and iteration count, with
   Start/Cancel and a streamed log. An exported dataset with unmerged submaps or
   too many rejected frames is marked *not trainable*; Start then requires
-  **Train anyway**.
+  **Train anyway**. The trained `.ply` can be loaded into the viewport, with a
+  Mesh/Splats toggle and a Fit-splats control. This is a basic preview: nearest
+  DC colour and isotropic billboards, not the full anisotropic SH renderer.
 
 *Start* runs the selected source. *Pause* stops consuming frames without
 losing the scanner; *Resume* continues. *Stop* ends the capture but keeps the
@@ -268,7 +273,7 @@ Nerfstudio/Brush trainer can start from. It needs colour views, so tick Colour
 on a live or Record source, or replay a recording made with `record --color`.
 Start preflights the path; Export shows the view and initial-point counts in
 the telemetry panel. The Splats panel can then run a configured Brush child
-process; it does not render the trained splats yet. See
+process and load its `.ply` into a basic splat preview. See
 [GAUSSIAN_SPLATTING.md](GAUSSIAN_SPLATTING.md).
 
 **Brush smoke test without a sensor.** The dataset has been through the real
@@ -555,11 +560,12 @@ platform/linux      udev rule
 cargo test -p geom -p scan --features gui
 ```
 
-203 tests. The geometry is tested against synthetic scenes and known transforms
-rather than against recorded data, so the suite runs without a sensor. The
-window's tests are headless too: they exercise the session worker, a synthetic
-scan and its export, the trainer child-process worker, and the software renderer
-without opening a window. Without `--features gui` the suite is 183 tests.
+207 tests (3 ignored). The geometry is tested against synthetic scenes and known
+transforms rather than against recorded data, so the suite runs without a
+sensor. The window's tests are headless too: they exercise the session worker,
+a synthetic scan and its export, the trainer child-process worker, the splat
+loader/renderer, and the software renderer without opening a window. Without
+`--features gui` the suite is 183 tests.
 
 Two tests need hardware and are ignored by default:
 
@@ -569,6 +575,13 @@ cargo test --release -p scan --features wgpu-decode -- --ignored --nocapture
 
 `live_decoders_agree` feeds one real sensor packet to both depth decoders, and
 `diagnose_the_divergence` prints the stage-by-stage comparison.
+
+The third ignored test is the manual splat load/render:
+
+```sh
+SCAN_SPLAT_PLY=/path/to/export.ply \
+  cargo test --release -p scan --features gui gui:: -- --ignored --nocapture
+```
 
 ## Known gaps
 
