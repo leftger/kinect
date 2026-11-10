@@ -531,6 +531,14 @@ different close-up of the table, not an exact return, so that is path end
 distance rather than pure drift. `out/room.k2df` still verifies no revisits and
 remains 19 fragments; the new capture is the real merge case.
 
+A first RTAB-Map-inspired piece is in: spatial candidates are tried first, and
+only if none verifies does an appearance signature (8×8 grayscale + RGB
+histogram) propose colour keyframes outside the pose radius. The proposal still
+has to pass spatial ICP. On this capture the result is unchanged — 2 revisits,
+1 submap, 0.555 m, trainable — which is the intended safe behaviour; the path is
+for loops where drift has moved the pose estimate outside `search_radius`.
+`SCAN_DEBUG_LOOPS=1` prints spatial/appearance candidates and ICP outcomes.
+
 **Still needed: an exact return/ground truth.** Return the camera to the same
 pose, ideally with a fixed marker or measured baseline, to separate residual
 drift from “the operator ended somewhere near the start.” Every absolute pose

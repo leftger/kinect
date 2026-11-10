@@ -13,6 +13,12 @@
 //! *filter*, though, because the poses are exactly what has drifted; it narrows
 //! thousands of pairs down to a handful worth testing.
 //!
+//! Colour scans have a second, appearance-based path inspired by RTAB-Map's
+//! bag-of-words loop detection: if the pose-proximity pass verifies nothing, a
+//! compact colour signature can propose an earlier frame *outside* the pose
+//! radius. That is only a proposal. The same spatial ICP has to accept it before
+//! it becomes an edge, so a repeated-looking wall cannot fold the map by itself.
+//!
 //! Each surviving candidate is then aligned geometrically with point-to-plane ICP
 //! (`geom::icp::align`, the spatial-index path, since two keyframes that are far
 //! apart share no viewpoint and projective association does not apply). Only an
@@ -21,16 +27,109 @@
 //! That verification is not optional. A pose graph will happily fold a map in half
 //! to satisfy a single bad edge, so a false loop is far worse than a missed one.
 
-use geom::icp::{align, IcpCloud, IcpParams};
+use geom::icp::{IcpCloud, IcpParams, align};
 use geom::pose_graph::Edge;
 use geom::transform_point;
 use nalgebra::{Isometry3, Vector3};
+
+/// A compact appearance signature for one colour frame.
+///
+/// This is a deliberately small stand-in for RTAB-Map's visual bag of words:
+/// an 8×8 grayscale image and a 4×4×4 RGB histogram, each normalised and
+/// concatenated. It is cheap enough to compute on every frame and good enough
+/// to *propose* a loop candidate; the spatial ICP below still has to verify it.
+/// Without that second stage an appearance match could fold two similar-looking
+/// walls together.
+#[derive(Clone, Debug)]
+pub struct VisualDescriptor {
+    values: Vec<f32>,
+}
+
+impl VisualDescriptor {
+    pub fn from_rgb(rgb: &[u8], width: usize, height: usize) -> Option<Self> {
+        if width == 0 || height == 0 || rgb.len() < width * height * 3 {
+            return None;
+        }
+
+        let mut gray = [0.0f32; 64];
+        for gy in 0..8 {
+            for gx in 0..8 {
+                let x0 = gx * width / 8;
+                let x1 = ((gx + 1) * width / 8).max(x0 + 1).min(width);
+                let y0 = gy * height / 8;
+                let y1 = ((gy + 1) * height / 8).max(y0 + 1).min(height);
+                let mut sum = 0.0f32;
+                let mut count = 0u32;
+                for y in y0..y1 {
+                    for x in x0..x1 {
+                        let index = (y * width + x) * 3;
+                        sum += 0.299 * rgb[index] as f32
+                            + 0.587 * rgb[index + 1] as f32
+                            + 0.114 * rgb[index + 2] as f32;
+                        count += 1;
+                    }
+                }
+                gray[gy * 8 + gx] = sum / count.max(1) as f32;
+            }
+        }
+
+        let mean = gray.iter().sum::<f32>() / 64.0;
+        let variance = gray
+            .iter()
+            .map(|value| (value - mean) * (value - mean))
+            .sum::<f32>()
+            / 64.0;
+        let deviation = variance.sqrt();
+        let mut values = Vec::with_capacity(128);
+        if deviation < 1e-4 {
+            values.extend(std::iter::repeat_n(0.0, 64));
+        } else {
+            values.extend(gray.iter().map(|value| (value - mean) / deviation / 8.0));
+        }
+
+        let mut color = [0.0f32; 64];
+        let pixels = width * height;
+        for index in (0..pixels * 3).step_by(3) {
+            let r = rgb[index] as f32 / 255.0;
+            let g = rgb[index + 1] as f32 / 255.0;
+            let b = rgb[index + 2] as f32 / 255.0;
+            let ri = (r * 4.0).floor().min(3.0) as usize;
+            let gi = (g * 4.0).floor().min(3.0) as usize;
+            let bi = (b * 4.0).floor().min(3.0) as usize;
+            color[(ri * 4 + gi) * 4 + bi] += 1.0;
+        }
+        let color_norm = color.iter().map(|value| value * value).sum::<f32>().sqrt();
+        values.extend(color.iter().map(|value| value / color_norm.max(1e-6)));
+
+        let norm = values.iter().map(|value| value * value).sum::<f32>().sqrt();
+        let norm = norm.max(1e-6);
+        for value in &mut values {
+            *value /= norm;
+        }
+        Some(Self { values })
+    }
+
+    /// Cosine similarity: 1 for the same view, lower for a different one.
+    pub fn similarity(&self, other: &Self) -> f32 {
+        if self.values.len() != other.values.len() {
+            return 0.0;
+        }
+        self.values
+            .iter()
+            .zip(&other.values)
+            .map(|(a, b)| a * b)
+            .sum::<f32>()
+            .clamp(-1.0, 1.0)
+    }
+}
 
 /// A frame kept as a place the sensor might return to.
 pub struct Keyframe {
     /// Index of this frame within the scan, which is what edges refer to.
     pub index: usize,
     pub pose: Isometry3<f32>,
+    /// Appearance signature, when the scan had colour.
+    appearance: Option<VisualDescriptor>,
     cloud: IcpCloud,
 }
 
@@ -49,6 +148,9 @@ pub struct LoopClosureConfig {
     pub min_index_gap: usize,
     /// How many candidates to spend ICP on per frame.
     pub max_candidates: usize,
+    /// Appearance similarity that can propose a candidate whose pose is outside
+    /// `search_radius`. Purely a proposal: ICP still has to accept it.
+    pub appearance_min_similarity: f32,
     /// ICP acceptance: fraction of points that must find a match...
     pub min_inlier_ratio: f32,
     /// ...and the RMS residual they must achieve, in metres.
@@ -69,6 +171,7 @@ impl Default for LoopClosureConfig {
             search_radius: 1.5,
             min_index_gap: 40,
             max_candidates: 3,
+            appearance_min_similarity: 0.78,
             min_inlier_ratio: 0.5,
             max_rmse: 0.03,
             // Below odometry on purpose: a loop is a hypothesis, an odometry edge
@@ -150,6 +253,21 @@ impl LoopFinder {
         pose: Isometry3<f32>,
         points: &[Vector3<f32>],
     ) -> Option<Loop> {
+        self.consider_with_appearance(index, pose, points, None)
+    }
+
+    /// As [`Self::consider`], with an optional appearance signature.
+    ///
+    /// The signature can retrieve a candidate whose pose has drifted outside
+    /// `search_radius`; ICP still decides whether it is a real loop. Scans
+    /// without colour simply pass `None` and keep the pose-only path.
+    pub fn consider_with_appearance(
+        &mut self,
+        index: usize,
+        pose: Isometry3<f32>,
+        points: &[Vector3<f32>],
+        appearance: Option<&VisualDescriptor>,
+    ) -> Option<Loop> {
         let origin = Vector3::zeros();
         let cloud = IcpCloud::build(
             points,
@@ -159,9 +277,14 @@ impl LoopFinder {
             &origin,
         );
 
-        let found = self.search(index, &pose, &cloud);
+        let found = self.search(index, &pose, &cloud, appearance);
 
-        self.keyframes.push(Keyframe { index, pose, cloud });
+        self.keyframes.push(Keyframe {
+            index,
+            pose,
+            appearance: appearance.cloned(),
+            cloud,
+        });
 
         if let Some(ref loop_closure) = found {
             self.loops.push(*loop_closure);
@@ -171,30 +294,88 @@ impl LoopFinder {
     }
 
     /// Align the new frame against the most plausible earlier ones.
-    fn search(&mut self, index: usize, pose: &Isometry3<f32>, cloud: &IcpCloud) -> Option<Loop> {
-        let mut candidates: Vec<(f32, usize)> = self
+    fn search(
+        &mut self,
+        index: usize,
+        pose: &Isometry3<f32>,
+        cloud: &IcpCloud,
+        appearance: Option<&VisualDescriptor>,
+    ) -> Option<Loop> {
+        let debug = std::env::var_os("SCAN_DEBUG_LOOPS").is_some();
+
+        // Spatial candidates first: they are the normal path and keep colourless
+        // scans, and scans that already track well, behaving exactly as before.
+        let mut spatial: Vec<(f32, usize)> = self
             .keyframes
             .iter()
             .enumerate()
             .filter(|(_, keyframe)| {
                 index.saturating_sub(keyframe.index) >= self.config.min_index_gap
             })
-            .map(|(position, keyframe)| {
-                (
-                    (keyframe.pose.translation.vector - pose.translation.vector).norm(),
-                    position,
-                )
+            .filter_map(|(position, keyframe)| {
+                let distance = (keyframe.pose.translation.vector - pose.translation.vector).norm();
+                (distance <= self.config.search_radius).then_some((distance, position))
             })
-            .filter(|(distance, _)| *distance <= self.config.search_radius)
+            .collect();
+        spatial.sort_by(|a, b| a.0.total_cmp(&b.0));
+        spatial.truncate(self.config.max_candidates);
+        if debug {
+            for (distance, position) in &spatial {
+                eprintln!(
+                    "[loop] {index} spatial candidate kf {} at {distance:.2} m",
+                    self.keyframes[*position].index
+                );
+            }
+        }
+
+        // Appearance is the fallback: only candidates *outside* the pose radius
+        // are retrieved. This is the RTAB-Map "appearance proposes, geometry
+        // verifies" split, without letting a generic view reorder the normal
+        // spatial candidates.
+        let mut appearance_only: Vec<(f32, usize)> = self
+            .keyframes
+            .iter()
+            .enumerate()
+            .filter(|(_, keyframe)| {
+                index.saturating_sub(keyframe.index) >= self.config.min_index_gap
+            })
+            .filter_map(|(position, keyframe)| {
+                let current = appearance?;
+                let previous = keyframe.appearance.as_ref()?;
+                let distance =
+                    (keyframe.pose.translation.vector - pose.translation.vector).norm();
+                if distance <= self.config.search_radius {
+                    return None;
+                }
+                let similarity = current.similarity(previous);
+                if similarity < self.config.appearance_min_similarity {
+                    return None;
+                }
+                if debug {
+                    eprintln!(
+                        "[loop] {index} appearance candidate kf {} at {distance:.2} m, similarity {similarity:.3}",
+                        keyframe.index
+                    );
+                }
+                Some((similarity, position))
+            })
+            .collect();
+        appearance_only.sort_by(|a, b| b.0.total_cmp(&a.0));
+        appearance_only.truncate(self.config.max_candidates);
+
+        let candidates: Vec<(bool, usize)> = spatial
+            .into_iter()
+            .map(|(_, position)| (true, position))
+            .chain(
+                appearance_only
+                    .into_iter()
+                    .map(|(_, position)| (false, position)),
+            )
             .collect();
 
         if candidates.is_empty() {
             return None;
         }
-
-        // Closest first: the pose estimate is wrong, but not arbitrarily wrong.
-        candidates.sort_by(|a, b| a.0.total_cmp(&b.0));
-        candidates.truncate(self.config.max_candidates);
 
         let params = IcpParams {
             max_correspondence_distance: self.config.max_distance,
@@ -204,7 +385,12 @@ impl LoopFinder {
 
         let mut best: Option<Loop> = None;
 
-        for (_, position) in candidates {
+        for (spatial, position) in candidates {
+            // A verified spatial loop is enough; only fall back to appearance
+            // when the entire pose-proximity pass produced nothing.
+            if !spatial && best.is_some() {
+                break;
+            }
             let keyframe = &self.keyframes[position];
 
             // Starting guess: where the poses say the earlier frame is, relative
@@ -213,6 +399,12 @@ impl LoopFinder {
 
             self.attempts += 1;
             let result = align(cloud, &keyframe.cloud, initial, &params);
+            if debug {
+                eprintln!(
+                    "[loop] align kf {} -> {index}: inliers {:.3} rmse {:.4} corr {}",
+                    keyframe.index, result.inlier_ratio, result.rmse, result.correspondences
+                );
+            }
 
             if result.inlier_ratio < self.config.min_inlier_ratio
                 || result.rmse > self.config.max_rmse
@@ -293,19 +485,74 @@ mod tests {
         })
     }
 
+    fn solid(width: usize, height: usize, rgb: [u8; 3]) -> Vec<u8> {
+        let mut pixels = vec![0u8; width * height * 3];
+        for pixel in pixels.chunks_exact_mut(3) {
+            pixel.copy_from_slice(&rgb);
+        }
+        pixels
+    }
+
+    #[test]
+    fn appearance_similarity_prefers_the_same_view() {
+        let red =
+            VisualDescriptor::from_rgb(&solid(32, 32, [220, 40, 40]), 32, 32).expect("descriptor");
+        let blue =
+            VisualDescriptor::from_rgb(&solid(32, 32, [40, 40, 220]), 32, 32).expect("descriptor");
+
+        assert!(red.similarity(&red) > 0.99);
+        assert!(red.similarity(&blue) < 0.5);
+    }
+
+    #[test]
+    fn appearance_can_propose_a_loop_outside_the_pose_radius() {
+        let world = scene();
+        let config = LoopClosureConfig {
+            search_radius: 0.1,
+            min_index_gap: 30,
+            max_distance: 0.3,
+            ..LoopClosureConfig::default()
+        };
+
+        let start = at(0.0, 0.0, 0.0);
+        let returned = at(0.2, 0.0, 0.0);
+        let first = view(&world, &start);
+        let second = view(&world, &returned);
+
+        // Without appearance, 0.2 m is outside the 0.1 m search radius.
+        let mut plain = LoopFinder::new(config);
+        plain.consider(0, start, &first);
+        assert!(plain.consider(50, returned, &second).is_none());
+        assert_eq!(plain.attempts(), 0);
+
+        let signature =
+            VisualDescriptor::from_rgb(&solid(32, 32, [220, 40, 40]), 32, 32).expect("descriptor");
+        let mut appearance = LoopFinder::new(config);
+        appearance.consider_with_appearance(0, start, &first, Some(&signature));
+        let found = appearance.consider_with_appearance(50, returned, &second, Some(&signature));
+
+        assert!(
+            found.is_some(),
+            "appearance should retrieve the candidate and ICP should verify it"
+        );
+        assert_eq!(appearance.attempts(), 1);
+    }
+
     #[test]
     fn returning_to_a_place_is_detected_and_re_measured() {
         let world = scene();
         let mut finder = finder();
 
         // First keyframe: camera at the origin.
-        assert!(finder
-            .consider(
-                0,
-                Isometry3::identity(),
-                &view(&world, &Isometry3::identity())
-            )
-            .is_none());
+        assert!(
+            finder
+                .consider(
+                    0,
+                    Isometry3::identity(),
+                    &view(&world, &Isometry3::identity())
+                )
+                .is_none()
+        );
 
         // Much later, the camera is genuinely at (0.4, 0, 0), but odometry thinks
         // it is at (0.55, 0.05, 0) because of accumulated drift.

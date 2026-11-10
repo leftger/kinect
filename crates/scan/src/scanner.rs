@@ -1,15 +1,15 @@
 //! The scan pipeline: depth frame -> odometry -> TSDF fusion.
 
-use geom::coloring::{colorize, ColorView, ColoringParams, ColoringReport};
+use geom::coloring::{ColorView, ColoringParams, ColoringReport, colorize};
 use geom::mesh::Mesh;
 use geom::pose_graph::{PoseGraph, PoseGraphParams};
-use geom::texturing::{texture, TexturedMesh, TexturingParams, TexturingReport};
+use geom::texturing::{TexturedMesh, TexturingParams, TexturingReport, texture};
 use geom::tsdf::{IntegrationStats, TsdfParams, TsdfVolume};
-use geom::{transform_point, DepthImage, Intrinsics};
+use geom::{DepthImage, Intrinsics, transform_point};
 use nalgebra::{Isometry3, Vector3};
 use std::time::{Duration, Instant};
 
-use crate::loop_closure::{LoopClosureConfig, LoopFinder};
+use crate::loop_closure::{LoopClosureConfig, LoopFinder, VisualDescriptor};
 use crate::odometry::{Odometry, OdometryConfig, TrackReport};
 
 #[derive(Clone, Debug)]
@@ -88,7 +88,6 @@ struct KeptFrame {
     /// the same choice, or the model gains geometry the tracker refused.
     fused: bool,
 }
-
 
 /// The most any single pose may be moved by loop closure before the whole
 /// correction is discarded.
@@ -288,7 +287,11 @@ impl Scanner {
     /// The union of every submap's surface, in the world frame.
     fn geometry(&self) -> Mesh {
         let mut mesh = self.finished_geometry.clone();
-        append_transformed(&mut mesh, self.volume.extract_mesh(), self.world_from_submap);
+        append_transformed(
+            &mut mesh,
+            self.volume.extract_mesh(),
+            self.world_from_submap,
+        );
         mesh
     }
 
@@ -402,6 +405,18 @@ impl Scanner {
         // pose the tracker accepted. A rejected frame's colour would paint the
         // model from a pose that was never used to build it. It is still
         // counted, so the summary can say how many colour frames were dropped.
+        //
+        // The appearance signature is computed before `color` is consumed below.
+        // It lets a loop candidate be proposed by what the camera saw, not only
+        // by where the drifted pose says it is -- the RTAB-Map idea, with a
+        // tiny descriptor standing in for a visual vocabulary.
+        let appearance = if self.loops.is_some() {
+            color
+                .as_ref()
+                .and_then(|color| VisualDescriptor::from_rgb(color.rgb, width, height))
+        } else {
+            None
+        };
         if let Some(color) = color {
             self.color_supplied += 1;
             if fuse {
@@ -427,7 +442,12 @@ impl Scanner {
         // voxel hashing and, when a candidate turns up, one ICP alignment.
         if let Some(finder) = self.loops.as_mut() {
             if fuse {
-                finder.consider(self.frames, pose, &self.points);
+                finder.consider_with_appearance(
+                    self.frames,
+                    pose,
+                    &self.points,
+                    appearance.as_ref(),
+                );
             }
         }
 
@@ -473,7 +493,13 @@ impl Scanner {
         // A submap boundary is a guess, not a measurement; it must not pin the
         // new submap to the old one's frame.
         let odometry_edges = (0..nodes.saturating_sub(1))
-            .filter(|index| !self.pose_boundaries.get(index + 1).copied().unwrap_or(false))
+            .filter(|index| {
+                !self
+                    .pose_boundaries
+                    .get(index + 1)
+                    .copied()
+                    .unwrap_or(false)
+            })
             .count();
 
         let nothing = ClosureReport {
@@ -507,7 +533,12 @@ impl Scanner {
         // A submap boundary is the exception: its relative pose is a guess, so
         // leaving it out lets a cross-submap loop edge move the whole submap.
         for index in 0..nodes - 1 {
-            if self.pose_boundaries.get(index + 1).copied().unwrap_or(false) {
+            if self
+                .pose_boundaries
+                .get(index + 1)
+                .copied()
+                .unwrap_or(false)
+            {
                 continue;
             }
             let measurement = self.poses[index].inverse() * self.poses[index + 1];
@@ -859,16 +890,16 @@ impl Scanner {
 /// merged surface from the colour views after every submap is in place.
 fn append_transformed(target: &mut Mesh, mesh: Mesh, transform: Isometry3<f32>) {
     let base = target.vertices.len() as u32;
-    target
-        .vertices
-        .extend(mesh.vertices.into_iter().map(|vertex| transform_point(&transform, &vertex)));
-    target.triangles.extend(mesh.triangles.into_iter().map(|triangle| {
-        [
-            triangle[0] + base,
-            triangle[1] + base,
-            triangle[2] + base,
-        ]
-    }));
+    target.vertices.extend(
+        mesh.vertices
+            .into_iter()
+            .map(|vertex| transform_point(&transform, &vertex)),
+    );
+    target.triangles.extend(
+        mesh.triangles
+            .into_iter()
+            .map(|triangle| [triangle[0] + base, triangle[1] + base, triangle[2] + base]),
+    );
 }
 
 fn mesh_bytes(mesh: &Mesh) -> usize {
@@ -925,8 +956,7 @@ mod tests {
             (Vector3::new(0.0, -1.0, 0.0), -MAX_Y),
             (Vector3::new(0.0, 0.0, -1.0), -MAX_Z),
         ];
-        let rotation =
-            nalgebra::UnitQuaternion::from_axis_angle(&Vector3::y_axis(), yaw);
+        let rotation = nalgebra::UnitQuaternion::from_axis_angle(&Vector3::y_axis(), yaw);
 
         let mut frame = vec![f32::NAN; width * height];
 
@@ -1102,7 +1132,10 @@ mod tests {
             "the side view should not track the front view"
         );
         assert_eq!(transition.submap, 1);
-        assert!(transition.integration.is_some(), "the submap origin is fused");
+        assert!(
+            transition.integration.is_some(),
+            "the submap origin is fused"
+        );
 
         let confirmed = scanner.add_frame(&side, WIDTH, HEIGHT);
         assert!(!confirmed.new_submap);
@@ -1121,7 +1154,10 @@ mod tests {
         assert!(!quality.trainable());
         assert_eq!(quality.submaps, 2);
         assert!(
-            quality.warnings.iter().any(|warning| warning.contains("unmerged")),
+            quality
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("unmerged")),
             "{:?}",
             quality.warnings
         );
@@ -1238,10 +1274,7 @@ mod tests {
 
         let report = scanner.close_loops();
 
-        assert!(
-            report.loop_edges > 0,
-            "no loop edge reached the pose graph"
-        );
+        assert!(report.loop_edges > 0, "no loop edge reached the pose graph");
         assert!(report.rebuilt, "the corrected model was not rebuilt");
         assert!(!report.refused, "the correction was refused");
         assert!(

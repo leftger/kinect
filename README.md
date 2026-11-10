@@ -175,8 +175,12 @@ Useful options:
   faster and keeps more junk points.
 - `--frames N` is how many frames to capture or replay. The default is 60.
 - `--loop-closure` detects revisits and rebuilds the model from corrected poses.
-  On a live colour scan the colour views move onto those poses before the mesh
-  is painted. The rebuild keeps every depth frame, about 850 KB each, so a
+  Pose proximity proposes the normal candidates. On colour scans, if none of
+  those verifies, a compact appearance signature (8x8 grayscale plus an RGB
+  histogram) can propose a frame outside the pose radius, RTAB-Map style; the
+  same spatial ICP still has to accept it. On a live colour scan the colour
+  views move onto those poses before the mesh is painted. The rebuild keeps
+  every depth frame, about 850 KB each, so a
   200-frame scan holds around 170 MB of depth. Each colour view is separate:
   about 1.66 MiB, and about 1 GiB at 600 views. It only helps a scan that
   returns somewhere it has already been.
@@ -574,12 +578,12 @@ platform/linux      udev rule
 cargo test -p geom -p scan --features gui
 ```
 
-209 tests (3 ignored). The geometry is tested against synthetic scenes and known
+211 tests (3 ignored). The geometry is tested against synthetic scenes and known
 transforms rather than against recorded data, so the suite runs without a
 sensor. The window's tests are headless too: they exercise the session worker,
 a synthetic scan and its export, the trainer child-process worker, the splat
 loader/renderer, and the software renderer without opening a window. The
-non-GUI suite is 184 tests.
+non-GUI suite is 186 tests.
 
 Two tests need hardware and are ignored by default:
 
