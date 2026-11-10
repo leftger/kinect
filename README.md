@@ -198,9 +198,11 @@ Useful options:
 - `--dataset DIR` also writes a Nerfstudio dataset for a Gaussian-splatting
   trainer: `transforms.json`, posed `images/`, `masks/`, and a coloured
   `init.ply`. It needs colour views, so use `live --color`, or `record --color`
-  and replay. The window preflights the path and reports the result; its Splats
-  panel can launch a configured trainer, but this repo does not implement one.
-  See [GAUSSIAN_SPLATTING.md](GAUSSIAN_SPLATTING.md).
+  and replay. The seed cloud is voxel-decimated to at most 250,000 points; the
+  full surface stays in the exported mesh. The window preflights the path and
+  reports the result; its Splats panel can launch a configured trainer, but this
+  repo does not implement one. See
+  [GAUSSIAN_SPLATTING.md](GAUSSIAN_SPLATTING.md).
 - `--viewer` opens the scanner window on the live source and starts immediately.
   It is the same window as `scan gui`; the old picture-only viewer is gone. Needs
   a build with `--features gui` (or the `viewer` alias) and a display. Closing
@@ -252,9 +254,9 @@ The window has five parts:
   Editable executable, dataset, output directory and iteration count, with
   Start/Cancel and a streamed log. An exported dataset with unmerged submaps or
   too many rejected frames is marked *not trainable*; Start then requires
-  **Train anyway**. The trained `.ply` can be loaded into the viewport, with a
-  Mesh/Splats toggle and a Fit-splats control. This is a basic preview: nearest
-  DC colour and isotropic billboards, not the full anisotropic SH renderer.
+  **Train anyway**. The trained `.ply` can be loaded into the viewport, with
+  Mesh/Splats, Fit-splats and First-person controls. The preview projects the
+  anisotropic covariance and blends DC colour; higher SH bands are not evaluated.
 
 *Start* runs the selected source. *Pause* stops consuming frames without
 losing the scanner; *Resume* continues. *Stop* ends the capture but keeps the
@@ -293,6 +295,15 @@ prove that a real room renders recognisably, which still needs a real capture.
 The synthetic fixture is harsher than a handheld scan, so the quality check
 marks this run *not trainable*; that is expected for a format smoke test, not a
 verdict on the exporter.
+
+The first real closed-loop capture (`out/closed-loop.k2df`) fused **120/120
+frames in one submap** over 31.6 s. Loop closure found **two revisits** and
+reduced cost from 0.034 to 0.000 with a largest pose change of **10 cm**; the
+exported dataset was marked *trainable*. Brush loads and trains it. A
+5,000-iteration run (60 views at 256 px, 199k seed, densified to 519,041
+splats) now shows the couch, plant and table, but it is still visibly smeared;
+a full ~30k-iteration run is the next step. The exporter now caps `init.ply` at
+250k points (the 2.24M-vertex seed made training impractically slow).
 
 The preview is rasterised on the CPU into an ordinary egui texture. That keeps
 the window independent of the GPU decoder and testable without a display; at a
@@ -560,12 +571,12 @@ platform/linux      udev rule
 cargo test -p geom -p scan --features gui
 ```
 
-207 tests (3 ignored). The geometry is tested against synthetic scenes and known
+209 tests (3 ignored). The geometry is tested against synthetic scenes and known
 transforms rather than against recorded data, so the suite runs without a
 sensor. The window's tests are headless too: they exercise the session worker,
 a synthetic scan and its export, the trainer child-process worker, the splat
-loader/renderer, and the software renderer without opening a window. Without
-`--features gui` the suite is 183 tests.
+loader/renderer, and the software renderer without opening a window. The
+non-GUI suite is 184 tests.
 
 Two tests need hardware and are ignored by default:
 

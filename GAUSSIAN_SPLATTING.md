@@ -12,9 +12,9 @@ measured on this machine unless marked otherwise.
 > sensor (optionally writing a `.k2df` as it reconstructs), replay a colour
 > recording, or run the synthetic room; it writes the dataset on Export, then
 > launches a configured Brush command as a child process, streams its log, and
-> cancels it. The Splats panel can load the trained `.ply` into a basic
-> isotropic DC preview; full anisotropic/SH rendering remains M1.6. This document marks
-> that boundary explicitly: what already lives in the window, and what should
+> cancels it. The Splats panel can load the trained `.ply` into an anisotropic
+> DC preview; higher SH bands and mesh alignment remain M1.6. This document
+> marks that boundary explicitly: what already lives in the window, and what should
 > come next.
 
 ---
@@ -66,7 +66,7 @@ live-only workflow; the old M2.4 is done.
 open the same window: live/record/replay/synthetic sources, start/pause/stop/
 reset/export, a navigable TSDF preview, the dataset field, a dataset result
 card after Export, and a Splats panel that launches a configured Brush child
-process and loads a trained `.ply` into a basic isotropic DC splat preview.
+process and loads a trained `.ply` into an anisotropic DC splat preview.
 `Scanner::quality` marks unmerged submaps or heavy frame loss as not trainable
 before the panel starts a trainer.
 
@@ -92,9 +92,9 @@ reduce drift — see §5, M2.
   has no dataset to write. `live --color`, `record --color` and the synthetic
   room do. The window checks live and Record at Start and rejects a depth-only
   replay before it starts.
-- **The splat preview is basic.** It loads Brush's `.ply` and renders sorted,
-  alpha-blended isotropic DC billboards. Full anisotropic covariance, higher SH
-  bands, and a verified pose/scale match with the mesh remain M1.6.
+- **The splat preview is anisotropic but DC-only.** It loads Brush's `.ply`,
+  projects the full 2D covariance, and alpha-blends sorted billboards. Higher SH
+  bands and a verified pose/scale match with the mesh remain M1.6.
 - **The paths are still text fields.** The dataset and recording paths are
   preflighted at Start, but there is no native folder picker yet; that is the
   one M0 item left.
@@ -249,15 +249,16 @@ scan. Do not tune acceptance thresholds against it.
 Ordered by what unblocks the most. Each milestone has a definition of done that
 is a measurement, not a feeling.
 
-**Three tracks, because they need different things.** M1's real half needs the
-Kinect; Brush is built and the synthetic half is proven. **M0 and M2.1b do not
-need hardware.** M2.1b is now in: 150/150 frames land in 19 submaps, and a
-synthetic front-side-return test proves the loop edge moves a submap and rebuilds
-one model; a real capture with a genuine loop is still needed for the real-data
-case. The next pose work is that capture, then M2.2 drift. If the sensor is not
-on the desk, the M0 folder picker and M1.5's interactive click-through remain;
-the basic M1.6 preview is in, while full anisotropic/SH alignment needs a
-trained result and a real mesh comparison.
+**Three tracks, because they need different things.** The real capture and the
+real loop are now in: 120/120 frames, one submap, two revisits, a 10 cm pose
+correction and a trainable dataset. What remains on M1 is visual Brush quality,
+not format or poses. M2.1b's synthetic front-side-return test still covers the
+submap-boundary plumbing; `out/room.k2df` still has 19 fragments because it
+never revisits. The next pose work is M2.2 drift on the closed-loop capture,
+then an exact-return capture for ground truth. Without the sensor, the M0
+folder picker and M1.5's interactive click-through remain; the M1.6 preview is
+now anisotropic, while higher SH bands and a verified mesh/splat alignment
+remain.
 
 ### M0 — Finish the dataset side of the window (done, except the folder picker)
 
@@ -295,18 +296,26 @@ what remains is a real capture.
    dataset, and the installed `brush-cli` loaded it, trained 100 iterations and
    exported a 504,178-splat PLY. The same run crossed a submap boundary, so the
    parse covers a two-fragment dataset too.
-2. **Real capture.** Plug in the Kinect and take a short colour scan, either
-   from the CLI:
-   `scan live --color --dataset out/ds --frames 60 --out out/ds_scan.ply`
-   or from the window: **Live** + **Colour** + dataset directory, Start, Export.
-3. Point Brush at a real `out/ds` and train.
+2. **Real capture — done.** The first deliberate closed-loop scan is
+   `out/closed-loop.k2df`: 120 frames over 31.6 s, **120/120 fused in one
+   submap**, 120 colour views kept. Loop closure found two revisits and the
+   dataset passed the quality gate.
+3. **Real Brush train — format done, visual still early.** Brush loads the real
+   dataset and trains. A 100-iteration run on the 2.24 M-vertex seed, a
+   1,000-iteration run on a decimated seed, and a 5,000-iteration run on 60
+   views at 256 px all export valid PLYs. The 5k run densified to **519,041
+   splats** and now shows the couch, plant and table, but it is still visibly
+   smeared; a full ~30k run is the next training step. The 2.24 M seed made
+   training impractically slow, so the exporter now voxel-caps `init.ply` at
+   **250,000 points** (the real capture produced 173,784).
 
 **Done when:** a real capture loads without error and produces a `.ply` of
-splats that renders recognisably. Expect it to look *wrong* — poses drift — but
-it must be recognisably the room. The synthetic half is already done.
+splats that renders recognisably. The load/export half is done; the
+recognisable-render half is **not**. Short runs still look muddy, which is a
+training/seed-density problem rather than a format problem.
 
-*Also do:* a 60-frame scan is the right size. Do not spend 300 frames before the
-round trip is proven.
+*Also do:* 60–120 frames is the right size. The first real capture used 120;
+the lower bound is for quicker iterations, not a correctness requirement.
 
 ### M1.5 — A trainer job in the window
 
@@ -340,30 +349,33 @@ half; the synthetic Brush run covers the command half.
 Cancel actually stops the child process, and the output path is reported. The
 viewport does not have to show the splats yet.
 
-### M1.6 — Show the trained splats (basic implemented)
+### M1.6 — Show the trained splats (anisotropic preview implemented)
 
 The current viewport is still a CPU rasteriser, but the Splats panel can now
 load a Brush `.ply` and display it. `gui/splat.rs` parses the binary
-little-endian 3DGS layout, decodes log scales, logit opacity and the DC colour
-term, and ignores the 45 `f_rest` fields. `gui/render.rs::render_splats` sorts
-the splats far-to-near and alpha-blends **isotropic circular billboards** using
-the largest linear axis as the screen radius. The viewport has a Mesh/Splats
-toggle and a Fit-splats button.
+little-endian 3DGS layout, decodes log scales, the quaternion, logit opacity
+and the DC colour term, and ignores the 45 `f_rest` fields.
+`gui/render.rs::render_splats` projects `R diag(s²) Rᵀ` through the perspective
+Jacobian, sorts far-to-near, and alpha-blends the resulting **2×2 anisotropic
+Gaussian** footprints. The viewport has Mesh/Splats, Fit-splats and
+First-person controls; a scan that contains the origin opens at the scanner's
+first-person view.
 
-Measured on the synthetic Brush export (504,178 splats):
+Measured with real Brush exports:
 
-| Operation | Debug | Release |
-| --- | --- | --- |
-| Load and decode the PLY | 0.86 s | not separately measured |
-| Render 320×240 | 2.97 s | **336 ms** |
+| Operation | Release |
+| --- | --- |
+| Load/decode 2.24 M splats | **0.47 s** |
+| Render 199 k splats at 640×480 | **0.93 s** |
+| Render 2.24 M splats at 640×480, first-person | **3.37 s** |
 
 The render only runs when the camera changes, so this is usable as a static
 preview, not a real-time splat renderer.
 
-**Still open:** the isotropic footprint ignores the quaternion and the true 2D
-covariance, only the DC SH band is used, coordinates are displayed as exported
-with no verified alignment to the scanner mesh, and sorting/blending are CPU
-only. The done condition below is therefore **not yet met**:
+**Still open:** only the DC SH band is used, coordinates are displayed as
+exported with no verified alignment to the scanner mesh, and sorting/blending
+are CPU only. A 100-iteration Brush run on the real capture is still muddy, so
+the done condition below is **not yet met**:
 
 **Done when:** the window shows the trained result beside the mesh it came from,
 and the two agree on pose and scale.
@@ -492,23 +504,37 @@ returned front view 20 cm to the right form three submaps. Loop closure verifies
 the return, the boundary edge is skipped, and the pose graph moves the third
 submap by 0.1995 m and rebuilds one model. That is the plumbing working.
 
-The remaining limitation is real data. Loop closure on `out/room.k2df` verifies
-no revisits, so its 19 fragments stay at their candidate-pose origins and the
-exported mesh is 5.66 M vertices / 10.1 M triangles with an 8.05 x 5.43 x 5.44 m
-extent — a set of locally clean fragments, not a single room. A real capture
-that returns somewhere it has already been is still needed.
+The real-data gap is now partly closed. A deliberate 120-frame, 31.6 s closed
+loop (`out/closed-loop.k2df`) produced:
 
-**Still needed: a capture with ground truth.** A deliberate slow walk out and
-back is the single most valuable piece of test data this project could have; every
-pose number in this document is currently unfalsifiable without it.
+| Metric | Result |
+| --- | --- |
+| fused / skipped | **120 / 0** |
+| submaps | **1** |
+| colour views | 120 kept, 0 dropped |
+| loop revisits | **2** |
+| pose-graph cost | 0.034 → 0.000 in 3 iterations |
+| largest pose change | **10.0 cm** |
+| rebuilt model | yes |
+| quality | **trainable** |
 
-**M2.2 — Then drift.** Frame-to-model is implemented but **not yet shown to
-help, and on this recording it does worse** — it locks out three frames earlier
-than the baseline. That is expected while the render-based target is less
-forgiving than a raw frame, and it is why M2.1 comes first. On 20 real frames it
-fuses 18/20 and ends 0.393 m from origin against the baseline's 20/20 and
-0.544 m — suggestive, not conclusive, because neither is ground truth. Current
-state on the synthetic trajectory:
+The final pose is 0.555 m from the start, but the last colour frame is a
+different close-up of the table, not an exact return, so that is path end
+distance rather than pure drift. `out/room.k2df` still verifies no revisits and
+remains 19 fragments; the new capture is the real merge case.
+
+**Still needed: an exact return/ground truth.** Return the camera to the same
+pose, ideally with a fixed marker or measured baseline, to separate residual
+drift from “the operator ended somewhere near the start.” Every absolute pose
+number in this document still lacks that reference.
+
+**M2.2 — Then drift.** Frame-to-model is implemented but **does worse on the old
+20-frame recording**: 18/20 fused and 0.393 m from origin against the
+frame-to-frame baseline's 20/20 and 0.544 m. That is suggestive, not conclusive,
+and it is why the new closed-loop capture matters. Its baseline is 120/120
+fused, two revisits, a 10 cm correction and 0.555 m end distance. Running the
+same capture with `--frame-to-model` and comparing those numbers is the next
+measurement. Current synthetic state:
 
 ```
 frame_to_model=false: fused 41/41, mean inlier 0.937   (synthetic, harsh)
@@ -516,14 +542,14 @@ frame_to_model=true:  fused 18/40, mean inlier 0.683
 ```
 
 The `frame_to_model_drifts_less_than_frame_to_frame` test is `#[ignore]`d with
-those numbers. Two things to try, in order:
+those numbers. The TSDF-gradient normal step is **already done**:
+`TsdfVolume::raycast` returns gradient normals and `Odometry::render` passes
+them through `from_image_with_normals`. The remaining problem is target
+coverage, not normal construction. Two things to try, in order:
 
-- **Make the render denser.** It is accurate (0.16 mm) and about as complete as
-  the source frame, but "about as complete" still costs correspondences, and the
-  gates were tuned for two equally complete frames. Feeding the **TSDF gradient**
-  as the render's normals instead of cross products would help twice: gradient
-  normals are defined wherever the field is observed (no four-neighbour
-  requirement) and they are better conditioned than depth-image normals.
+- **Normalise the inlier gate by target coverage.** A target covering 80% of
+  the image cannot reach a 100% inlier ratio; lowering a fixed threshold until
+  a test passes is not the fix.
 - **Then decide whether the gates should be mode-aware.** A frame whose target
   covers 80% of the image cannot achieve a 100% inlier ratio. Normalising the
   inlier gate by target coverage is principled; lowering a threshold until a test

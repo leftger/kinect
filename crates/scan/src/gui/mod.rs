@@ -33,6 +33,7 @@ use eframe::egui;
 use geom::coloring::ColorMode;
 use geom::export::MeshFormat;
 use geom::tsdf::TsdfParams;
+use nalgebra::Vector3;
 
 use crate::{Options, DEFAULT_FRAMES};
 
@@ -822,6 +823,11 @@ impl ScannerApp {
                     self.camera.fit(bounds.0, bounds.1);
                     self.dirty = true;
                 }
+                if ui.button("First-person").clicked() {
+                    self.camera
+                        .look_from(Vector3::zeros(), Vector3::new(0.0, 0.0, 2.0));
+                    self.dirty = true;
+                }
             });
         }
 
@@ -956,7 +962,17 @@ impl ScannerApp {
 
         match SplatCloud::load(Path::new(path)) {
             Ok(cloud) => {
-                self.camera.fit(cloud.bounds.0, cloud.bounds.1);
+                let (min, max) = cloud.bounds;
+                let contains_origin = min
+                    .iter()
+                    .zip(max.iter())
+                    .all(|(min, max)| *min <= 0.0 && *max >= 0.0);
+                if contains_origin {
+                    self.camera
+                        .look_from(Vector3::zeros(), Vector3::new(0.0, 0.0, 2.0));
+                } else {
+                    self.camera.fit(min, max);
+                }
                 self.splat = Some(cloud);
                 self.show_splats = true;
                 self.dirty = true;

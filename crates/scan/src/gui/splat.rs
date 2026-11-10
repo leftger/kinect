@@ -11,17 +11,19 @@ use std::fs::File;
 use std::io::{BufRead, BufReader, Read};
 use std::path::Path;
 
-use nalgebra::Vector3;
+use nalgebra::{Quaternion, UnitQuaternion, Vector3};
 
 /// `1 / sqrt(4 pi)`, the SH DC scale used by 3DGS.
 const SH_C0: f32 = 0.282_094_8;
 
-/// One splat after the PLY's log-scale and logit-opacity fields are decoded.
+/// One splat after the PLY's log-scale, quaternion and logit-opacity fields
+/// are decoded.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Splat {
     pub position: Vector3<f32>,
-    /// Largest linear axis, used as an isotropic screen-space radius.
-    pub scale: f32,
+    /// Linear standard deviations along the splat's local axes.
+    pub scale: Vector3<f32>,
+    pub rotation: UnitQuaternion<f32>,
     pub opacity: f32,
     pub color: [f32; 3],
 }
@@ -106,6 +108,12 @@ impl SplatCloud {
         let y = offset("y")?;
         let z = offset("z")?;
         let scale = [offset("scale_0")?, offset("scale_1")?, offset("scale_2")?];
+        let rotation = [
+            offset("rot_0")?,
+            offset("rot_1")?,
+            offset("rot_2")?,
+            offset("rot_3")?,
+        ];
         let opacity = offset("opacity")?;
         let color = [offset("f_dc_0")?, offset("f_dc_1")?, offset("f_dc_2")?];
 
@@ -141,16 +149,22 @@ impl SplatCloud {
         for vertex in 0..vertex_count {
             let base = vertex * stride;
             let position = Vector3::new(float(base, x), float(base, y), float(base, z));
-            let log_scales = [
-                float(base, scale[0]),
-                float(base, scale[1]),
-                float(base, scale[2]),
-            ];
-            let linear_scale = log_scales
-                .into_iter()
-                .map(f32::exp)
-                .filter(|value| value.is_finite() && *value > 0.0)
-                .fold(0.0f32, f32::max);
+            let linear_scale = Vector3::new(
+                float(base, scale[0]).exp(),
+                float(base, scale[1]).exp(),
+                float(base, scale[2]).exp(),
+            );
+            let quaternion = Quaternion::new(
+                float(base, rotation[0]),
+                float(base, rotation[1]),
+                float(base, rotation[2]),
+                float(base, rotation[3]),
+            );
+            let rotation = if quaternion.norm() > 1e-6 {
+                UnitQuaternion::new_normalize(quaternion)
+            } else {
+                UnitQuaternion::identity()
+            };
             let logit = float(base, opacity);
             let opacity = 1.0 / (1.0 + (-logit).exp());
             let rgb = [
@@ -161,8 +175,9 @@ impl SplatCloud {
 
             if !position.iter().all(|value| value.is_finite())
                 || !opacity.is_finite()
-                || linear_scale <= 0.0
-                || !linear_scale.is_finite()
+                || linear_scale
+                    .iter()
+                    .any(|value| !value.is_finite() || *value <= 0.0)
             {
                 continue;
             }
@@ -172,6 +187,7 @@ impl SplatCloud {
             splats.push(Splat {
                 position,
                 scale: linear_scale,
+                rotation,
                 opacity: opacity.clamp(0.0, 1.0),
                 color: rgb,
             });
@@ -211,6 +227,10 @@ property float scale_0
 property float scale_1
 property float scale_2
 property float opacity
+property float rot_0
+property float rot_1
+property float rot_2
+property float rot_3
 property float f_dc_0
 property float f_dc_1
 property float f_dc_2
@@ -226,14 +246,24 @@ end_header
     #[test]
     fn loads_the_dc_colour_scale_and_opacity() {
         let path = temp_file("load");
-        write_ply(&path, &[1.0, 2.0, 3.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]);
+        write_ply(
+            &path,
+            &[
+                1.0, 2.0, 3.0, // position
+                0.0, 0.0, 0.0, // log scales
+                0.0, // opacity logit
+                1.0, 0.0, 0.0, 0.0, // identity quaternion
+                0.0, 0.0, 0.0, // DC colour
+            ],
+        );
 
         let cloud = SplatCloud::load(&path).expect("load");
 
         assert_eq!(cloud.len(), 1);
         let splat = cloud.splats[0];
         assert!((splat.position - Vector3::new(1.0, 2.0, 3.0)).norm() < 1e-6);
-        assert!((splat.scale - 1.0).abs() < 1e-6);
+        assert!((splat.scale - Vector3::new(1.0, 1.0, 1.0)).norm() < 1e-6);
+        assert!((splat.rotation.w - 1.0).abs() < 1e-6);
         assert!((splat.opacity - 0.5).abs() < 1e-6);
         assert!((splat.color[0] - 0.5).abs() < 1e-6);
         assert!((cloud.bounds.0 - Vector3::new(1.0, 2.0, 3.0)).norm() < 1e-6);

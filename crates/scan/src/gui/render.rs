@@ -12,7 +12,7 @@
 //! them, and flat-lit otherwise.
 
 use geom::mesh::Mesh;
-use nalgebra::Vector3;
+use nalgebra::{Matrix2x3, Matrix3, Vector3};
 
 use super::splat::SplatCloud;
 
@@ -123,6 +123,16 @@ impl Camera {
 
         self.target = center;
         self.distance = (extent * 0.5 / half_fov * 1.25).clamp(0.2, 1_000.0);
+    }
+
+    /// Place the camera at `eye`, looking towards `target`.
+    pub fn look_from(&mut self, eye: Vector3<f32>, target: Vector3<f32>) {
+        self.target = target;
+        let offset = eye - target;
+        self.distance = offset.norm().max(0.05);
+        let direction = offset / self.distance;
+        self.pitch = (-direction.y).asin().clamp(-1.45, 1.45);
+        self.yaw = direction.x.atan2(direction.z);
     }
 
     fn basis(&self) -> (Vector3<f32>, Vector3<f32>, Vector3<f32>) {
@@ -265,16 +275,20 @@ impl Renderer {
         &self.rgba
     }
 
-    /// Render a trained splat cloud as sorted, alpha-blended circular billboards.
+    /// Render a trained splat cloud as sorted, alpha-blended anisotropic
+    /// billboards.
     ///
-    /// This is a deliberately conservative viewer: each splat uses its largest
-    /// linear axis as an isotropic screen radius. It does not reconstruct the
-    /// full anisotropic covariance or evaluate higher SH bands. The point is to
-    /// see the trained result beside the mesh and check pose and scale, not to
-    /// claim a production 3DGS renderer.
+    /// The 3D covariance `R diag(s^2) R^T` is projected through the perspective
+    /// Jacobian, and each covered pixel evaluates the resulting 2x2 Gaussian.
+    /// Higher SH bands are still ignored: the colour is the DC term only.
     pub fn render_splats(&mut self, cloud: &SplatCloud, camera: &Camera) -> &[u8] {
         self.clear_background();
         let view = camera.view(self.width, self.height);
+        let view_rotation = Matrix3::from_rows(&[
+            view.right.transpose(),
+            view.up.transpose(),
+            view.forward.transpose(),
+        ]);
 
         let mut order: Vec<(f32, usize)> = cloud
             .splats
@@ -290,11 +304,46 @@ impl Renderer {
         for (z, index) in order {
             let splat = &cloud.splats[index];
             let delta = splat.position - view.eye;
-            let sx = view.cx + view.focal * delta.dot(&view.right) / z;
-            let sy = view.cy - view.focal * delta.dot(&view.up) / z;
-            let sigma = (view.focal * splat.scale / z).clamp(0.5, 48.0);
-            let radius = (sigma * 3.0).ceil();
-            let sigma_inv = 1.0 / (sigma * sigma);
+            let x = delta.dot(&view.right);
+            let y = delta.dot(&view.up);
+            let sx = view.cx + view.focal * x / z;
+            let sy = view.cy - view.focal * y / z;
+
+            let rotation = splat.rotation.to_rotation_matrix();
+            let rotation = rotation.matrix();
+            let scale = splat.scale;
+            let covariance = rotation
+                * Matrix3::from_diagonal(&Vector3::new(
+                    scale.x * scale.x,
+                    scale.y * scale.y,
+                    scale.z * scale.z,
+                ))
+                * rotation.transpose();
+            let camera_covariance = view_rotation * covariance * view_rotation.transpose();
+
+            let inv_z = 1.0 / z;
+            let jacobian = Matrix2x3::new(
+                view.focal * inv_z,
+                0.0,
+                -view.focal * x * inv_z * inv_z,
+                0.0,
+                -view.focal * inv_z,
+                view.focal * y * inv_z * inv_z,
+            );
+            let projected = jacobian * camera_covariance * jacobian.transpose();
+            let a = projected[(0, 0)] + 0.3;
+            let b = projected[(0, 1)];
+            let c = projected[(1, 1)] + 0.3;
+            let determinant = a * c - b * b;
+            if !determinant.is_finite() || determinant <= 1e-8 {
+                continue;
+            }
+
+            let inv_a = c / determinant;
+            let inv_b = -b / determinant;
+            let inv_c = a / determinant;
+            let largest = 0.5 * (a + c + ((a - c) * (a - c) + 4.0 * b * b).sqrt());
+            let radius = (3.0 * largest.max(0.0).sqrt()).clamp(0.5, 64.0);
 
             let x0 = ((sx - radius).floor() as isize).max(0);
             let x1 = ((sx + radius).ceil() as isize).min(self.width as isize - 1);
@@ -308,7 +357,8 @@ impl Renderer {
                 let dy = py as f32 + 0.5 - sy;
                 for px in x0..=x1 {
                     let dx = px as f32 + 0.5 - sx;
-                    let alpha = splat.opacity * (-0.5 * (dx * dx + dy * dy) * sigma_inv).exp();
+                    let power = -0.5 * (inv_a * dx * dx + 2.0 * inv_b * dx * dy + inv_c * dy * dy);
+                    let alpha = splat.opacity * power.exp();
                     if alpha <= 0.001 {
                         continue;
                     }
@@ -546,6 +596,7 @@ impl Renderer {
 mod tests {
     use super::*;
     use crate::gui::splat::Splat;
+    use nalgebra::UnitQuaternion;
 
     fn camera_looking_at(target: Vector3<f32>, distance: f32) -> Camera {
         Camera {
@@ -654,7 +705,8 @@ mod tests {
         let cloud = SplatCloud {
             splats: vec![Splat {
                 position,
-                scale: 0.1,
+                scale: Vector3::new(0.1, 0.1, 0.1),
+                rotation: UnitQuaternion::identity(),
                 opacity: 1.0,
                 color: [1.0, 0.0, 0.0],
             }],
@@ -678,7 +730,8 @@ mod tests {
         let cloud = SplatCloud {
             splats: vec![Splat {
                 position,
-                scale: 0.1,
+                scale: Vector3::new(0.1, 0.1, 0.1),
+                rotation: UnitQuaternion::identity(),
                 opacity: 1.0,
                 color: [1.0, 0.0, 0.0],
             }],
@@ -704,18 +757,50 @@ mod tests {
         let path = std::env::var("SCAN_SPLAT_PLY").expect("SCAN_SPLAT_PLY");
         let cloud = SplatCloud::load(std::path::Path::new(&path)).expect("load Brush PLY");
         let mut camera = Camera::default();
-        camera.fit(cloud.bounds.0, cloud.bounds.1);
+        let (min, max) = cloud.bounds;
+        let contains_origin = min
+            .iter()
+            .zip(max.iter())
+            .all(|(min, max)| *min <= 0.0 && *max >= 0.0);
+        if contains_origin {
+            camera.look_from(Vector3::zeros(), Vector3::new(0.0, 0.0, 2.0));
+        } else {
+            camera.fit(min, max);
+        }
 
-        let mut renderer = Renderer::new(320, 240);
+        const WIDTH: usize = 640;
+        const HEIGHT: usize = 480;
+        let mut renderer = Renderer::new(WIDTH, HEIGHT);
         let started = Instant::now();
         let rgba = renderer.render_splats(&cloud, &camera);
         println!(
-            "rendered {} splats at 320x240 in {:?}",
+            "rendered {} splats at {WIDTH}x{HEIGHT} in {:?}",
             cloud.len(),
             started.elapsed()
         );
 
-        assert_eq!(rgba.len(), 320 * 240 * 4);
+        assert_eq!(rgba.len(), WIDTH * HEIGHT * 4);
         assert!(rgba.chunks_exact(4).all(|pixel| pixel[3] == 255));
+
+        if let Ok(ppm) = std::env::var("SCAN_SPLAT_PPM") {
+            use std::io::Write;
+
+            let mut file = std::fs::File::create(&ppm).expect("create PPM");
+            write!(file, "P6\n{WIDTH} {HEIGHT}\n255\n").expect("PPM header");
+            for pixel in rgba.chunks_exact(4) {
+                file.write_all(&pixel[..3]).expect("PPM pixel");
+            }
+        }
+    }
+
+    #[test]
+    fn looking_from_a_pose_puts_the_eye_there() {
+        let eye = Vector3::new(1.0, 2.0, 3.0);
+        let target = Vector3::new(0.0, 0.0, 2.0);
+        let mut camera = Camera::default();
+        camera.look_from(eye, target);
+
+        assert!((camera.target - target).norm() < 1e-6);
+        assert!((camera.eye() - eye).norm() < 1e-4);
     }
 }

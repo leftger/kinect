@@ -58,16 +58,22 @@
 //! but mixing a flipped point cloud with unflipped images would not train at
 //! all. So this module writes everything unflipped, and says so.
 
+use geom::Intrinsics;
 use geom::coloring::ColorView;
 use geom::mesh::save_colored_points_ply;
 use geom::png;
-use geom::Intrinsics;
-use nalgebra::Isometry3;
+use nalgebra::{Isometry3, Vector3};
+use std::collections::HashSet;
 use std::fs;
 use std::io::{self, ErrorKind};
 use std::path::{Path, PathBuf};
 
 use crate::scanner::Scanner;
+
+/// A full TSDF surface can have millions of vertices. Training one Gaussian per
+/// vertex makes Brush slow and over-dense, so the seed cloud is voxel-decimated
+/// to this many points at most.
+const MAX_INIT_POINTS: usize = 250_000;
 
 /// Images live here. The trainer resolves each frame's `file_path` against the
 /// directory holding `transforms.json`.
@@ -133,9 +139,17 @@ pub fn write_dataset(scanner: &Scanner, dir: &Path) -> io::Result<DatasetReport>
     // un-mirroring it again first, and the mirror is exactly the thing this
     // module exists to keep away from the dataset.
     let mesh = scanner.mesh();
-    let points = mesh.vertices.len();
+    let source_points = mesh.vertices.len();
+    let (seed, seed_colors) =
+        decimate_init(&mesh.vertices, mesh.colors.as_deref(), MAX_INIT_POINTS);
+    let points = seed.len();
+    if source_points > points {
+        println!(
+            "[scan] init cloud: {points} of {source_points} vertices (capped at {MAX_INIT_POINTS})"
+        );
+    }
     if points > 0 {
-        save_colored_points_ply(&dir.join(INIT_PLY), &mesh.vertices, mesh.colors.as_deref())?;
+        save_colored_points_ply(&dir.join(INIT_PLY), &seed, seed_colors.as_deref())?;
     } else {
         println!("[scan] no surface to seed the splats with; the trainer will start from its own");
     }
@@ -149,6 +163,62 @@ pub fn write_dataset(scanner: &Scanner, dir: &Path) -> io::Result<DatasetReport>
         points,
         skipped,
     })
+}
+
+/// Keep at most `max_points` seed vertices by taking the first vertex in each
+/// voxel. The voxel starts at 2 cm and is enlarged until the cloud fits.
+fn decimate_init(
+    points: &[Vector3<f32>],
+    colors: Option<&[[u8; 3]]>,
+    max_points: usize,
+) -> (Vec<Vector3<f32>>, Option<Vec<[u8; 3]>>) {
+    let max_points = max_points.max(1);
+    let colors = colors.filter(|colors| colors.len() == points.len());
+    if points.len() <= max_points {
+        return (points.to_vec(), colors.map(|colors| colors.to_vec()));
+    }
+
+    let mut voxel = 0.02f32;
+    for _ in 0..12 {
+        let inverse = 1.0 / voxel;
+        let mut seen = HashSet::new();
+        let mut kept = Vec::new();
+        let mut kept_colors = colors.map(|_| Vec::new());
+
+        for (index, point) in points.iter().enumerate() {
+            let key = [
+                (point.x * inverse).floor() as i32,
+                (point.y * inverse).floor() as i32,
+                (point.z * inverse).floor() as i32,
+            ];
+            if !seen.insert(key) {
+                continue;
+            }
+            kept.push(*point);
+            if let (Some(colors), Some(kept_colors)) = (colors, kept_colors.as_mut()) {
+                kept_colors.push(colors[index]);
+            }
+        }
+
+        if kept.len() <= max_points || kept.len() == points.len() {
+            return (kept, kept_colors);
+        }
+        voxel *= 1.25;
+    }
+
+    // A pathological cloud can still miss the target after enlarging the
+    // voxels. A uniform stride is coarse, but it is bounded and never worse
+    // than handing the trainer millions of points.
+    let stride = points.len().div_ceil(max_points);
+    let mut kept = Vec::new();
+    let mut kept_colors = colors.map(|_| Vec::new());
+    for (index, point) in points.iter().enumerate().step_by(stride) {
+        kept.push(*point);
+        if let (Some(colors), Some(kept_colors)) = (colors, kept_colors.as_mut()) {
+            kept_colors.push(colors[index]);
+        }
+    }
+    (kept, kept_colors)
 }
 
 /// Write one image and one mask per view, and describe each as a frame entry.
@@ -464,7 +534,11 @@ mod tests {
             ),
             // A compound rotation: no single axis, so a wrong-handed conversion
             // cannot pass by symmetry.
-            pose(Vector3::new(1.0, 2.0, -3.0), 2.1, Vector3::new(0.7, -0.3, 1.4)),
+            pose(
+                Vector3::new(1.0, 2.0, -3.0),
+                2.1,
+                Vector3::new(0.7, -0.3, 1.4),
+            ),
         ];
 
         for original in poses {
@@ -522,9 +596,12 @@ mod tests {
         let views: Vec<_> = poses.iter().map(|p| view(*p, 0)).collect();
 
         let dir = TempDir::new("poses");
-        let (frames, skipped) =
-            write_views(&views, &dir.path().join("images"), &dir.path().join("masks"))
-                .expect("write");
+        let (frames, skipped) = write_views(
+            &views,
+            &dir.path().join("images"),
+            &dir.path().join("masks"),
+        )
+        .expect("write");
 
         assert_eq!(skipped, 0);
         assert_eq!(frames.len(), 2);
@@ -559,9 +636,12 @@ mod tests {
         let views = vec![view(good, 0), view(broken, 0), view(good, 0)];
 
         let dir = TempDir::new("gaps");
-        let (frames, skipped) =
-            write_views(&views, &dir.path().join("images"), &dir.path().join("masks"))
-                .expect("write");
+        let (frames, skipped) = write_views(
+            &views,
+            &dir.path().join("images"),
+            &dir.path().join("masks"),
+        )
+        .expect("write");
 
         assert_eq!(skipped, 1, "the unusable pose should have been skipped");
         assert_eq!(frames.len(), 2);
@@ -916,8 +996,20 @@ mod tests {
             let image = fs::read(dir.path().join("images").join(&name)).expect("image");
             let mask = fs::read(dir.path().join("masks").join(&name)).expect("mask");
 
-            assert_eq!(png_dimensions(&image), (crate::synthetic::WIDTH as u32, crate::synthetic::HEIGHT as u32));
-            assert_eq!(png_dimensions(&mask), (crate::synthetic::WIDTH as u32, crate::synthetic::HEIGHT as u32));
+            assert_eq!(
+                png_dimensions(&image),
+                (
+                    crate::synthetic::WIDTH as u32,
+                    crate::synthetic::HEIGHT as u32
+                )
+            );
+            assert_eq!(
+                png_dimensions(&mask),
+                (
+                    crate::synthetic::WIDTH as u32,
+                    crate::synthetic::HEIGHT as u32
+                )
+            );
             assert_ne!(
                 image, mask,
                 "the mask must not be a copy of the image at {name}"
@@ -931,11 +1023,7 @@ mod tests {
         let transforms = fs::read_to_string(dir.path().join("transforms.json")).expect("json");
         assert!(transforms.contains("\"ply_file_path\""), "{transforms}");
 
-        let translations: Vec<f32> = scanner
-            .trajectory()
-            .iter()
-            .map(|p| p.norm())
-            .collect();
+        let translations: Vec<f32> = scanner.trajectory().iter().map(|p| p.norm()).collect();
         let furthest = translations.iter().copied().fold(0.0f32, f32::max);
         assert!(
             furthest > 0.2,
@@ -945,5 +1033,29 @@ mod tests {
             furthest < 3.0,
             "a pose {furthest:.3} m from the anchor is outside the room"
         );
+    }
+
+    #[test]
+    fn the_init_cloud_is_capped_by_voxels() {
+        let mut points = Vec::new();
+        let mut colors = Vec::new();
+        for x in 0..50 {
+            for y in 0..20 {
+                for z in 0..10 {
+                    points.push(Vector3::new(
+                        x as f32 * 0.01,
+                        y as f32 * 0.01,
+                        z as f32 * 0.01,
+                    ));
+                    colors.push([x as u8, y as u8, z as u8]);
+                }
+            }
+        }
+
+        let (seed, seed_colors) = decimate_init(&points, Some(&colors), 1000);
+
+        assert!(!seed.is_empty());
+        assert!(seed.len() <= 1000, "kept {} points", seed.len());
+        assert_eq!(seed_colors.as_ref().unwrap().len(), seed.len());
     }
 }
