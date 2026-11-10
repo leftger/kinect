@@ -1157,6 +1157,13 @@ impl ScannerApp {
             stat(ui, "fused", snapshot.fused.to_string());
             stat(ui, "rejected", snapshot.rejected.to_string());
             stat(ui, "submaps", snapshot.submaps.to_string());
+            let loop_text = if snapshot.loops_dropped > 0 {
+                format!("{} ({} dropped)", snapshot.loops, snapshot.loops_dropped)
+            } else {
+                snapshot.loops.to_string()
+            };
+            stat(ui, "loops", loop_text);
+            stat(ui, "loop ICP", snapshot.loop_attempts.to_string());
             stat(
                 ui,
                 "position",

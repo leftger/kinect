@@ -250,9 +250,10 @@ Ordered by what unblocks the most. Each milestone has a definition of done that
 is a measurement, not a feeling.
 
 **Three tracks, because they need different things.** The real capture and the
-real loop are now in: 120/120 frames, one submap, two revisits, a 10 cm pose
-correction and a trainable dataset. What remains on M1 is visual Brush quality,
-not format or poses. M2.1b's synthetic front-side-return test still covers the
+real loop are now in: 120/120 frames, one submap, one verified revisit, a
+10.9 cm pose correction and a trainable dataset. What remains on M1 is visual
+Brush quality, not format or poses. M2.1b's synthetic front-side-return test
+still covers the
 submap-boundary plumbing; `out/room.k2df` still has 19 fragments because it
 never revisits. The next pose work is M2.2 drift on the closed-loop capture,
 then an exact-return capture for ground truth. Without the sensor, the M0
@@ -298,8 +299,8 @@ what remains is a real capture.
    parse covers a two-fragment dataset too.
 2. **Real capture — done.** The first deliberate closed-loop scan is
    `out/closed-loop.k2df`: 120 frames over 31.6 s, **120/120 fused in one
-   submap**, 120 colour views kept. Loop closure found two revisits and the
-   dataset passed the quality gate.
+   submap**, 120 colour views kept. Loop closure found one verified revisit
+   and the dataset passed the quality gate.
 3. **Real Brush train — format done, visual still early.** Brush loads the real
    dataset and trains. A 100-iteration run on the 2.24 M-vertex seed, a
    1,000-iteration run on a decimated seed, and a 5,000-iteration run on 60
@@ -520,24 +521,36 @@ loop (`out/closed-loop.k2df`) produced:
 | fused / skipped | **120 / 0** |
 | submaps | **1** |
 | colour views | 120 kept, 0 dropped |
-| loop revisits | **2** |
-| pose-graph cost | 0.034 → 0.000 in 3 iterations |
-| largest pose change | **10.0 cm** |
+| loop revisits | **1** after keyframe thinning |
+| pose-graph cost | 0.020 → 0.000 in 3 iterations |
+| largest pose change | **10.9 cm** |
 | rebuilt model | yes |
 | quality | **trainable** |
 
-The final pose is 0.555 m from the start, but the last colour frame is a
+The final pose is 0.542 m from the start, but the last colour frame is a
 different close-up of the table, not an exact return, so that is path end
 distance rather than pure drift. `out/room.k2df` still verifies no revisits and
 remains 19 fragments; the new capture is the real merge case.
 
-A first RTAB-Map-inspired piece is in: spatial candidates are tried first, and
-only if none verifies does an appearance signature (8×8 grayscale + RGB
-histogram) propose colour keyframes outside the pose radius. The proposal still
-has to pass spatial ICP. On this capture the result is unchanged — 2 revisits,
-1 submap, 0.555 m, trainable — which is the intended safe behaviour; the path is
-for loops where drift has moved the pose estimate outside `search_radius`.
-`SCAN_DEBUG_LOOPS=1` prints spatial/appearance candidates and ICP outcomes.
+The RTAB-Map-inspired loop slice is now broader:
+
+- Spatial candidates are tried first; only if none verifies does an appearance
+  signature (8×8 grayscale + RGB histogram) propose colour keyframes outside
+  the pose radius.
+- Loop keyframes are thinned to 2 cm / 3° of motion, with a five-frame fallback,
+  so a submap reset cannot starve the loop index.
+- Accepted loops must align in reverse; the round-trip transform is the gate.
+- Loop edges are weighted by inlier coverage and residual rather than a fixed
+  weight.
+- If the pose graph wants an implausible correction, the weakest loop is
+  dropped and the graph is retried. `ClosureReport` and the window telemetry
+  report loops kept, loops dropped, and ICP attempts.
+
+After that change the real capture gives **1 revisit, 1 submap, 0.542 m,
+trainable**. It is slightly different from the older 2-revisit/0.555 m result
+because the thinned keyframe set no longer contains the second revisited pair;
+the correction is still coherent. `SCAN_DEBUG_LOOPS=1` prints candidate and ICP
+details.
 
 **Still needed: an exact return/ground truth.** Return the camera to the same
 pose, ideally with a fixed marker or measured baseline, to separate residual

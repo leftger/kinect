@@ -30,13 +30,13 @@
 
 mod capture;
 mod dataset;
+#[cfg(feature = "gui")]
+mod gui;
 mod loop_closure;
 mod odometry;
 mod recording;
 mod scanner;
 mod synthetic;
-#[cfg(feature = "gui")]
-mod gui;
 #[cfg(feature = "wgpu-decode")]
 mod wgpu_depth;
 
@@ -290,16 +290,14 @@ fn parse_args(
                     "--dataset needs --color: the dataset is built from the colour views, \
                      and a depth-only scan has none"
                         .into(),
-                )
+                );
             }
-            Command::Record => {
-                return Err(
-                    "--dataset cannot be used with `record`: a record run only writes a capture file. \
+            Command::Record => return Err(
+                "--dataset cannot be used with `record`: a record run only writes a capture file. \
                      Use `live --color --dataset DIR`, or replay a colour recording with \
                      `scan replay --in FILE --dataset DIR`"
-                        .into(),
-                )
-            }
+                    .into(),
+            ),
             // `replay` is allowed with `--dataset`; the recording itself is checked in
             // `replay()` to ensure it carries a colour stream.
             Command::Replay => {}
@@ -579,7 +577,11 @@ async fn record(options: &Options) -> Result<(), Box<dyn Error>> {
         .unwrap_or_else(|| PathBuf::from("capture.k2df"));
 
     let color_enabled = options.color;
-    let drain = if color_enabled { false } else { options.drain_color };
+    let drain = if color_enabled {
+        false
+    } else {
+        options.drain_color
+    };
     let mut capture =
         capture::Capture::open(options.filters, color_enabled || drain, options.gpu).await?;
     let intrinsics = capture.intrinsics();
@@ -587,8 +589,15 @@ async fn record(options: &Options) -> Result<(), Box<dyn Error>> {
 
     let mut writer =
         recording::FrameWriter::create_with_color(&out, intrinsics, width, height, color_enabled)?;
-    let mode_desc = if color_enabled { "depth + colour" } else { "depth" };
-    println!("[scan] recording {frames} {mode_desc} frames to {}", out.display());
+    let mode_desc = if color_enabled {
+        "depth + colour"
+    } else {
+        "depth"
+    };
+    println!(
+        "[scan] recording {frames} {mode_desc} frames to {}",
+        out.display()
+    );
 
     let started = std::time::Instant::now();
     for index in 1..=frames {
@@ -643,9 +652,7 @@ fn replay(options: &Options) -> Result<(), Box<dyn Error>> {
         recording.intrinsics.cy
     );
     if !recording.has_color && options.color {
-        println!(
-            "[scan] this .k2df recording has no colour stream; painting is unavailable"
-        );
+        println!("[scan] this .k2df recording has no colour stream; painting is unavailable");
     }
     if !recording.has_color && options.dataset.is_some() {
         return Err(
@@ -669,12 +676,8 @@ fn replay(options: &Options) -> Result<(), Box<dyn Error>> {
             gain: c.gain,
             gamma: c.gamma,
         });
-        let report = scanner.add_frame_with_color(
-            &frame.depth,
-            recording.width,
-            recording.height,
-            color,
-        );
+        let report =
+            scanner.add_frame_with_color(&frame.depth, recording.width, recording.height, color);
         print_progress(index + 1, &report);
     }
 
@@ -762,8 +765,14 @@ fn report_tracking_error(scanner: &Scanner, shots: &[synthetic::Shot]) {
 
     // The path the camera actually took, for comparison against how far the
     // tracker believes it went.
-    let truth_path: f32 = aligned.windows(2).map(|pair| (pair[1] - pair[0]).norm()).sum();
-    let lived_path: f32 = lived.windows(2).map(|pair| (pair[1] - pair[0]).norm()).sum();
+    let truth_path: f32 = aligned
+        .windows(2)
+        .map(|pair| (pair[1] - pair[0]).norm())
+        .sum();
+    let lived_path: f32 = lived
+        .windows(2)
+        .map(|pair| (pair[1] - pair[0]).norm())
+        .sum();
 
     println!(
         "[scan] ground truth: path {:.3} m tracked as {:.3} m over {} of {} frames",
@@ -821,6 +830,12 @@ pub(crate) struct FinishSummary {
     pub dataset: Option<dataset::DatasetReport>,
     /// Pre-training sanity check, including unmerged-submap warnings.
     pub quality: ScanQuality,
+    /// Loop edges kept after outlier trimming.
+    pub loops: usize,
+    /// Verified loops discarded because the correction was implausible.
+    pub loops_dropped: usize,
+    /// Spatial ICP attempts spent by the loop finder.
+    pub loop_attempts: usize,
 }
 
 /// Close loops, then write the mesh. Live, replay, and the scanner window all
@@ -848,7 +863,7 @@ fn close_loops(scanner: &mut Scanner, options: &Options) {
 
     let report = scanner.close_loops();
 
-    if report.loop_edges == 0 {
+    if report.loop_edges == 0 && report.dropped_loops == 0 {
         println!(
             "loop closure: no revisits verified over {} frames, trajectory unchanged",
             report.nodes
@@ -856,10 +871,27 @@ fn close_loops(scanner: &mut Scanner, options: &Options) {
         return;
     }
 
-    println!(
-        "loop closure: {} revisits over {} frames, cost {:.3} -> {:.3} in {} iterations",
-        report.loop_edges, report.nodes, report.cost_before, report.cost_after, report.iterations
-    );
+    if report.loop_edges == 0 {
+        println!(
+            "loop closure: all {} verified loops were discarded over {} frames",
+            report.dropped_loops, report.nodes
+        );
+    } else {
+        println!(
+            "loop closure: {} revisits over {} frames, cost {:.3} -> {:.3} in {} iterations",
+            report.loop_edges,
+            report.nodes,
+            report.cost_before,
+            report.cost_after,
+            report.iterations
+        );
+    }
+    if report.dropped_loops > 0 {
+        println!(
+            "  dropped {} weak loop(s) after an implausible correction",
+            report.dropped_loops
+        );
+    }
     println!(
         "  largest pose change {:.1} cm, {:.1} degrees",
         report.max_correction * 100.0,
@@ -1079,6 +1111,12 @@ pub(crate) fn finish(
         }
     }
 
+    let (loops, loops_dropped) = scanner
+        .closure()
+        .map(|report| (report.loop_edges, report.dropped_loops))
+        .unwrap_or((scanner.loops(), 0));
+    let loop_attempts = scanner.loop_attempts();
+
     let out = options
         .out
         .clone()
@@ -1096,6 +1134,9 @@ pub(crate) fn finish(
             mesh: None,
             dataset: None,
             quality: quality.clone(),
+            loops,
+            loops_dropped,
+            loop_attempts,
         });
     };
 
@@ -1179,6 +1220,9 @@ pub(crate) fn finish(
         mesh: mesh_summary,
         dataset: dataset_report,
         quality,
+        loops,
+        loops_dropped,
+        loop_attempts,
     })
 }
 
@@ -1318,41 +1362,46 @@ mod tests {
     fn dataset_is_refused_for_record_command() {
         let error = parse_args(words(&["record", "--dataset", "out/d"])).expect_err("record");
         assert!(
-            error.to_string().contains("--dataset cannot be used with `record`"),
+            error
+                .to_string()
+                .contains("--dataset cannot be used with `record`"),
             "{error}"
         );
     }
 
     #[test]
     fn dataset_is_allowed_for_replay_at_parse_time() {
-        let (command, options) = parse_args(words(&["replay", "--in", "capture.k2df", "--dataset", "out/d"])).expect("parse");
+        let (command, options) = parse_args(words(&[
+            "replay",
+            "--in",
+            "capture.k2df",
+            "--dataset",
+            "out/d",
+        ]))
+        .expect("parse");
         assert!(matches!(command, Command::Replay));
         assert_eq!(options.dataset, Some(PathBuf::from("out/d")));
     }
 
     #[test]
     fn relocalize_is_opt_in_and_reaches_the_scanner_config() {
-        let (_, options) =
-            parse_args(words(&["replay", "--in", "capture.k2df"])).expect("parse");
+        let (_, options) = parse_args(words(&["replay", "--in", "capture.k2df"])).expect("parse");
         assert!(!options.relocalize);
 
         let (_, options) =
-            parse_args(words(&["replay", "--in", "capture.k2df", "--relocalize"]))
-                .expect("parse");
+            parse_args(words(&["replay", "--in", "capture.k2df", "--relocalize"])).expect("parse");
         assert!(options.relocalize);
         assert!(scanner_config(&options).odometry.relocalize);
     }
 
     #[test]
     fn submaps_are_on_by_default_and_can_be_disabled() {
-        let (_, options) =
-            parse_args(words(&["replay", "--in", "capture.k2df"])).expect("parse");
+        let (_, options) = parse_args(words(&["replay", "--in", "capture.k2df"])).expect("parse");
         assert!(options.submaps);
         assert!(scanner_config(&options).submaps);
 
         let (_, options) =
-            parse_args(words(&["replay", "--in", "capture.k2df", "--no-submaps"]))
-                .expect("parse");
+            parse_args(words(&["replay", "--in", "capture.k2df", "--no-submaps"])).expect("parse");
         assert!(!options.submaps);
         assert!(!scanner_config(&options).submaps);
     }
@@ -1457,12 +1506,8 @@ mod tests {
         assert!(every.to_string().contains("at least 1"), "{every}");
 
         for value in ["-1", "nan", "inf"] {
-            let fps =
-                parse_args(words(&["gui", "--playback-fps", value])).expect_err(value);
-            assert!(
-                fps.to_string().contains("zero or more"),
-                "{value}: {fps}"
-            );
+            let fps = parse_args(words(&["gui", "--playback-fps", value])).expect_err(value);
+            assert!(fps.to_string().contains("zero or more"), "{value}: {fps}");
         }
     }
 

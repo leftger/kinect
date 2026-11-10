@@ -134,6 +134,9 @@ pub(crate) struct SessionView {
     pub fused: usize,
     pub rejected: usize,
     pub submaps: usize,
+    pub loops: usize,
+    pub loops_dropped: usize,
+    pub loop_attempts: usize,
     pub position: [f32; 3],
     pub blocks: usize,
     pub allocated_bytes: usize,
@@ -163,6 +166,9 @@ impl Default for SessionView {
             fused: 0,
             rejected: 0,
             submaps: 0,
+            loops: 0,
+            loops_dropped: 0,
+            loop_attempts: 0,
             position: [0.0; 3],
             blocks: 0,
             allocated_bytes: 0,
@@ -202,6 +208,9 @@ impl SessionView {
             fused: self.fused,
             rejected: self.rejected,
             submaps: self.submaps,
+            loops: self.loops,
+            loops_dropped: self.loops_dropped,
+            loop_attempts: self.loop_attempts,
             position: self.position,
             blocks: self.blocks,
             allocated_bytes: self.allocated_bytes,
@@ -240,6 +249,9 @@ pub(crate) struct SessionSnapshot {
     pub fused: usize,
     pub rejected: usize,
     pub submaps: usize,
+    pub loops: usize,
+    pub loops_dropped: usize,
+    pub loop_attempts: usize,
     pub position: [f32; 3],
     pub blocks: usize,
     pub allocated_bytes: usize,
@@ -519,6 +531,9 @@ fn export_scanner(scanner: &mut Scanner, options: &Options, shared: &Arc<Mutex<S
             view.status = Status::Exported;
             view.output = Some(summary.output);
             view.mesh = summary.mesh;
+            view.loops = summary.loops;
+            view.loops_dropped = summary.loops_dropped;
+            view.loop_attempts = summary.loop_attempts;
             view.dataset = summary.dataset.map(|report| DatasetSummary {
                 dir: report.dir,
                 views: report.views,
@@ -635,6 +650,8 @@ impl SessionState {
         view.fused = self.scanner.fused();
         view.rejected = self.scanner.rejected();
         view.submaps = self.scanner.submaps();
+        view.loops = self.scanner.loops();
+        view.loop_attempts = self.scanner.loop_attempts();
         view.blocks = report.blocks;
         view.allocated_bytes = report.allocated_bytes;
 

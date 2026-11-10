@@ -146,6 +146,13 @@ pub struct LoopClosureConfig {
     pub search_radius: f32,
     /// Never match against a frame this recent.
     pub min_index_gap: usize,
+    /// Build the next loop keyframe only after this much translation, in metres,
+    /// or `keyframe_min_rotation`. RTAB-Map's linear/angular update thresholds.
+    pub keyframe_min_translation: f32,
+    pub keyframe_min_rotation: f32,
+    /// Force a keyframe after this many frames even if the camera barely moved.
+    /// Submap boundaries reset the pose, so motion alone is not enough.
+    pub keyframe_max_interval: usize,
     /// How many candidates to spend ICP on per frame.
     pub max_candidates: usize,
     /// Appearance similarity that can propose a candidate whose pose is outside
@@ -155,6 +162,10 @@ pub struct LoopClosureConfig {
     pub min_inlier_ratio: f32,
     /// ...and the RMS residual they must achieve, in metres.
     pub max_rmse: f32,
+    /// A verified loop must also align in reverse. These bound the disagreement
+    /// between `T_ab` and the inverse of the reverse alignment.
+    pub reciprocal_max_translation: f32,
+    pub reciprocal_max_rotation: f32,
     /// Confidence given to a loop edge, relative to an odometry edge.
     pub edge_weight: f32,
     /// Resolution to keep keyframes at. Coarse keeps the memory per keyframe small
@@ -170,10 +181,15 @@ impl Default for LoopClosureConfig {
         Self {
             search_radius: 1.5,
             min_index_gap: 40,
+            keyframe_min_translation: 0.02,
+            keyframe_min_rotation: 0.05,
+            keyframe_max_interval: 5,
             max_candidates: 3,
             appearance_min_similarity: 0.78,
             min_inlier_ratio: 0.5,
             max_rmse: 0.03,
+            reciprocal_max_translation: 0.05,
+            reciprocal_max_rotation: 0.10,
             // Below odometry on purpose: a loop is a hypothesis, an odometry edge
             // is a measurement of something we actually saw move.
             edge_weight: 0.5,
@@ -200,12 +216,18 @@ pub struct Loop {
 
 impl Loop {
     /// The constraint, ready for a pose graph.
-    pub fn edge(&self, weight: f32) -> Edge {
+    ///
+    /// The base loop weight is scaled by both correspondence coverage and how
+    /// close the residual is to the acceptance limit. A loop that barely passed
+    /// still gets a voice, but a much quieter one than a tight fit.
+    pub fn edge(&self, base_weight: f32, max_rmse: f32) -> Edge {
+        let residual_quality = (max_rmse / self.rmse.max(1e-6)).clamp(0.0, 1.0);
+        let quality = (0.5 * self.inlier_ratio + 0.5 * residual_quality).clamp(0.1, 1.0);
         Edge {
             from: self.from,
             to: self.to,
             measurement: self.measurement,
-            weight,
+            weight: base_weight * quality,
         }
     }
 }
@@ -216,6 +238,7 @@ pub struct LoopFinder {
     keyframes: Vec<Keyframe>,
     loops: Vec<Loop>,
     attempts: usize,
+    last_keyframe: Option<Isometry3<f32>>,
 }
 
 impl LoopFinder {
@@ -225,6 +248,7 @@ impl LoopFinder {
             keyframes: Vec::new(),
             loops: Vec::new(),
             attempts: 0,
+            last_keyframe: None,
         }
     }
 
@@ -268,6 +292,23 @@ impl LoopFinder {
         points: &[Vector3<f32>],
         appearance: Option<&VisualDescriptor>,
     ) -> Option<Loop> {
+        let due = match self.keyframes.last() {
+            None => true,
+            Some(last) => {
+                index.saturating_sub(last.index) >= self.config.keyframe_max_interval.max(1)
+            }
+        };
+        if !due {
+            if let Some(last) = self.last_keyframe {
+                let motion = last.inverse() * pose;
+                if motion.translation.vector.norm() < self.config.keyframe_min_translation
+                    && motion.rotation.angle() < self.config.keyframe_min_rotation
+                {
+                    return None;
+                }
+            }
+        }
+
         let origin = Vector3::zeros();
         let cloud = IcpCloud::build(
             points,
@@ -285,6 +326,7 @@ impl LoopFinder {
             appearance: appearance.cloned(),
             cloud,
         });
+        self.last_keyframe = Some(pose);
 
         if let Some(ref loop_closure) = found {
             self.loops.push(*loop_closure);
@@ -412,6 +454,30 @@ impl LoopFinder {
                 continue;
             }
 
+            // A real place match survives being aligned in the other direction.
+            // Reverse ICP starts from the inverse of the forward result, so a
+            // one-sided surface fit shows up as a large round-trip error.
+            let reverse = align(&keyframe.cloud, cloud, result.transform.inverse(), &params);
+            let round_trip = reverse.transform * result.transform;
+            // Reverse RMSE is not a gate: a slightly noisier reverse fit with a
+            // tiny round-trip error is exactly what a correct loop looks like.
+            if reverse.inlier_ratio < self.config.min_inlier_ratio
+                || round_trip.translation.vector.norm() > self.config.reciprocal_max_translation
+                || round_trip.rotation.angle() > self.config.reciprocal_max_rotation
+            {
+                if debug {
+                    eprintln!(
+                        "[loop] reject kf {} -> {index}: reverse inliers {:.3} rmse {:.4}, round-trip {:.3} m {:.3} rad",
+                        keyframe.index,
+                        reverse.inlier_ratio,
+                        reverse.rmse,
+                        round_trip.translation.vector.norm(),
+                        round_trip.rotation.angle()
+                    );
+                }
+                continue;
+            }
+
             let candidate = Loop {
                 from: keyframe.index,
                 to: index,
@@ -437,7 +503,22 @@ impl LoopFinder {
     pub fn edges(&self) -> Vec<Edge> {
         self.loops
             .iter()
-            .map(|loop_closure| loop_closure.edge(self.config.edge_weight))
+            .map(|loop_closure| loop_closure.edge(self.config.edge_weight, self.config.max_rmse))
+            .collect()
+    }
+
+    /// Loop edges best-first, so the scanner can drop weak constraints when the
+    /// pose graph asks for an implausible correction.
+    pub fn edges_ranked(&self) -> Vec<Edge> {
+        let mut loops: Vec<&Loop> = self.loops.iter().collect();
+        loops.sort_by(|a, b| {
+            b.inlier_ratio
+                .total_cmp(&a.inlier_ratio)
+                .then_with(|| a.rmse.total_cmp(&b.rmse))
+        });
+        loops
+            .into_iter()
+            .map(|loop_closure| loop_closure.edge(self.config.edge_weight, self.config.max_rmse))
             .collect()
     }
 }
@@ -536,6 +617,57 @@ mod tests {
             "appearance should retrieve the candidate and ICP should verify it"
         );
         assert_eq!(appearance.attempts(), 1);
+    }
+
+    #[test]
+    fn nearby_frames_are_not_loop_keyframes() {
+        let world = scene();
+        let config = LoopClosureConfig {
+            keyframe_min_translation: 0.1,
+            keyframe_min_rotation: 0.2,
+            ..LoopClosureConfig::default()
+        };
+        let mut finder = LoopFinder::new(config);
+
+        finder.consider(0, at(0.0, 0.0, 0.0), &view(&world, &at(0.0, 0.0, 0.0)));
+        assert_eq!(finder.keyframes().len(), 1);
+
+        // Too little motion: this frame is not worth a cloud or a search.
+        finder.consider(1, at(0.02, 0.0, 0.0), &view(&world, &at(0.02, 0.0, 0.0)));
+        assert_eq!(finder.keyframes().len(), 1);
+
+        // Enough motion from the last keyframe: keep it.
+        finder.consider(2, at(0.2, 0.0, 0.0), &view(&world, &at(0.2, 0.0, 0.0)));
+        assert_eq!(finder.keyframes().len(), 2);
+    }
+
+    #[test]
+    fn loop_edges_are_ranked_by_quality_and_weighted_by_residual() {
+        let config = LoopClosureConfig::default();
+        let mut finder = LoopFinder::new(config);
+        finder.loops.push(Loop {
+            from: 4,
+            to: 40,
+            measurement: Isometry3::identity(),
+            inlier_ratio: 0.60,
+            rmse: 0.028,
+        });
+        finder.loops.push(Loop {
+            from: 1,
+            to: 50,
+            measurement: Isometry3::identity(),
+            inlier_ratio: 0.95,
+            rmse: 0.005,
+        });
+
+        let edges = finder.edges_ranked();
+        assert_eq!(edges.len(), 2);
+        assert_eq!(edges[0].from, 1, "the stronger loop should rank first");
+        assert!(
+            edges[0].weight > edges[1].weight,
+            "the tighter residual should carry more weight"
+        );
+        assert!(edges[0].weight <= config.edge_weight + 1e-6);
     }
 
     #[test]

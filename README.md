@@ -178,7 +178,13 @@ Useful options:
   Pose proximity proposes the normal candidates. On colour scans, if none of
   those verifies, a compact appearance signature (8x8 grayscale plus an RGB
   histogram) can propose a frame outside the pose radius, RTAB-Map style; the
-  same spatial ICP still has to accept it. On a live colour scan the colour
+  same spatial ICP still has to accept it. Loop keyframes are thinned to every
+  2 cm / 3 degrees of motion, with a five-frame fallback, so a submap reset
+  cannot starve the loop index. An accepted loop must also align in reverse,
+  and each edge is weighted by inlier coverage and residual. If the pose graph
+  asks for an implausible correction, the weakest loop is dropped and the graph
+  is retried before giving up. The window's telemetry shows loops, loop ICP
+  attempts, and dropped loops. On a live colour scan the colour
   views move onto those poses before the mesh is painted. The rebuild keeps
   every depth frame, about 850 KB each, so a
   200-frame scan holds around 170 MB of depth. Each colour view is separate:
@@ -304,9 +310,10 @@ marks this run *not trainable*; that is expected for a format smoke test, not a
 verdict on the exporter.
 
 The first real closed-loop capture (`out/closed-loop.k2df`) fused **120/120
-frames in one submap** over 31.6 s. Loop closure found **two revisits** and
-reduced cost from 0.034 to 0.000 with a largest pose change of **10 cm**; the
-exported dataset was marked *trainable*. Brush loads and trains it. A
+frames in one submap** over 31.6 s. With thinned loop keyframes, loop closure
+found **one verified revisit**, reduced cost from 0.020 to 0.000, and moved the
+largest pose by **10.9 cm**; the exported dataset was marked *trainable*. Brush
+loads and trains it. A
 5,000-iteration run (60 views at 256 px, 199k seed, densified to 519,041
 splats) now shows the couch, plant and table, but it is still visibly smeared;
 a full ~30k-iteration run is the next step. The exporter now caps `init.ply` at
@@ -578,12 +585,12 @@ platform/linux      udev rule
 cargo test -p geom -p scan --features gui
 ```
 
-211 tests (3 ignored). The geometry is tested against synthetic scenes and known
+213 tests (3 ignored). The geometry is tested against synthetic scenes and known
 transforms rather than against recorded data, so the suite runs without a
 sensor. The window's tests are headless too: they exercise the session worker,
 a synthetic scan and its export, the trainer child-process worker, the splat
 loader/renderer, and the software renderer without opening a window. The
-non-GUI suite is 186 tests.
+non-GUI suite is 188 tests.
 
 Two tests need hardware and are ignored by default:
 

@@ -106,7 +106,10 @@ pub const MAX_CORRECTION_RADIANS: f32 = 0.5;
 pub struct ClosureReport {
     pub nodes: usize,
     pub odometry_edges: usize,
+    /// Loop edges used by the final optimisation.
     pub loop_edges: usize,
+    /// Verified loops discarded because they made the correction implausible.
+    pub dropped_loops: usize,
     pub cost_before: f64,
     pub cost_after: f64,
     pub iterations: usize,
@@ -483,11 +486,12 @@ impl Scanner {
     /// Call once, after the last frame. A no-op when loop closure is disabled, or
     /// when no revisit survived verification.
     pub fn close_loops(&mut self) -> ClosureReport {
-        let loop_edges = self
+        let mut loop_edges = self
             .loops
             .as_ref()
-            .map(|finder| finder.edges())
+            .map(|finder| finder.edges_ranked())
             .unwrap_or_default();
+        let total_loops = loop_edges.len();
 
         let nodes = self.poses.len();
         // A submap boundary is a guess, not a measurement; it must not pin the
@@ -505,7 +509,8 @@ impl Scanner {
         let nothing = ClosureReport {
             nodes,
             odometry_edges,
-            loop_edges: loop_edges.len(),
+            loop_edges: total_loops,
+            dropped_loops: 0,
             cost_before: 0.0,
             cost_after: 0.0,
             iterations: 0,
@@ -523,60 +528,76 @@ impl Scanner {
             return nothing;
         }
 
-        let mut graph = PoseGraph::new(self.poses[0]);
-        for pose in &self.poses[1..] {
-            graph.add_node(*pose);
-        }
-
-        // The odometry edges are free: the tracked pose is the accumulation, so
-        // the measurement between neighbours is already encoded in the poses.
-        // A submap boundary is the exception: its relative pose is a guess, so
-        // leaving it out lets a cross-submap loop edge move the whole submap.
-        for index in 0..nodes - 1 {
-            if self
-                .pose_boundaries
-                .get(index + 1)
-                .copied()
-                .unwrap_or(false)
-            {
-                continue;
+        // Optimise, and if the result wants to move a pose further than the
+        // odometry could plausibly be wrong, discard the weakest loop and try
+        // again. One bad edge should not throw away every good correction.
+        let (graph, optimised, max_correction, max_rotation, within) = loop {
+            let mut graph = PoseGraph::new(self.poses[0]);
+            for pose in &self.poses[1..] {
+                graph.add_node(*pose);
             }
-            let measurement = self.poses[index].inverse() * self.poses[index + 1];
-            graph.add_edge(index, index + 1, measurement, 1.0);
-        }
-        for edge in &loop_edges {
-            graph.add_edge(edge.from, edge.to, edge.measurement, edge.weight);
-        }
 
-        let optimised = graph.optimize(&PoseGraphParams::default());
+            // The odometry edges are free: the tracked pose is the accumulation,
+            // so the measurement between neighbours is already encoded in the
+            // poses. A submap boundary is the exception: its relative pose is a
+            // guess, so leaving it out lets a cross-submap loop edge move the
+            // whole submap.
+            for index in 0..nodes - 1 {
+                if self
+                    .pose_boundaries
+                    .get(index + 1)
+                    .copied()
+                    .unwrap_or(false)
+                {
+                    continue;
+                }
+                let measurement = self.poses[index].inverse() * self.poses[index + 1];
+                graph.add_edge(index, index + 1, measurement, 1.0);
+            }
+            for edge in &loop_edges {
+                graph.add_edge(edge.from, edge.to, edge.measurement, edge.weight);
+            }
 
-        let mut max_correction = 0.0f32;
-        let mut max_rotation = 0.0f32;
-        for (before, after) in self.poses.iter().zip(graph.nodes()) {
-            let delta = before.inverse() * after;
-            max_correction = max_correction.max(delta.translation.vector.norm());
-            max_rotation = max_rotation.max(delta.rotation.angle());
-        }
+            let optimised = graph.optimize(&PoseGraphParams::default());
 
+            let mut max_correction = 0.0f32;
+            let mut max_rotation = 0.0f32;
+            for (before, after) in self.poses.iter().zip(graph.nodes()) {
+                let delta = before.inverse() * after;
+                max_correction = max_correction.max(delta.translation.vector.norm());
+                max_rotation = max_rotation.max(delta.rotation.angle());
+            }
+
+            let within =
+                max_correction <= MAX_CORRECTION_METRES && max_rotation <= MAX_CORRECTION_RADIANS;
+
+            if within || loop_edges.len() <= 1 {
+                break (graph, optimised, max_correction, max_rotation, within);
+            }
+
+            // `edges_ranked` is best-first, so the weakest constraint is last.
+            loop_edges.pop();
+        };
+
+        let kept_loops = if within { loop_edges.len() } else { 0 };
         let mut closure = ClosureReport {
             nodes,
             odometry_edges,
-            loop_edges: loop_edges.len(),
+            loop_edges: kept_loops,
+            dropped_loops: total_loops - kept_loops,
             cost_before: optimised.cost_before,
             cost_after: optimised.cost_after,
             iterations: optimised.iterations,
             converged: optimised.converged,
             max_correction,
             max_rotation,
-            refused: false,
+            refused: !within,
             rebuilt: false,
         };
 
-        // Simplicity beats quiet corruption. If the graph wants to move a pose
-        // further than the odometry could plausibly be wrong, believe the
-        // odometry and leave the model alone.
-        if max_correction > MAX_CORRECTION_METRES || max_rotation > MAX_CORRECTION_RADIANS {
-            closure.refused = true;
+        // Simplicity beats quiet corruption. If even the strongest loop wants
+        // to fold the map, believe the odometry and leave the model alone.
+        if !within {
             self.closure = Some(closure);
             return closure;
         }
@@ -651,6 +672,14 @@ impl Scanner {
         self.loops
             .as_ref()
             .map(|finder| finder.loops().len())
+            .unwrap_or(0)
+    }
+
+    /// How many spatial ICP attempts the loop finder has spent.
+    pub fn loop_attempts(&self) -> usize {
+        self.loops
+            .as_ref()
+            .map(|finder| finder.attempts())
             .unwrap_or(0)
     }
 
