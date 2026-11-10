@@ -304,10 +304,14 @@ what remains is a real capture.
    dataset and trains. A 100-iteration run on the 2.24 M-vertex seed, a
    1,000-iteration run on a decimated seed, and a 5,000-iteration run on 60
    views at 256 px all export valid PLYs. The 5k run densified to **519,041
-   splats** and now shows the couch, plant and table, but it is still visibly
-   smeared; a full ~30k run is the next training step. The 2.24 M seed made
-   training impractically slow, so the exporter now voxel-caps `init.ply` at
-   **250,000 points** (the real capture produced 173,784).
+   splats** and showed the couch, plant and table, but still smeared. A 30k run
+   at 40 views/192 px produced **1,000,000 splats**; the splat centres project
+   into a coherent room (table, plant, person), but the rendered model is still
+   muddy. That points at view count and training resolution, not pose or format.
+   The 2.24 M seed made training impractically slow, so the exporter now
+   voxel-caps `init.ply` at **250,000 points** (the real capture produced
+   173,784). The next training input should be a cleaner, slower, static
+   capture at full 512×424, not another low-resolution run.
 
 **Done when:** a real capture loads without error and produces a `.ply` of
 splats that renders recognisably. The load/export half is done; the
@@ -357,9 +361,10 @@ little-endian 3DGS layout, decodes log scales, the quaternion, logit opacity
 and the DC colour term, and ignores the 45 `f_rest` fields.
 `gui/render.rs::render_splats` projects `R diag(s²) Rᵀ` through the perspective
 Jacobian, sorts far-to-near, and alpha-blends the resulting **2×2 anisotropic
-Gaussian** footprints. The viewport has Mesh/Splats, Fit-splats and
-First-person controls; a scan that contains the origin opens at the scanner's
-first-person view.
+Gaussian** footprints. First-person splats flip screen-x so the layout matches
+the colour frame. Mesh/Splats, Fit-splats, First-person, splat-size and
+minimum-opacity controls are in the panel. Clouds over 250k splats render at
+half raster resolution in the window and are scaled by egui.
 
 Measured with real Brush exports:
 
@@ -367,15 +372,18 @@ Measured with real Brush exports:
 | --- | --- |
 | Load/decode 2.24 M splats | **0.47 s** |
 | Render 199 k splats at 640×480 | **0.93 s** |
-| Render 2.24 M splats at 640×480, first-person | **3.37 s** |
+| Render 2.24 M splats at 640×480, early first-person model | **3.37 s** |
+| Render 1 M splats at 640×480, 30k model | **14.8 s** |
 
 The render only runs when the camera changes, so this is usable as a static
-preview, not a real-time splat renderer.
+preview, not a real-time splat renderer. The 30k model's splat centres project
+into a coherent room; the model itself is still smeared because it was trained
+from 40 views at 192 px.
 
 **Still open:** only the DC SH band is used, coordinates are displayed as
 exported with no verified alignment to the scanner mesh, and sorting/blending
-are CPU only. A 100-iteration Brush run on the real capture is still muddy, so
-the done condition below is **not yet met**:
+are CPU only. The 30k model is not yet recognizable enough, so the done
+condition below is **not yet met**:
 
 **Done when:** the window shows the trained result beside the mesh it came from,
 and the two agree on pose and scale.
@@ -531,10 +539,12 @@ number in this document still lacks that reference.
 **M2.2 — Then drift.** Frame-to-model is implemented but **does worse on the old
 20-frame recording**: 18/20 fused and 0.393 m from origin against the
 frame-to-frame baseline's 20/20 and 0.544 m. That is suggestive, not conclusive,
-and it is why the new closed-loop capture matters. Its baseline is 120/120
-fused, two revisits, a 10 cm correction and 0.555 m end distance. Running the
-same capture with `--frame-to-model` and comparing those numbers is the next
-measurement. Current synthetic state:
+and it is why the new closed-loop capture matters. On that capture, the
+frame-to-frame baseline without loop closure makes **11 submaps** and ends
+0.610 m from the start. Frame-to-model also fuses 120/120 but makes **13
+submaps**, verifies **no revisits**, ends **2.249 m** away, and costs 979 ms
+per frame vs 91 ms. It is clearly worse, not just inconclusive. Current
+synthetic state:
 
 ```
 frame_to_model=false: fused 41/41, mean inlier 0.937   (synthetic, harsh)
@@ -550,10 +560,10 @@ coverage, not normal construction. Two things to try, in order:
 - **Normalise the inlier gate by target coverage.** A target covering 80% of
   the image cannot reach a 100% inlier ratio; lowering a fixed threshold until
   a test passes is not the fix.
-- **Then decide whether the gates should be mode-aware.** A frame whose target
-  covers 80% of the image cannot achieve a 100% inlier ratio. Normalising the
-  inlier gate by target coverage is principled; lowering a threshold until a test
-  passes is not.
+- **Coverage alone is not the whole story.** `SCAN_DEBUG_F2M` reports 85.8%
+  coverage at the first failing frame, yet the alignment still rejects it. The
+  next measurement is target normal density and a fallback that uses the
+  previous frame whenever the model render aligns worse than the raw frame.
 
 **Done when:** on a real recording, frame-to-model beats frame-to-frame on a
 metric that is not self-referential — a closed-loop capture, where ending near

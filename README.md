@@ -257,6 +257,9 @@ The window has five parts:
   **Train anyway**. The trained `.ply` can be loaded into the viewport, with
   Mesh/Splats, Fit-splats and First-person controls. The preview projects the
   anisotropic covariance and blends DC colour; higher SH bands are not evaluated.
+  Splat-size and minimum-opacity sliders make under-trained or floating-splat
+  models inspectable. Clouds over 250k splats render at half raster resolution
+  and are scaled by egui; first-person splats use the colour frame's x direction.
 
 *Start* runs the selected source. *Pause* stops consuming frames without
 losing the scanner; *Resume* continues. *Stop* ends the capture but keeps the

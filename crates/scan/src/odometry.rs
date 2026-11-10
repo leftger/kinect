@@ -329,8 +329,13 @@ impl Odometry {
     /// it has not been, and the previous frame is the better target.
     fn render(&self, volume: &TsdfVolume, width: usize, height: usize) -> Option<DepthPyramid> {
         let rendered = volume.raycast(&self.intrinsics, &self.pose, width, height);
+        let hits = rendered.hits();
+        let coverage = hits as f32 / (width * height).max(1) as f32;
+        if std::env::var_os("SCAN_DEBUG_F2M").is_some() {
+            eprintln!("[f2m] render hits {hits} ({:.1}% coverage)", coverage * 100.0);
+        }
 
-        if rendered.hits() < self.config.min_points {
+        if hits < self.config.min_points {
             return None;
         }
 

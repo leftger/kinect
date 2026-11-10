@@ -35,7 +35,7 @@ use geom::export::MeshFormat;
 use geom::tsdf::TsdfParams;
 use nalgebra::Vector3;
 
-use crate::{Options, DEFAULT_FRAMES};
+use crate::{DEFAULT_FRAMES, Options};
 
 use render::{Camera, PreviewScene, Renderer};
 use session::{SessionConfig, SessionHandle, SessionSnapshot, Source, Status};
@@ -218,6 +218,8 @@ struct ScannerApp {
     splat_path: String,
     splat_error: Option<String>,
     show_splats: bool,
+    splat_scale: f32,
+    splat_min_opacity: f32,
     camera: Camera,
     renderer: Renderer,
     texture: Option<egui::TextureHandle>,
@@ -247,6 +249,8 @@ impl ScannerApp {
             splat_path: String::new(),
             splat_error: None,
             show_splats: false,
+            splat_scale: 1.0,
+            splat_min_opacity: 0.0,
             camera: Camera::default(),
             renderer: Renderer::new(800, 600),
             texture: None,
@@ -807,10 +811,7 @@ impl ScannerApp {
         if let Some(error) = &self.splat_error {
             ui.colored_label(egui::Color32::LIGHT_RED, error);
         }
-        let splat_summary = self
-            .splat
-            .as_ref()
-            .map(|splat| (splat.len(), splat.bounds));
+        let splat_summary = self.splat.as_ref().map(|splat| (splat.len(), splat.bounds));
         if let Some((count, bounds)) = splat_summary {
             ui.horizontal(|ui| {
                 ui.label(format!("{count} splats"));
@@ -829,6 +830,20 @@ impl ScannerApp {
                     self.dirty = true;
                 }
             });
+            let before_scale = self.splat_scale;
+            ui.add(
+                egui::Slider::new(&mut self.splat_scale, 0.05..=2.0)
+                    .logarithmic(true)
+                    .text("splat size"),
+            );
+            if before_scale != self.splat_scale {
+                self.dirty = true;
+            }
+            let before_opacity = self.splat_min_opacity;
+            ui.add(egui::Slider::new(&mut self.splat_min_opacity, 0.0..=0.8).text("min opacity"));
+            if before_opacity != self.splat_min_opacity {
+                self.dirty = true;
+            }
         }
 
         if use_last {
@@ -849,10 +864,7 @@ impl ScannerApp {
                     format!("  {warning}"),
                 );
             }
-            ui.checkbox(
-                &mut self.trainer_config.allow_unmerged,
-                "Train anyway",
-            );
+            ui.checkbox(&mut self.trainer_config.allow_unmerged, "Train anyway");
         }
 
         let running = view.status.active();
@@ -903,8 +915,7 @@ impl ScannerApp {
         self.trainer_error = None;
         if !warnings.is_empty() && !self.trainer_config.allow_unmerged {
             self.trainer_error = Some(
-                "the exported dataset is not trainable; tick Train anyway to override"
-                    .to_string(),
+                "the exported dataset is not trainable; tick Train anyway to override".to_string(),
             );
             return;
         }
@@ -1056,8 +1067,22 @@ impl ScannerApp {
         if self.dirty {
             let image = if self.show_splats {
                 if let Some(splat) = &self.splat {
-                    let rgba = self.renderer.render_splats(splat, &self.camera);
-                    egui::ColorImage::from_rgba_unmultiplied([width, height], rgba)
+                    // A million splats at full viewport resolution costs seconds
+                    // per camera change. Halve the raster size for big clouds and
+                    // let egui scale the texture; the model itself is the limit.
+                    let (render_width, render_height) = if splat.len() > 250_000 {
+                        ((width / 2).max(1), (height / 2).max(1))
+                    } else {
+                        (width, height)
+                    };
+                    let mut renderer = Renderer::new(render_width, render_height);
+                    let rgba = renderer.render_splats(
+                        splat,
+                        &self.camera,
+                        self.splat_scale,
+                        self.splat_min_opacity,
+                    );
+                    egui::ColorImage::from_rgba_unmultiplied([render_width, render_height], rgba)
                 } else {
                     let rgba = self.renderer.render(&PreviewScene::empty(), &self.camera);
                     egui::ColorImage::from_rgba_unmultiplied([width, height], rgba)

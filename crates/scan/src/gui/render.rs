@@ -68,6 +68,10 @@ pub(crate) struct Camera {
     pub pitch: f32,
     pub distance: f32,
     pub fov_y: f32,
+    /// First-person views look along the sensor's +z, where the right-handed
+    /// camera basis flips x. Splat rendering flips its screen-right axis so the
+    /// result matches the colour frame; the mesh orbit view ignores this.
+    pub mirror_x: bool,
 }
 
 impl Default for Camera {
@@ -78,6 +82,7 @@ impl Default for Camera {
             pitch: 0.35,
             distance: 3.0,
             fov_y: 1.0,
+            mirror_x: false,
         }
     }
 }
@@ -123,6 +128,7 @@ impl Camera {
 
         self.target = center;
         self.distance = (extent * 0.5 / half_fov * 1.25).clamp(0.2, 1_000.0);
+        self.mirror_x = false;
     }
 
     /// Place the camera at `eye`, looking towards `target`.
@@ -133,6 +139,7 @@ impl Camera {
         let direction = offset / self.distance;
         self.pitch = (-direction.y).asin().clamp(-1.45, 1.45);
         self.yaw = direction.x.atan2(direction.z);
+        self.mirror_x = true;
     }
 
     fn basis(&self) -> (Vector3<f32>, Vector3<f32>, Vector3<f32>) {
@@ -281,9 +288,20 @@ impl Renderer {
     /// The 3D covariance `R diag(s^2) R^T` is projected through the perspective
     /// Jacobian, and each covered pixel evaluates the resulting 2x2 Gaussian.
     /// Higher SH bands are still ignored: the colour is the DC term only.
-    pub fn render_splats(&mut self, cloud: &SplatCloud, camera: &Camera) -> &[u8] {
+    /// `scale_multiplier` shrinks or grows every footprint without touching the
+    /// stored model, which makes an oversized/undertrained model inspectable.
+    pub fn render_splats(
+        &mut self,
+        cloud: &SplatCloud,
+        camera: &Camera,
+        scale_multiplier: f32,
+        min_opacity: f32,
+    ) -> &[u8] {
         self.clear_background();
-        let view = camera.view(self.width, self.height);
+        let mut view = camera.view(self.width, self.height);
+        if camera.mirror_x {
+            view.right = -view.right;
+        }
         let view_rotation = Matrix3::from_rows(&[
             view.right.transpose(),
             view.up.transpose(),
@@ -295,6 +313,9 @@ impl Renderer {
             .iter()
             .enumerate()
             .filter_map(|(index, splat)| {
+                if splat.opacity < min_opacity {
+                    return None;
+                }
                 let z = (splat.position - view.eye).dot(&view.forward);
                 (z > 1e-3).then_some((z, index))
             })
@@ -311,7 +332,7 @@ impl Renderer {
 
             let rotation = splat.rotation.to_rotation_matrix();
             let rotation = rotation.matrix();
-            let scale = splat.scale;
+            let scale = splat.scale * scale_multiplier.max(1e-3);
             let covariance = rotation
                 * Matrix3::from_diagonal(&Vector3::new(
                     scale.x * scale.x,
@@ -605,6 +626,7 @@ mod tests {
             pitch: 0.0,
             distance,
             fov_y: 1.0,
+            mirror_x: false,
         }
     }
 
@@ -714,7 +736,7 @@ mod tests {
         };
         let camera = camera_looking_at(Vector3::zeros(), 3.0);
         let mut renderer = Renderer::new(64, 64);
-        let rgba = renderer.render_splats(&cloud, &camera);
+        let rgba = renderer.render_splats(&cloud, &camera, 1.0, 0.0);
         let centre = (32 * 64 + 32) * 4;
 
         assert!(
@@ -739,7 +761,7 @@ mod tests {
         };
         let camera = camera_looking_at(Vector3::zeros(), 3.0);
         let mut renderer = Renderer::new(64, 64);
-        let rgba = renderer.render_splats(&cloud, &camera);
+        let rgba = renderer.render_splats(&cloud, &camera, 1.0, 0.0);
         let centre = (32 * 64 + 32) * 4;
 
         assert!(
@@ -762,31 +784,45 @@ mod tests {
             .iter()
             .zip(max.iter())
             .all(|(min, max)| *min <= 0.0 && *max >= 0.0);
-        if contains_origin {
+        if contains_origin && std::env::var_os("SCAN_SPLAT_FIT").is_none() {
             camera.look_from(Vector3::zeros(), Vector3::new(0.0, 0.0, 2.0));
         } else {
             camera.fit(min, max);
         }
 
-        const WIDTH: usize = 640;
-        const HEIGHT: usize = 480;
-        let mut renderer = Renderer::new(WIDTH, HEIGHT);
+        let width = std::env::var("SCAN_SPLAT_WIDTH")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(640usize);
+        let height = std::env::var("SCAN_SPLAT_HEIGHT")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(480usize);
+        let scale = std::env::var("SCAN_SPLAT_SCALE")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(1.0f32);
+        let min_opacity = std::env::var("SCAN_SPLAT_MIN_OPACITY")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(0.0f32);
+        let mut renderer = Renderer::new(width, height);
         let started = Instant::now();
-        let rgba = renderer.render_splats(&cloud, &camera);
+        let rgba = renderer.render_splats(&cloud, &camera, scale, min_opacity);
         println!(
-            "rendered {} splats at {WIDTH}x{HEIGHT} in {:?}",
+            "rendered {} splats at {width}x{height} in {:?}",
             cloud.len(),
             started.elapsed()
         );
 
-        assert_eq!(rgba.len(), WIDTH * HEIGHT * 4);
+        assert_eq!(rgba.len(), width * height * 4);
         assert!(rgba.chunks_exact(4).all(|pixel| pixel[3] == 255));
 
         if let Ok(ppm) = std::env::var("SCAN_SPLAT_PPM") {
             use std::io::Write;
 
             let mut file = std::fs::File::create(&ppm).expect("create PPM");
-            write!(file, "P6\n{WIDTH} {HEIGHT}\n255\n").expect("PPM header");
+            write!(file, "P6\n{width} {height}\n255\n").expect("PPM header");
             for pixel in rgba.chunks_exact(4) {
                 file.write_all(&pixel[..3]).expect("PPM pixel");
             }

@@ -23,12 +23,12 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use geom::{transform_point, Intrinsics};
+use geom::{Intrinsics, transform_point};
 use nalgebra::{Isometry3, Vector3};
 
 use crate::scanner::{FrameColor, Scanner};
 use crate::synthetic;
-use crate::{capture, recording, Options, DEFAULT_FRAMES};
+use crate::{DEFAULT_FRAMES, Options, capture, recording};
 
 use super::render::{PreviewLine, PreviewPoint, PreviewScene};
 
@@ -1354,12 +1354,14 @@ mod tests {
 
         let recording = recording::read(&path).expect("read the finished recording");
         assert_eq!(recording.frames.len(), 1);
-        assert!(shared
-            .lock()
-            .unwrap()
-            .log
-            .iter()
-            .any(|line| line.contains("recorded 1 frames to test.k2df")));
+        assert!(
+            shared
+                .lock()
+                .unwrap()
+                .log
+                .iter()
+                .any(|line| line.contains("recorded 1 frames to test.k2df"))
+        );
 
         let _ = std::fs::remove_file(&path);
     }
