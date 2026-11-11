@@ -27,6 +27,7 @@
 //! That verification is not optional. A pose graph will happily fold a map in half
 //! to satisfy a single bad edge, so a false loop is far worse than a missed one.
 
+use geom::global_search::{self, GlobalSearchParams, ScoreGrid};
 use geom::icp::{IcpCloud, IcpParams, align};
 use geom::pose_graph::Edge;
 use geom::transform_point;
@@ -184,6 +185,21 @@ pub struct LoopClosureConfig {
     pub normal_radius: f32,
     pub max_distance: f32,
     pub max_iterations: usize,
+    /// When ICP from the drifted initial guess fails, run the 4-DOF
+    /// branch-and-bound search before giving up on the candidate. This is the
+    /// global half of loop closure: a wider basin, still followed
+    /// by the same reciprocal verification.
+    pub global_search: bool,
+    /// Translation half-width for that search, in metres.
+    pub global_search_radius: f32,
+    /// Yaw half-width for that search, in radians.
+    pub global_search_yaw: f32,
+    /// Minimum mean likelihood for the global search to be trusted.
+    pub global_search_min_score: f32,
+    /// Minimum mean likelihood of the final alignment against the target's
+    /// surface grid. Zero disables the gate; the ICP inlier and reciprocal
+    /// checks remain the primary defences.
+    pub min_match_score: f32,
     /// How many keyframes on each side of a loop candidate to merge into the
     /// ICP target. LIO-SAM builds its loop target from a window of history
     /// keyframes rather than a single scan; the wider surface makes a narrow
@@ -220,6 +236,11 @@ impl Default for LoopClosureConfig {
             normal_radius: 0.12,
             max_distance: 0.25,
             max_iterations: 20,
+            global_search: false,
+            global_search_radius: 0.55,
+            global_search_yaw: 0.55,
+            global_search_min_score: 0.30,
+            min_match_score: 0.0,
             // A three-keyframe window each way: LIO-SAM uses 25, but a depth
             // camera already sees a dense surface and indoor rooms are small,
             // so a handful is enough to widen the basin without burying the
@@ -303,7 +324,39 @@ fn verify_candidates(
         }
 
         attempts += 1;
-        let result = align(source, &candidate.target, candidate.initial, &params);
+        let mut result = align(source, &candidate.target, candidate.initial, &params);
+
+        // If the drifted prior is too far out for ICP, give the 4-DOF global
+        // search one chance before rejecting the candidate. The verification
+        // below is unchanged, so a global match still has to survive reverse
+        // alignment and the likelihood gate.
+        if (result.inlier_ratio < config.min_inlier_ratio || result.rmse > config.max_rmse)
+            && config.global_search
+        {
+            let global = GlobalSearchParams {
+                voxel: config.voxel,
+                sigma: config.normal_radius,
+                translation_radius: config.global_search_radius,
+                yaw_radius: config.global_search_yaw,
+                min_score: config.global_search_min_score,
+                ..GlobalSearchParams::default()
+            };
+            if let Some(found) = global_search::search(
+                &candidate.target.points,
+                &source.points,
+                candidate.initial,
+                &global,
+            ) {
+                result = align(source, &candidate.target, found.transform, &params);
+                if debug {
+                    eprintln!(
+                        "[loop] global search rescued kf {} -> {index} at score {:.3}",
+                        candidate.from, found.score
+                    );
+                }
+            }
+        }
+
         if debug {
             eprintln!(
                 "[loop] align kf {} -> {index}: inliers {:.3} rmse {:.4} corr {}",
@@ -342,6 +395,35 @@ fn verify_candidates(
                 );
             }
             continue;
+        }
+
+        // Likelihood gate. ICP inliers say "points found neighbours"; this says
+        // "they landed near the observed surface", which is a different signal
+        // and catches repetitive geometry that happens to fit.
+        if config.min_match_score > 0.0 {
+            let score_params = GlobalSearchParams {
+                voxel: config.voxel,
+                sigma: config.normal_radius,
+                translation_radius: 0.0,
+                yaw_radius: 0.0,
+                levels: 1,
+                max_points: source.points.len().max(1),
+                max_nodes: 1,
+                min_score: 0.0,
+                ..GlobalSearchParams::default()
+            };
+            if let Some(grid) = ScoreGrid::build(&candidate.target.points, &score_params) {
+                let score = grid.score_transform(&source.points, &result.transform);
+                if debug {
+                    eprintln!(
+                        "[loop] kf {} -> {index} match score {score:.3}",
+                        candidate.from
+                    );
+                }
+                if score < config.min_match_score {
+                    continue;
+                }
+            }
         }
 
         let loop_closure = Loop {
@@ -1353,5 +1435,80 @@ mod tests {
         assert_eq!(finder.pending(), 0);
         assert_eq!(found[0].from, 0);
         assert_eq!(found[0].to, 50);
+    }
+
+    #[test]
+    fn the_likelihood_gate_can_reject_an_icp_verified_loop() {
+        let world = scene();
+        let returned = at(0.4, 0.0, 0.0);
+
+        // A valid loop passes a normal likelihood threshold.
+        let mut finder = LoopFinder::new(LoopClosureConfig {
+            min_index_gap: 30,
+            min_match_score: 0.5,
+            ..LoopClosureConfig::default()
+        });
+        finder.consider(
+            0,
+            Isometry3::identity(),
+            &view(&world, &Isometry3::identity()),
+        );
+        assert!(
+            finder
+                .consider(50, returned, &view(&world, &returned))
+                .is_some(),
+            "a valid loop failed the normal likelihood gate"
+        );
+
+        // An impossible threshold must reject the same loop even though ICP
+        // and the reciprocal check both pass.
+        let mut finder = LoopFinder::new(LoopClosureConfig {
+            min_index_gap: 30,
+            min_match_score: 1.01,
+            ..LoopClosureConfig::default()
+        });
+        finder.consider(
+            0,
+            Isometry3::identity(),
+            &view(&world, &Isometry3::identity()),
+        );
+        assert!(
+            finder
+                .consider(50, returned, &view(&world, &returned))
+                .is_none(),
+            "the likelihood gate was not applied"
+        );
+    }
+
+    #[test]
+    fn global_search_rescues_a_loop_from_a_bad_prior() {
+        let world = scene();
+        let mut finder = LoopFinder::new(LoopClosureConfig {
+            min_index_gap: 30,
+            // The drifted estimate is 0.55 m beyond the truth, which is outside
+            // the ICP correspondence radius but inside the global search.
+            max_distance: 0.12,
+            min_inlier_ratio: 0.80,
+            global_search: true,
+            global_search_radius: 0.65,
+            global_search_yaw: 0.40,
+            global_search_min_score: 0.20,
+            ..LoopClosureConfig::default()
+        });
+
+        finder.consider(
+            0,
+            Isometry3::identity(),
+            &view(&world, &Isometry3::identity()),
+        );
+
+        let truth = at(0.4, 0.0, 0.0);
+        let estimate = at(0.95, 0.0, 0.0);
+        let found = finder
+            .consider(50, estimate, &view(&world, &truth))
+            .expect("the global search did not rescue the loop");
+        assert_eq!(found.from, 0);
+        assert_eq!(found.to, 50);
+        assert!(found.inlier_ratio > 0.8);
     }
 }

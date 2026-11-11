@@ -53,6 +53,14 @@ features, and the first-scan checklist.
 - Applies a verified loop during the scan (`--online-loops`) or at the end, and
   can move cached submap surfaces instead of re-fusing every frame
   (`--incremental-rebuild`).
+- Falls back to a 4-DOF yaw/translation branch-and-bound search when projective
+  tracking or ICP loses its basin, and can use the same matcher as a loop gate.
+- Skips near-duplicate fusion (`--fusion-filter`) and chunks the active TSDF
+  (`--tsdf-chunk`), so fusion time and memory stay bounded on long scans.
+- Can optimise submap nodes (`--submap-graph`) and run that solve on a worker
+  thread (`--graph-worker`), keeping capture off the dense solve.
+- Localises a recording against a frozen PLY map (`scan localize`) without
+  modifying the prior.
 - Keeps unplaceable frames in submaps instead of discarding them.
 - Exports a Nerfstudio/Brush dataset for Gaussian splatting.
 - Runs a scanner GUI with a live 3D preview, source picker, transport, export,
@@ -70,6 +78,9 @@ features, and the first-scan checklist.
 - Keyframe-graph loop closure with multi-keyframe verification targets, optional
   online correction, an optional background ICP worker, and an incremental
   submap correction path.
+- Global 4-DOF relocalisation, motion-filtered fusion, chunked
+  TSDF, submap-node optimisation, a background graph worker, and frozen-map
+  localisation.
 - Gaussian-splatting dataset export and a tested Brush hand-off on synthetic and
   real data. The window can launch Brush and load its `.ply` into a basic splat
   preview.
@@ -96,11 +107,13 @@ The long-form Gaussian-splatting plan and measurements are in
 depth frame from USB
   -> decode            raw packet to metres
   -> odometry          pose relative to the last frame, local keyframe map
-  -> TSDF fusion       integrate into a voxel-hashed volume
-  -> loop closure      keyframe graph, online or end-of-scan correction
+  -> global search     optional 4-DOF fallback when ICP loses the basin
+  -> TSDF fusion       integrate into a voxel-hashed volume, optionally chunked
+  -> loop closure      keyframe or submap graph, online or end-of-scan
   -> mesh extraction   surface nets, then PLY / OBJ / glTF / GLB
   -> optional colour   register views, paint the mesh or atlas
   -> optional dataset  posed images, masks, and init.ply for a trainer
+  -> optional localize frozen prior map, trajectory only, no new TSDF
 ```
 
 Read [How it works](docs/how-it-works.md) for tracking, fusion, mesh extraction,
@@ -112,12 +125,18 @@ window of keyframes as the verification target, and corrections applied to
 cached pieces rather than an unconditional re-fuse. The front end is depth-only;
 there is no lidar and no IMU.
 
+The global search, motion filter, fixed-size submap budget, submap-node graph,
+background graph solve, and frozen-map localisation are optional stages of the
+pipeline. The matcher is deliberately 4-DOF (yaw plus translation), not a full
+6-DOF 3D search, because a handheld depth camera is usually upright and a
+six-dimensional correlative search is too expensive for a live frame.
+
 ## Documentation
 
 | Guide | What is inside |
 | --- | --- |
 | [Getting started](docs/getting-started.md) | Hardware, USB permissions, builds, sensor check, first scan |
-| [Command line](docs/cli.md) | Commands, options, recording/replay, loop closure, submaps |
+| [Command line](docs/cli.md) | Commands, options, recording/replay, loop closure, submaps, frozen-map localisation |
 | [Scanner window](docs/gui.md) | Sources, panels, viewport controls, transport, telemetry, Splats |
 | [Colour](docs/colour.md) | Registration, visibility tests, colour modes, output formats |
 | [Datasets and splats](docs/datasets.md) | Dataset layout, quality gate, Brush smoke test, real-capture results |

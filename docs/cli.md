@@ -1,6 +1,6 @@
 # Command line
 
-The `scan` binary has four main workflows plus a sensor-free synthetic
+The `scan` binary has five main workflows plus a sensor-free synthetic
 generator:
 
 | Command | Use it for |
@@ -9,6 +9,7 @@ generator:
 | `live` | Capture a new scan from the sensor |
 | `record` | Write a `.k2df` recording without reconstructing |
 | `replay` | Reconstruct from a `.k2df` recording |
+| `localize` | Localise a recording against a frozen PLY map |
 | `synth` | Render the analytic room and write a dataset |
 
 Build first:
@@ -26,21 +27,32 @@ scan gui    [--in FILE | --synthetic] [--auto-start] [--frames N]
             [--out mesh.ply] [--dataset DIR] [--color] [--preview-every N]
             [--playback-fps F] [--loop-closure] [--online-loops]
             [--loop-worker] [--loop-window N] [--incremental-rebuild]
-            [--no-submaps]
+            [--loop-global] [--match-score S] [--submap-graph] [--graph-worker]
+            [--fusion-filter] [--tsdf-chunk N] [--relocalize]
+            [--relocalize-global] [--relocalize-keyframes N] [--no-submaps]
 
 scan live   [--frames N] [--out mesh.ply] [--voxel M] [--no-filter] [--color]
             [--color-mode best|blend|average] [--color-depth-tolerance M]
             [--gpu] [--loop-closure] [--online-loops] [--loop-worker]
-            [--loop-window N] [--incremental-rebuild] [--relocalize]
-            [--relocalize-keyframes N] [--viewer] [--dataset DIR] [--no-submaps]
+            [--loop-window N] [--incremental-rebuild] [--loop-global]
+            [--match-score S] [--submap-graph] [--graph-worker]
+            [--fusion-filter] [--tsdf-chunk N] [--relocalize]
+            [--relocalize-global] [--relocalize-keyframes N] [--viewer]
+            [--dataset DIR] [--no-submaps]
 
 scan record --out capture.k2df [--frames N] [--no-filter] [--drain-color]
             [--gpu] [--color]
 
 scan replay --in capture.k2df [--out mesh.ply] [--voxel M] [--frames N]
             [--loop-closure] [--online-loops] [--loop-worker]
-            [--loop-window N] [--incremental-rebuild] [--relocalize]
-            [--relocalize-keyframes N] [--no-submaps] [--dataset DIR]
+            [--loop-window N] [--incremental-rebuild] [--loop-global]
+            [--match-score S] [--submap-graph] [--graph-worker]
+            [--fusion-filter] [--tsdf-chunk N] [--relocalize]
+            [--relocalize-global] [--relocalize-keyframes N] [--no-submaps]
+            [--dataset DIR]
+
+scan localize --in capture.k2df --map prior.ply [--frames N]
+            [--out trajectory.ply]
 
 scan synth  --dataset DIR [--frames N] [--out mesh.ply] [--voxel M]
 ```
@@ -96,6 +108,24 @@ If the recording carries colour, the mesh is painted from it and
 `--dataset DIR` can write a dataset. A depth-only recording cannot be painted or
 used for a colour dataset.
 
+### `localize`
+
+Localises a recording against a frozen prior map and writes a trajectory:
+
+```sh
+scan localize --in capture.k2df --map prior.ply --out trajectory.ply
+```
+
+The prior is a PLY point cloud, ASCII or binary little-endian. Only vertex
+positions are read; colours, normals, and faces are skipped. Each frame gets a
+4-DOF global search for an initial pose, then ICP refines it; the same inlier and
+RMSE gates decide whether a pose is accepted. Nothing is fused and the prior is
+never changed. Without `--out`, the poses are printed only.
+
+`--frames N` limits how many recording frames are localised. The first frame
+starts from identity, so the recording should begin near the prior map's origin
+or within the global search radius.
+
 ### `synth`
 
 Renders the analytic room, writes the mesh, and writes a colour dataset. It
@@ -122,6 +152,14 @@ This is the cheapest way to exercise the Brush hand-off.
 | `--incremental-rebuild` | Move cached submap surfaces instead of re-fusing; implies `--loop-closure` |
 | `--relocalize` | Retry a rejected frame with spatial ICP against a local keyframe map |
 | `--relocalize-keyframes N` | Recent keyframes in that local map; default `6`; implies `--relocalize` |
+| `--relocalize-global` | Add a 4-DOF branch-and-bound fallback when that ICP fails; implies `--relocalize` |
+| `--fusion-filter` | Track but do not fuse near-duplicate frames; forces one every 5 frames |
+| `--tsdf-chunk N` | Finish the active TSDF into a cached chunk every N fused frames |
+| `--loop-global` | Add a 4-DOF branch-and-bound fallback when loop ICP fails; implies `--loop-closure` |
+| `--match-score S` | Minimum mean likelihood for a verified loop, `0..1`; zero disables |
+| `--submap-graph` | Optimise submap nodes instead of keyframe nodes; implies `--loop-closure` |
+| `--graph-worker` | Solve the online submap graph off the capture thread; implies `--submap-graph` and `--online-loops` |
+| `--map FILE` | `localize`: prior map as ASCII or binary little-endian PLY |
 | `--no-submaps` | Keep one model and skip unplaceable frames instead of starting a submap |
 | `--gpu` | GPU depth decode; requires `--features wgpu-decode` |
 | `--mirror` | Keep the raw sensor mirror orientation instead of flipping X |
@@ -141,11 +179,39 @@ scan replay --in out/closed-loop.k2df --loop-closure --loop-window 4
 
 # Fast final correction: move the cached submaps, do not re-fuse.
 scan replay --in out/closed-loop.k2df --loop-closure --incremental-rebuild
+
+# Recover a lost track with a wide 4-DOF search before accepting the frame.
+scan replay --in out/closed-loop.k2df --relocalize --relocalize-global
+
+# Refuse loops that ICP fits but the target surface does not support.
+scan replay --in out/closed-loop.k2df --loop-closure --match-score 0.55
+
+# Submap-node graph, solved off the capture thread.
+scan replay --in out/closed-loop.k2df --loop-closure --online-loops \
+    --submap-graph --graph-worker
+
+# Skip near-duplicate fusion and bound the active volume.
+scan replay --in out/room.k2df --fusion-filter --tsdf-chunk 80
 ```
 
 `--online-loops` and `--incremental-rebuild` trade accuracy inside a submap for
 speed: the cached surface moves rigidly. The default full rebuild re-integrates
 every kept frame at the corrected poses and is the one to compare against.
+
+The global-search flags are fallbacks, not replacements: they only supply an
+initial guess when ICP loses its basin, and the ordinary inlier, residual, and
+reciprocal gates still decide whether the result is trusted. They cost a
+multi-resolution grid and a bounded branch-and-bound search, so leave them off
+for a clean scan.
+
+`--fusion-filter` and `--tsdf-chunk` reduce fusion time without changing the
+trajectory: filtered frames are still tracked and retained, and a chunk is a
+memory boundary inside one submap, not a new pose boundary.
+
+`--submap-graph` moves whole submaps rigidly. It is cheaper than the keyframe
+graph and matches the cached surfaces, but it cannot deform inside a submap;
+keep the keyframe graph for the accuracy reference. `--graph-worker` only moves
+the online submap solve off the capture thread.
 
 ### Voxel size and memory
 

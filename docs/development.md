@@ -41,16 +41,19 @@ cargo build --release -p scan --features wgpu-decode
 cargo test -p geom -p scan --features gui
 ```
 
-229 tests, 3 ignored. The geometry is tested against synthetic scenes and known
+245 tests, 3 ignored. The geometry is tested against synthetic scenes and known
 transforms rather than recorded data, so the suite runs without a sensor. The
 loop-closure tests cover the keyframe window, the background worker, online
-correction, and the incremental submap path.
+correction, and the incremental submap path. The newer geometry tests cover the
+likelihood grid and branch-and-bound search, the PLY point reader, frozen-map
+localisation, motion-filtered fusion, TSDF chunks, submap-node optimisation, and
+the background graph worker.
 
 The window tests are headless too: they exercise the session worker, a synthetic
 scan and its export, the trainer child-process worker, the splat
 loader/renderer, and the software renderer without opening a window.
 
-The non-GUI suite is 204 tests.
+The non-GUI suite is 220 tests.
 
 ### Ignored hardware tests
 
@@ -122,9 +125,13 @@ cp -r /tmp/k1/src /tmp/verify/src
    use for the spare cores, or accept the wall-clock result in
    [Performance](performance.md).
 
-5. **Benchmark the new correction paths on a real loop.** The tests prove online
-   correction, the background worker, and incremental submap moves on synthetic
-   scans. They do not yet show which wins on `out/closed-loop.k2df`. Online and
+5. **Benchmark the new correction paths on real data.** The tests prove online
+   correction, the background worker, incremental submap moves, global search,
+   the likelihood gate, submap-node optimisation, the graph worker, motion
+   filtering, TSDF chunks, and frozen-map localisation on synthetic scans. They
+   do not yet show which wins on `out/closed-loop.k2df`, or how the 4-DOF search
+   behaves on a rolling or tilted capture: it assumes the scanner is roughly
+   upright and there is no gravity sensor to correct that assumption. Online and
    incremental moves are rigid per submap, so they cannot remove drift *inside*
    one; the default full rebuild stays the accuracy reference. The keyframe graph
    also still uses the dense numerical-Jacobian solve, fine at these node counts

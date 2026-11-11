@@ -6,6 +6,7 @@
 //! for the cases projective association cannot serve (aligning keyframes that are
 //! far apart, which is what loop closure will need).
 
+use geom::global_search::{self, GlobalSearchParams};
 use geom::icp::{IcpCloud, IcpParams, IcpResult, align};
 use geom::projective::{DepthPyramid, align_level};
 use geom::tsdf::{RaycastImage, TsdfVolume};
@@ -132,6 +133,17 @@ pub struct OdometryConfig {
     /// with near-identical views when the sensor is nearly stationary.
     pub relocalize_keyframe_min_translation: f32,
     pub relocalize_keyframe_min_rotation: f32,
+    /// When the spatial retry's ICP still fails, run a 4-DOF branch-and-bound
+    /// search over yaw and translation against the local map. This is the
+    /// global initialiser: it does not replace ICP, it gives
+    /// it a basin when the failed alignment's candidate is too far out.
+    pub relocalize_global_search: bool,
+    /// Translation half-width for that search, in metres.
+    pub relocalize_global_radius: f32,
+    /// Yaw half-width for that search, in radians.
+    pub relocalize_global_yaw: f32,
+    /// Minimum mean likelihood for the global search to be trusted.
+    pub relocalize_global_min_score: f32,
 
     /// A frame with at least this inlier ratio and at most `max_rmse` may be
     /// accepted even when its motion exceeds the ordinary per-frame limits.
@@ -173,6 +185,10 @@ impl Default for OdometryConfig {
             relocalize_map_radius: 2.0,
             relocalize_keyframe_min_translation: 0.04,
             relocalize_keyframe_min_rotation: 0.10,
+            relocalize_global_search: false,
+            relocalize_global_radius: 0.45,
+            relocalize_global_yaw: 0.45,
+            relocalize_global_min_score: 0.35,
             fast_motion_inlier_ratio: 0.80,
             fast_motion_max_translation: 0.50,
             fast_motion_max_rotation: 1.0,
@@ -503,7 +519,32 @@ impl Odometry {
 
         let target = IcpCloud::new(points, normals, radius);
         let target_len = target.len();
-        let initial = anchor_pose.inverse() * candidate;
+        let mut initial = anchor_pose.inverse() * candidate;
+
+        // The local map is the target; the branch-and-bound search only supplies
+        // an initial guess. ICP still decides whether the fit is real.
+        if self.config.relocalize_global_search {
+            let global = GlobalSearchParams {
+                translation_radius: self.config.relocalize_global_radius,
+                yaw_radius: self.config.relocalize_global_yaw,
+                min_score: self.config.relocalize_global_min_score,
+                ..GlobalSearchParams::default()
+            };
+            if let Some(found) =
+                global_search::search(&target.points, &current_cloud.points, initial, &global)
+            {
+                initial = found.transform;
+                if debug {
+                    eprintln!(
+                        "[relocalize] global search moved the initial guess by {:.3} m / {:.3} rad, score {:.3}",
+                        found.transform.translation.vector.norm(),
+                        found.transform.rotation.angle(),
+                        found.score
+                    );
+                }
+            }
+        }
+
         let result = align(&current_cloud, &target, initial, &params);
         self.last_relocalize_frames = merged_frames;
 

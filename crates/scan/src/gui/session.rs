@@ -142,6 +142,10 @@ pub(crate) struct SessionView {
     pub online_updates: usize,
     pub last_online_correction: f32,
     pub loop_pending: usize,
+    pub graph_pending: bool,
+    pub graph_updates: usize,
+    pub chunks: usize,
+    pub fusion_skipped: usize,
     pub position: [f32; 3],
     pub blocks: usize,
     pub allocated_bytes: usize,
@@ -179,6 +183,10 @@ impl Default for SessionView {
             online_updates: 0,
             last_online_correction: 0.0,
             loop_pending: 0,
+            graph_pending: false,
+            graph_updates: 0,
+            chunks: 0,
+            fusion_skipped: 0,
             position: [0.0; 3],
             blocks: 0,
             allocated_bytes: 0,
@@ -226,6 +234,10 @@ impl SessionView {
             online_updates: self.online_updates,
             last_online_correction: self.last_online_correction,
             loop_pending: self.loop_pending,
+            graph_pending: self.graph_pending,
+            graph_updates: self.graph_updates,
+            chunks: self.chunks,
+            fusion_skipped: self.fusion_skipped,
             position: self.position,
             blocks: self.blocks,
             allocated_bytes: self.allocated_bytes,
@@ -272,6 +284,10 @@ pub(crate) struct SessionSnapshot {
     pub online_updates: usize,
     pub last_online_correction: f32,
     pub loop_pending: usize,
+    pub graph_pending: bool,
+    pub graph_updates: usize,
+    pub chunks: usize,
+    pub fusion_skipped: usize,
     pub position: [f32; 3],
     pub blocks: usize,
     pub allocated_bytes: usize,
@@ -677,6 +693,10 @@ impl SessionState {
         view.online_updates = self.scanner.online_loop_updates();
         view.last_online_correction = self.scanner.last_online_correction();
         view.loop_pending = self.scanner.loop_pending();
+        view.graph_pending = self.scanner.graph_pending();
+        view.graph_updates = self.scanner.background_graph_updates();
+        view.chunks = self.scanner.chunks();
+        view.fusion_skipped = self.scanner.fusion_skipped();
         view.blocks = report.blocks;
         view.allocated_bytes = report.allocated_bytes;
 

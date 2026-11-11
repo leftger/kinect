@@ -18,6 +18,8 @@
 
 pub mod coloring;
 pub mod export;
+pub mod frozen_map;
+pub mod global_search;
 pub mod icp;
 pub mod mesh;
 pub mod normals;
@@ -176,9 +178,11 @@ mod tests {
 
     #[test]
     fn project_rejects_points_behind_the_camera() {
-        assert!(intrinsics()
-            .project(&Vector3::new(0.0, 0.0, -1.0))
-            .is_none());
+        assert!(
+            intrinsics()
+                .project(&Vector3::new(0.0, 0.0, -1.0))
+                .is_none()
+        );
         assert!(intrinsics().project(&Vector3::new(0.0, 0.0, 0.0)).is_none());
     }
 

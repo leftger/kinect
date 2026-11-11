@@ -8,10 +8,12 @@ help a little; GPS is useless indoors, and the Kinect v2 has neither.
 depth frame from USB
   -> decode            raw packet to metres          (vendored libfreenect2 port)
   -> odometry          pose relative to the last frame
-  -> TSDF fusion       integrate into a voxel-hashed volume
+  -> global search     optional 4-DOF branch-and-bound fallback
+  -> TSDF fusion       integrate into a voxel-hashed volume, optionally chunked
   -> mesh extraction   naive surface nets, then PLY, OBJ, glTF, or GLB
   -> optional colour   register views, paint the mesh or atlas
   -> optional dataset  posed images, masks, and init.ply for a trainer
+  -> optional localize frozen prior map, trajectory only
 ```
 
 ## Odometry
@@ -41,10 +43,30 @@ which matters most when the sensor turns in place. The ring is bounded
 (`--relocalize-keyframes`, default 6) and only built when the spatial retry is
 actually needed.
 
+`--relocalize-global` adds the missing global half: when that ICP still
+fails, a multi-resolution likelihood grid is built from the local map and a
+branch-and-bound search tries yaw plus translation over a bounded window. The
+search is 4-DOF, not 6-DOF, because a handheld scanner is usually upright; a
+full six-dimensional correlative search is too expensive for a depth frame. The
+result is only an initial guess: point-to-plane ICP refines it and the ordinary
+inlier and residual gates still decide whether the frame is accepted.
+
 ## Fusion
 
 Fusion uses a voxel-hashed TSDF, one hash entry per 8x8x8 block. Each block is
 enumerated once per frame and the projective update runs over its voxels.
+
+`--fusion-filter` applies a motion filter: a frame that moved less
+than 1 cm / 0.005 rad since the last *fused* frame is still tracked and retained
+for loop closure, but it is not integrated. A forced refresh every five frames
+keeps a stationary model averaging. Fusion is the largest per-frame cost, so
+this is the cheapest way to recover time on a slow or stationary scan.
+
+`--tsdf-chunk N` finishes the active volume into a cached chunk every N fused
+frames and starts a fresh one. The odometry frame and `world_from_submap` do not
+change, so this is a memory boundary inside a tracking submap, not a new pose
+boundary. It bounds the active volume and the per-frame fusion cost without
+introducing a boundary guess.
 
 Memory scales with the inverse cube of `--voxel`. Fusion is the largest
 remaining per-frame cost on a large model; see [Performance](performance.md).
@@ -83,6 +105,26 @@ factor-graph structure rather than a single align-and-rebuild pass.
    is retried.
 8. The correction is applied online, incrementally, or by a full rebuild.
 
+`--loop-global` uses the same 4-DOF branch-and-bound search as relocalisation
+when the drifted pose is too far out for ICP. The search supplies an initial
+guess only; forward ICP, reverse ICP, and the round-trip gate are unchanged.
+
+`--match-score S` adds a likelihood gate after ICP: the accepted transform is
+scored against a surface grid built from the target. That is a different signal
+from "points found neighbours" and catches repetitive geometry that happens to
+fit. `S` is a mean likelihood in 0..1; zero disables the gate.
+
+`--submap-graph` switches the optimiser from keyframe nodes to tracking-submap
+nodes, with the keyframes rigidly attached. That is a sparse pose
+adjustment shape. The graph is smaller and a correction moves whole submaps,
+which matches the cached surfaces, but it cannot deform inside one. The keyframe
+graph remains the default accuracy path.
+
+`--graph-worker` runs the online submap-graph solve on a worker thread and
+applies the result before the next frame's world pose is derived. This is the
+local-SLAM/global-SLAM split: capture does not stall behind a
+dense solve. `close_loops` flushes any in-flight job before the final pass.
+
 `--loop-worker` moves only the ICP verification to a worker thread. Keyframe
 selection stays on the capture thread, results are drained each frame, and
 `close_loops` flushes anything still in flight. That keeps a candidate from
@@ -120,6 +162,24 @@ Finalising each submap extracts its surface, about a second at each boundary.
 The surface stays in the submap's own frame with its world transform beside it,
 so a correction can move it without touching the voxels. `--no-submaps` restores
 the single model and the skipped frames.
+
+`--tsdf-chunk N` is a separate, cheaper boundary: every N fused frames the
+active volume is extracted and cached, and a fresh volume starts in the same
+odometry frame. A chunk is not a pose-graph node and adds no boundary guess. It
+bounds the active volume and the fusion cost on a long single-submap scan.
+
+## Frozen-map localisation
+
+`scan localize --in capture.k2df --map prior.ply` treats an existing point cloud
+as an immutable map. Each frame gets a 4-DOF global search for an initial pose,
+point-to-plane ICP refines it, and the same inlier and RMSE gates decide whether
+the pose is returned. Nothing is fused and the prior is never modified; the
+output is a trajectory, optionally written as a point cloud of positions.
+
+The prior reader accepts ASCII and binary little-endian PLY. Only the vertex
+positions are used; colours, normals, and faces are skipped. This is the depth
+camera's version of pure localisation, not a general map
+editor.
 
 ## Colour
 

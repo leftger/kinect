@@ -110,6 +110,13 @@ struct UiConfig {
     online_loops: bool,
     loop_worker: bool,
     incremental_rebuild: bool,
+    fusion_filter: bool,
+    tsdf_chunk_frames: usize,
+    relocalize_global: bool,
+    loop_global: bool,
+    match_score: f32,
+    submap_graph: bool,
+    graph_worker: bool,
     frame_to_model: bool,
     submaps: bool,
     gpu: bool,
@@ -133,6 +140,13 @@ impl UiConfig {
             online_loops: options.online_loops,
             loop_worker: options.loop_worker,
             incremental_rebuild: options.incremental_rebuild,
+            fusion_filter: options.fusion_filter,
+            tsdf_chunk_frames: options.tsdf_chunk_frames,
+            relocalize_global: options.relocalize_global,
+            loop_global: options.loop_global,
+            match_score: options.match_score,
+            submap_graph: options.submap_graph,
+            graph_worker: options.graph_worker,
             frame_to_model: options.frame_to_model,
             submaps: options.submaps,
             gpu: options.gpu,
@@ -356,8 +370,29 @@ impl ScannerApp {
         options.online_loops = self.config.online_loops;
         options.loop_worker = self.config.loop_worker;
         options.incremental_rebuild = self.config.incremental_rebuild;
-        if options.online_loops || options.loop_worker || options.incremental_rebuild {
+        options.fusion_filter = self.config.fusion_filter;
+        options.tsdf_chunk_frames = self.config.tsdf_chunk_frames;
+        options.relocalize_global = self.config.relocalize_global;
+        options.loop_global = self.config.loop_global;
+        options.match_score = self.config.match_score;
+        options.submap_graph = self.config.submap_graph;
+        options.graph_worker = self.config.graph_worker;
+        if options.online_loops
+            || options.loop_worker
+            || options.incremental_rebuild
+            || options.loop_global
+            || options.match_score > 0.0
+            || options.submap_graph
+            || options.graph_worker
+        {
             options.loop_closure = true;
+        }
+        if options.relocalize_global {
+            options.relocalize = true;
+        }
+        if options.graph_worker {
+            options.submap_graph = true;
+            options.online_loops = true;
         }
         options.frame_to_model = self.config.frame_to_model;
         options.submaps = self.config.submaps;
@@ -622,6 +657,48 @@ impl ScannerApp {
                     ui.checkbox(
                         &mut self.config.incremental_rebuild,
                         "move submaps, do not re-fuse",
+                    );
+                    ui.end_row();
+
+                    ui.label("Fusion filter");
+                    ui.checkbox(&mut self.config.fusion_filter, "skip near-duplicate frames");
+                    ui.end_row();
+
+                    ui.label("TSDF chunk");
+                    ui.add(
+                        egui::DragValue::new(&mut self.config.tsdf_chunk_frames)
+                            .range(0..=500)
+                            .speed(1.0)
+                            .suffix(" frames"),
+                    );
+                    ui.end_row();
+
+                    ui.label("Global relocalize");
+                    ui.checkbox(
+                        &mut self.config.relocalize_global,
+                        "branch-and-bound fallback",
+                    );
+                    ui.end_row();
+
+                    ui.label("Global loops");
+                    ui.checkbox(&mut self.config.loop_global, "branch-and-bound fallback");
+                    ui.end_row();
+
+                    ui.label("Match score");
+                    ui.add(
+                        egui::Slider::new(&mut self.config.match_score, 0.0..=1.0)
+                            .text("min likelihood"),
+                    );
+                    ui.end_row();
+
+                    ui.label("Submap graph");
+                    ui.checkbox(&mut self.config.submap_graph, "submap nodes, rigid");
+                    ui.end_row();
+
+                    ui.label("Graph worker");
+                    ui.checkbox(
+                        &mut self.config.graph_worker,
+                        "solve off the capture thread",
                     );
                     ui.end_row();
 
@@ -1209,6 +1286,18 @@ impl ScannerApp {
             );
             if snapshot.loop_pending > 0 {
                 stat(ui, "loop pending", snapshot.loop_pending.to_string());
+            }
+            if snapshot.fusion_skipped > 0 {
+                stat(ui, "filtered", snapshot.fusion_skipped.to_string());
+            }
+            if snapshot.chunks > 0 {
+                stat(ui, "chunks", snapshot.chunks.to_string());
+            }
+            if snapshot.graph_updates > 0 {
+                stat(ui, "graph fixes", snapshot.graph_updates.to_string());
+            }
+            if snapshot.graph_pending {
+                stat(ui, "graph pending", "1".to_string());
             }
             stat(
                 ui,

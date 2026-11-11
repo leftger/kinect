@@ -1,8 +1,8 @@
-//! Triangle meshes and binary PLY output.
+//! Triangle meshes and PLY input/output.
 
 use nalgebra::Vector3;
 use std::fs::File;
-use std::io::{self, BufWriter, Write};
+use std::io::{self, BufRead, BufReader, BufWriter, Read, Write};
 use std::path::Path;
 
 /// An indexed triangle mesh.
@@ -260,6 +260,163 @@ pub fn save_colored_points_ply(
     writer.flush()
 }
 
+/// Read vertex positions from an ASCII or binary little-endian PLY.
+///
+/// Only the `vertex` element is used; faces, colours, normals and any other
+/// properties are skipped. This is the input side of `scan localize`, not a
+/// general-purpose PLY importer.
+pub fn read_points_ply(path: &Path) -> io::Result<Vec<Vector3<f32>>> {
+    let file = File::open(path)?;
+    let mut reader = BufReader::new(file);
+    let mut line = String::new();
+
+    let mut format: Option<String> = None;
+    let mut vertex_count = 0usize;
+    let mut current_element = String::new();
+    let mut properties: Vec<(String, String)> = Vec::new();
+
+    loop {
+        line.clear();
+        if reader.read_line(&mut line)? == 0 {
+            return Err(invalid("PLY header has no end_header"));
+        }
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with("comment") || trimmed.starts_with("obj_info") {
+            continue;
+        }
+        let parts: Vec<&str> = trimmed.split_whitespace().collect();
+        match parts.as_slice() {
+            ["ply"] => {}
+            ["format", kind, _] => format = Some((*kind).to_string()),
+            ["element", element, count] => {
+                current_element = (*element).to_string();
+                if *element == "vertex" {
+                    vertex_count = count
+                        .parse()
+                        .map_err(|_| invalid("bad vertex count in PLY header"))?;
+                }
+            }
+            ["property", "list", ..] => {
+                if current_element == "vertex" {
+                    return Err(invalid("list properties are not supported on vertices"));
+                }
+            }
+            ["property", ty, name] => {
+                if current_element == "vertex" {
+                    properties.push(((*ty).to_string(), (*name).to_string()));
+                }
+            }
+            ["end_header"] => break,
+            _ => {}
+        }
+    }
+
+    let format = format.ok_or_else(|| invalid("PLY has no format line"))?;
+    if vertex_count == 0 {
+        return Ok(Vec::new());
+    }
+    let x = property_index(&properties, "x")?;
+    let y = property_index(&properties, "y")?;
+    let z = property_index(&properties, "z")?;
+
+    match format.as_str() {
+        "ascii" => {
+            let mut points = Vec::with_capacity(vertex_count);
+            let mut index = 0;
+            while index < vertex_count {
+                line.clear();
+                if reader.read_line(&mut line)? == 0 {
+                    return Err(invalid("PLY ended before all vertices"));
+                }
+                let trimmed = line.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                let values: Vec<&str> = trimmed.split_whitespace().collect();
+                let parse = |column: usize| -> io::Result<f32> {
+                    values
+                        .get(column)
+                        .and_then(|value| value.parse::<f32>().ok())
+                        .ok_or_else(|| invalid("bad ASCII vertex in PLY"))
+                };
+                points.push(Vector3::new(parse(x)?, parse(y)?, parse(z)?));
+                index += 1;
+            }
+            Ok(points)
+        }
+        "binary_little_endian" => {
+            let mut offsets = Vec::with_capacity(properties.len());
+            let mut stride = 0usize;
+            for (ty, _) in &properties {
+                offsets.push(stride);
+                stride += property_size(ty)?;
+            }
+            let bytes = stride
+                .checked_mul(vertex_count)
+                .ok_or_else(|| invalid("PLY vertex block is too large"))?;
+            let mut block = vec![0u8; bytes];
+            reader.read_exact(&mut block)?;
+
+            let mut points = Vec::with_capacity(vertex_count);
+            for index in 0..vertex_count {
+                let base = index * stride;
+                points.push(Vector3::new(
+                    read_binary_f32(&block, base + offsets[x], &properties[x].0)?,
+                    read_binary_f32(&block, base + offsets[y], &properties[y].0)?,
+                    read_binary_f32(&block, base + offsets[z], &properties[z].0)?,
+                ));
+            }
+            Ok(points)
+        }
+        "binary_big_endian" => Err(invalid("big-endian PLY is not supported")),
+        other => Err(invalid(&format!("unsupported PLY format {other}"))),
+    }
+}
+
+fn property_index(properties: &[(String, String)], name: &str) -> io::Result<usize> {
+    properties
+        .iter()
+        .position(|(_, property)| property == name)
+        .ok_or_else(|| invalid(&format!("PLY vertex has no {name} property")))
+}
+
+fn property_size(ty: &str) -> io::Result<usize> {
+    match ty {
+        "char" | "uchar" | "int8" | "uint8" => Ok(1),
+        "short" | "ushort" | "int16" | "uint16" => Ok(2),
+        "int" | "uint" | "int32" | "uint32" | "float" | "float32" => Ok(4),
+        "double" | "float64" => Ok(8),
+        other => Err(invalid(&format!("unsupported PLY property type {other}"))),
+    }
+}
+
+fn read_binary_f32(block: &[u8], offset: usize, ty: &str) -> io::Result<f32> {
+    let bytes = block
+        .get(offset..)
+        .ok_or_else(|| invalid("PLY vertex is truncated"))?;
+    match ty {
+        "float" | "float32" => {
+            let bytes: [u8; 4] = bytes
+                .get(..4)
+                .and_then(|bytes| bytes.try_into().ok())
+                .ok_or_else(|| invalid("truncated PLY float"))?;
+            Ok(f32::from_le_bytes(bytes))
+        }
+        "double" | "float64" => {
+            let bytes: [u8; 8] = bytes
+                .get(..8)
+                .and_then(|bytes| bytes.try_into().ok())
+                .ok_or_else(|| invalid("truncated PLY double"))?;
+            Ok(f64::from_le_bytes(bytes) as f32)
+        }
+        other => Err(invalid(&format!("{other} is not a coordinate type"))),
+    }
+}
+
+fn invalid(message: &str) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, message.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -474,5 +631,40 @@ mod tests {
         assert!((normal_after.x - (-normal_before.x)).abs() < 1e-6);
         assert!((normal_after.y - normal_before.y).abs() < 1e-6);
         assert!((normal_after.z - normal_before.z).abs() < 1e-6);
+    }
+
+    #[test]
+    fn points_ply_round_trips_through_the_reader() {
+        let path = std::env::temp_dir().join("scan-points-reader.ply");
+        let points = vec![
+            Vector3::new(0.0, 0.0, 0.0),
+            Vector3::new(1.0, -2.0, 3.5),
+            Vector3::new(-0.25, 0.5, 4.0),
+        ];
+        save_points_ply(&path, &points).expect("write");
+        let read = read_points_ply(&path).expect("read");
+        assert_eq!(read.len(), points.len());
+        for (actual, expected) in read.iter().zip(&points) {
+            assert!((actual - expected).norm() < 1e-6);
+        }
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn reads_ascii_points_and_ignores_extra_properties() {
+        let path = std::env::temp_dir().join("scan-ascii-points.ply");
+        let text = "ply\nformat ascii 1.0\n\
+                    element vertex 2\n\
+                    property float x\nproperty float y\nproperty float z\n\
+                    property uchar red\nproperty uchar green\nproperty uchar blue\n\
+                    end_header\n\
+                    0.0 1.0 2.0 255 0 0\n\
+                    -1.0 0.5 3.0 0 255 0\n";
+        std::fs::write(&path, text).expect("write");
+        let read = read_points_ply(&path).expect("read");
+        assert_eq!(read.len(), 2);
+        assert!((read[0] - Vector3::new(0.0, 1.0, 2.0)).norm() < 1e-6);
+        assert!((read[1] - Vector3::new(-1.0, 0.5, 3.0)).norm() < 1e-6);
+        std::fs::remove_file(&path).ok();
     }
 }

@@ -8,10 +8,36 @@ use geom::texturing::{TexturedMesh, TexturingParams, TexturingReport, texture};
 use geom::tsdf::{IntegrationStats, TsdfParams, TsdfVolume};
 use geom::{DepthImage, Intrinsics, transform_point};
 use nalgebra::{Isometry3, Translation3, Vector3};
+use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
+use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use crate::loop_closure::{LoopClosureConfig, LoopFinder, VisualDescriptor};
 use crate::odometry::{Odometry, OdometryConfig, TrackReport};
+
+/// A fusion motion filter, adapted to a frame-counted scanner.
+///
+/// A frame that moved less than this since the last *fused* frame is tracked
+/// but not integrated. Fusion is the largest per-frame cost, and a stationary
+/// or slow handheld scan produces many near-duplicate frames that add nothing
+/// to the surface. `max_interval_frames` forces one through periodically so a
+/// stationary model still accumulates some averaging.
+#[derive(Clone, Copy, Debug)]
+pub struct MotionFilterConfig {
+    pub max_distance: f32,
+    pub max_angle: f32,
+    pub max_interval_frames: usize,
+}
+
+impl Default for MotionFilterConfig {
+    fn default() -> Self {
+        Self {
+            max_distance: 0.01,
+            max_angle: 0.005,
+            max_interval_frames: 5,
+        }
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct ScannerConfig {
@@ -52,6 +78,26 @@ pub struct ScannerConfig {
     /// rigid submap move cannot fix drift *inside* a submap. The full rebuild
     /// remains the accuracy default.
     pub incremental_rebuild: bool,
+    /// Skip fusion for frames that barely moved. Tracking, loop closure, and the
+    /// retained depth still see them; only the TSDF integration is skipped.
+    pub fusion_filter: Option<MotionFilterConfig>,
+    /// Finish the active TSDF into a cached chunk every N fused frames. Zero
+    /// disables chunking. This bounds the active volume and the per-frame
+    /// fusion cost without resetting the odometry frame or creating a pose
+    /// boundary: chunks are a memory policy, not a new submap.
+    pub tsdf_chunk_frames: usize,
+    /// Optimise a graph whose nodes are tracking submaps rather than
+    /// keyframes, a sparse pose-adjustment shape. A correction
+    /// moves each submap rigidly, so this is cheaper and matches the
+    /// incremental path, but it cannot deform inside a submap. Off by default;
+    /// the keyframe graph is the accuracy path.
+    pub submap_graph: bool,
+    /// Run the online submap-graph solve on a worker thread instead of on the
+    /// capture thread. Local SLAM and global SLAM stay on
+    /// separate threads for the same reason: the capture loop must not stall
+    /// behind a dense solve. The final `close_loops` pass is still synchronous
+    /// and flushes any online job first.
+    pub graph_worker: bool,
 }
 
 impl Default for ScannerConfig {
@@ -68,6 +114,10 @@ impl Default for ScannerConfig {
             submaps: true,
             online_loops: false,
             incremental_rebuild: false,
+            fusion_filter: None,
+            tsdf_chunk_frames: 0,
+            submap_graph: false,
+            graph_worker: false,
         }
     }
 }
@@ -120,6 +170,11 @@ pub const MAX_CORRECTION_RADIANS: f32 = 0.5;
 #[derive(Clone, Copy, Debug)]
 pub struct ClosureReport {
     pub nodes: usize,
+    /// Keyframe nodes in the optimised graph.
+    pub keyframe_nodes: usize,
+    /// Submap nodes in the optimised graph. Non-zero only for the submap-graph
+    /// mode; the keyframe graph has none.
+    pub submap_nodes: usize,
     pub odometry_edges: usize,
     /// Loop edges used by the final optimisation.
     pub loop_edges: usize,
@@ -206,6 +261,16 @@ pub struct Scanner {
     frames: usize,
     fused: usize,
     rejected: usize,
+    /// Frames that tracked but the fusion motion filter skipped.
+    fusion_skipped: usize,
+    /// Pose of the last frame actually integrated, for the motion filter.
+    last_fused: Option<Isometry3<f32>>,
+    /// Frames since the last integration, for the forced-refresh interval.
+    frames_since_fused: usize,
+    /// First frame of the active TSDF chunk.
+    chunk_start: usize,
+    /// Fused frames in the active TSDF chunk.
+    chunk_frames: usize,
     trajectory: Vec<Vector3<f32>>,
     points: Vec<Vector3<f32>>,
     /// Cumulative time in tracking and in fusion, for the end-of-scan breakdown.
@@ -225,6 +290,12 @@ pub struct Scanner {
     /// Frames retained so the model can be rebuilt; parallel to `poses`.
     kept: Vec<KeptFrame>,
     loops: Option<LoopFinder>,
+    /// Optional background solver for the online submap graph.
+    graph_worker: Option<GraphWorker>,
+    graph_pending: bool,
+    graph_total_loops: usize,
+    /// How many online corrections the worker delivered.
+    graph_updates: usize,
     /// Colour from the frames that were fused. A rejected frame did not
     /// contribute geometry, so its colour is not kept either. After an accepted
     /// loop closure each view's pose is the corrected pose of its frame.
@@ -263,14 +334,20 @@ struct FinishedSubmap {
     mesh: Mesh,
     /// World-from-submap for this surface.
     transform: Isometry3<f32>,
-    /// Arrival index of the submap's first frame, used to pick its correction.
+    /// Arrival index of this chunk's first frame, used to pick its correction.
     start: usize,
+    /// Tracking submap this chunk belongs to. Several chunks can share one.
+    submap: usize,
 }
 
-/// What optimising the keyframe graph produced, projected onto every frame.
+/// What optimising the graph produced, projected onto every frame.
 struct GraphOutcome {
     poses: Vec<Isometry3<f32>>,
     nodes: usize,
+    keyframe_nodes: usize,
+    submap_nodes: usize,
+    /// New submap poses when the submap graph was used.
+    submap_poses: Option<Vec<Isometry3<f32>>>,
     odometry_edges: usize,
     max_correction: f32,
     max_rotation: f32,
@@ -278,6 +355,164 @@ struct GraphOutcome {
     cost_after: f64,
     iterations: usize,
     converged: bool,
+}
+
+/// A snapshot of everything the submap graph needs. It is deliberately owned
+/// data with no borrow of the scanner, so it can be moved to a worker thread.
+struct SubmapGraphJob {
+    poses: Vec<Isometry3<f32>>,
+    loop_edges: Vec<Edge>,
+    submap_starts: Vec<usize>,
+}
+
+/// Optional pose-graph worker. Owned by [`Scanner`]; dropping it closes the job
+/// channel and joins the thread.
+struct GraphWorker {
+    sender: Option<Sender<SubmapGraphJob>>,
+    receiver: Receiver<Option<(GraphOutcome, usize, bool)>>,
+    handle: Option<JoinHandle<()>>,
+}
+
+impl GraphWorker {
+    fn spawn() -> Self {
+        let (job_sender, job_receiver) = mpsc::channel::<SubmapGraphJob>();
+        let (outcome_sender, outcome_receiver) = mpsc::channel();
+        let handle = thread::Builder::new()
+            .name("scan-pose-graph".to_string())
+            .spawn(move || {
+                while let Ok(job) = job_receiver.recv() {
+                    if outcome_sender.send(solve_submap_graph(&job)).is_err() {
+                        break;
+                    }
+                }
+            })
+            .expect("spawn pose-graph worker");
+
+        Self {
+            sender: Some(job_sender),
+            receiver: outcome_receiver,
+            handle: Some(handle),
+        }
+    }
+}
+
+impl Drop for GraphWorker {
+    fn drop(&mut self) {
+        // Closing the sender lets the worker leave its receive loop; joining it
+        // before the receiver disappears keeps shutdown deterministic.
+        self.sender.take();
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+/// Optimise submap nodes with the keyframes rigidly attached.
+///
+/// Free function, not a method, so the exact same solve runs synchronously or
+/// on [`GraphWorker`].
+fn solve_submap_graph(job: &SubmapGraphJob) -> Option<(GraphOutcome, usize, bool)> {
+    let submaps = job.submap_starts.len();
+    if submaps < 2 {
+        return None;
+    }
+    let submap_poses: Vec<Isometry3<f32>> = job
+        .submap_starts
+        .iter()
+        .map(|start| job.poses[*start])
+        .collect();
+
+    let submap_of = |frame: usize| -> usize {
+        job.submap_starts
+            .partition_point(|start| *start <= frame)
+            .saturating_sub(1)
+    };
+
+    let mut loop_edges = job.loop_edges.clone();
+    loop {
+        if loop_edges.is_empty() {
+            return None;
+        }
+
+        let mut graph = PoseGraph::new(submap_poses[0]);
+        for pose in &submap_poses[1..] {
+            graph.add_node(*pose);
+        }
+
+        // Weak chain edges keep the submap sequence connected. They are a
+        // prior, not a measurement, so a loop edge is free to move a submap
+        // away from the guess.
+        let mut odometry_edges = 0;
+        for index in 0..submaps - 1 {
+            let measurement = submap_poses[index].inverse() * submap_poses[index + 1];
+            graph.add_edge(index, index + 1, measurement, 0.1);
+            odometry_edges += 1;
+        }
+
+        let mut added = 0;
+        for edge in &loop_edges {
+            let from = submap_of(edge.from);
+            let to = submap_of(edge.to);
+            if from == to {
+                continue;
+            }
+            // T_sub_from^-1 T_sub_to, built from the keyframe loop and the
+            // keyframes' current offsets inside their submaps.
+            let from_rel = submap_poses[from].inverse() * job.poses[edge.from];
+            let to_rel = submap_poses[to].inverse() * job.poses[edge.to];
+            let measurement = from_rel * edge.measurement * to_rel.inverse();
+            graph.add_edge(from, to, measurement, edge.weight);
+            added += 1;
+        }
+        if added == 0 {
+            return None;
+        }
+
+        let optimised = graph.optimize(&PoseGraphParams::default());
+        let new_submap_poses = graph.nodes().to_vec();
+        let poses: Vec<Isometry3<f32>> = job
+            .poses
+            .iter()
+            .enumerate()
+            .map(|(frame, pose)| {
+                let submap = submap_of(frame);
+                let delta = new_submap_poses[submap] * submap_poses[submap].inverse();
+                delta * pose
+            })
+            .collect();
+
+        let mut max_correction = 0.0f32;
+        let mut max_rotation = 0.0f32;
+        for (before, after) in job.poses.iter().zip(&poses) {
+            let delta = before.inverse() * after;
+            max_correction = max_correction.max(delta.translation.vector.norm());
+            max_rotation = max_rotation.max(delta.rotation.angle());
+        }
+        let within =
+            max_correction <= MAX_CORRECTION_METRES && max_rotation <= MAX_CORRECTION_RADIANS;
+
+        let outcome = GraphOutcome {
+            poses,
+            nodes: submaps,
+            keyframe_nodes: 0,
+            submap_nodes: submaps,
+            submap_poses: Some(new_submap_poses),
+            odometry_edges,
+            max_correction,
+            max_rotation,
+            cost_before: optimised.cost_before,
+            cost_after: optimised.cost_after,
+            iterations: optimised.iterations,
+            converged: optimised.converged,
+        };
+
+        let kept = loop_edges.len();
+        if within || kept <= 1 {
+            return Some((outcome, kept, within));
+        }
+
+        loop_edges.pop();
+    }
 }
 
 /// How an accepted correction is put into the model.
@@ -384,6 +619,11 @@ impl Scanner {
             ..config.tsdf
         });
         let odometry = Odometry::new(intrinsics, config.odometry.clone());
+        let graph_worker = if config.graph_worker && config.loop_closure.is_some() {
+            Some(GraphWorker::spawn())
+        } else {
+            None
+        };
         let loops = config.loop_closure.map(LoopFinder::new);
 
         Self {
@@ -394,6 +634,11 @@ impl Scanner {
             frames: 0,
             fused: 0,
             rejected: 0,
+            fusion_skipped: 0,
+            last_fused: None,
+            frames_since_fused: 0,
+            chunk_start: 0,
+            chunk_frames: 0,
             trajectory: Vec::new(),
             points: Vec::new(),
             total_tracking: Duration::ZERO,
@@ -402,6 +647,10 @@ impl Scanner {
             poses: Vec::new(),
             kept: Vec::new(),
             loops,
+            graph_worker,
+            graph_pending: false,
+            graph_total_loops: 0,
+            graph_updates: 0,
             color_views: Vec::new(),
             color_supplied: 0,
             dimensions: None,
@@ -434,18 +683,45 @@ impl Scanner {
     /// matters more than time.
     fn begin_submap(&mut self, world_from_submap: Isometry3<f32>) {
         let mesh = self.volume.extract_mesh();
-        let start = self.submap_starts.last().copied().unwrap_or(0);
-        self.finished_submaps.push(FinishedSubmap {
-            mesh,
-            transform: self.world_from_submap,
-            start,
-        });
+        let submap = self.submap_starts.len().saturating_sub(1);
+        if !mesh.is_empty() {
+            self.finished_submaps.push(FinishedSubmap {
+                mesh,
+                transform: self.world_from_submap,
+                start: self.chunk_start,
+                submap,
+            });
+        }
         self.volume = self.fresh_volume();
         self.world_from_submap = world_from_submap;
         self.submap_starts.push(self.frames);
+        self.chunk_start = self.frames;
+        self.chunk_frames = 0;
         // A new rigid piece means the model is no longer one merged world, even
         // if an earlier correction had collapsed the count to one.
         self.model_merged = false;
+    }
+
+    /// Finish the active TSDF into a cached chunk and start a fresh volume.
+    ///
+    /// The odometry frame and `world_from_submap` do not change: a chunk is a
+    /// memory boundary inside one tracking submap, not a pose boundary. That is
+    /// the difference between a submap budget and your submap
+    /// failure path, and it is why this costs no trajectory accuracy.
+    fn finish_chunk(&mut self) {
+        let mesh = self.volume.extract_mesh();
+        if !mesh.is_empty() {
+            let submap = self.submap_starts.len().saturating_sub(1);
+            self.finished_submaps.push(FinishedSubmap {
+                mesh,
+                transform: self.world_from_submap,
+                start: self.chunk_start,
+                submap,
+            });
+        }
+        self.volume = self.fresh_volume();
+        self.chunk_start = self.frames + 1;
+        self.chunk_frames = 0;
     }
 
     /// The union of every submap's surface, in the world frame.
@@ -540,6 +816,11 @@ impl Scanner {
             new_submap = true;
         }
 
+        // A background correction changes `world_from_submap` and every earlier
+        // pose. Apply it before this frame's world pose is derived, or the frame
+        // would be placed in the pre-correction frame.
+        self.poll_graph();
+
         // The odometry pose is local to the current submap. Everything the
         // scanner stores, colours, or exports is in the world frame.
         let local_pose = track.pose;
@@ -548,11 +829,32 @@ impl Scanner {
 
         // The first frame of the scan or of a submap defines that submap's
         // origin and is always fused: there is no target to accept it against.
-        let fuse = first || new_submap || track.accepted;
+        let mut fuse = first || new_submap || track.accepted;
+        let mut fusion_skipped = false;
+
+        // Fusion motion filter. The frame is still tracked, still
+        // retained for loop closure, and still contributes to the pose graph;
+        // it just does not spend a fusion pass on a near-duplicate view. The
+        // interval forces one through so a stationary model keeps averaging.
+        if fuse && !first && !new_submap {
+            if let (Some(filter), Some(last)) = (self.config.fusion_filter, self.last_fused) {
+                let motion = last.inverse() * pose;
+                if motion.translation.vector.norm() < filter.max_distance
+                    && motion.rotation.angle() < filter.max_angle
+                    && self.frames_since_fused < filter.max_interval_frames.max(1)
+                {
+                    fuse = false;
+                    fusion_skipped = true;
+                }
+            }
+        }
 
         let integration = if fuse {
             self.fused += 1;
             self.trajectory.push(pose.translation.vector);
+            self.last_fused = Some(pose);
+            self.frames_since_fused = 0;
+            self.chunk_frames += 1;
 
             let started = Instant::now();
             let stats = self.volume.integrate(&image, &intrinsics, &local_pose);
@@ -560,9 +862,26 @@ impl Scanner {
 
             Some(stats)
         } else {
-            self.rejected += 1;
+            if fusion_skipped {
+                self.fusion_skipped += 1;
+            } else {
+                self.rejected += 1;
+            }
+            self.frames_since_fused += 1;
             None
         };
+
+        // Bound the active volume. This is a memory boundary inside the current
+        // tracking submap, so it deliberately does not touch the odometry pose,
+        // `world_from_submap`, or `pose_boundaries`.
+        if fuse
+            && self.config.tsdf_chunk_frames > 0
+            && self.chunk_frames >= self.config.tsdf_chunk_frames
+        {
+            let started = Instant::now();
+            self.finish_chunk();
+            self.total_submap += started.elapsed();
+        }
 
         self.poses.push(pose);
         self.pose_boundaries.push(new_submap && !first);
@@ -710,6 +1029,10 @@ impl Scanner {
     /// corrections will already have been applied; this pass is still the final
     /// global one, and it waits for any background verification still in flight.
     pub fn close_loops(&mut self) -> ClosureReport {
+        // An online worker job may still be running. Apply its result before
+        // reading the loops, so the final pass sees the same trajectory the
+        // capture thread would have.
+        self.flush_graph();
         if let Some(finder) = self.loops.as_mut() {
             finder.flush();
         }
@@ -728,6 +1051,8 @@ impl Scanner {
 
         let nothing = ClosureReport {
             nodes,
+            keyframe_nodes: nodes,
+            submap_nodes: 0,
             odometry_edges: 0,
             loop_edges: total_loops,
             dropped_loops: 0,
@@ -784,6 +1109,28 @@ impl Scanner {
             return None;
         }
 
+        if self.config.graph_worker {
+            if self.graph_pending {
+                return None;
+            }
+            let Some(worker) = self.graph_worker.as_ref() else {
+                return None;
+            };
+            let Some(sender) = worker.sender.as_ref() else {
+                return None;
+            };
+            let job = SubmapGraphJob {
+                poses: self.poses.clone(),
+                loop_edges,
+                submap_starts: self.submap_starts.clone(),
+            };
+            if sender.send(job).is_ok() {
+                self.graph_pending = true;
+                self.graph_total_loops = total_loops;
+            }
+            return None;
+        }
+
         let (outcome, kept, within) = self.optimise_keyframe_graph(loop_edges)?;
         if !within {
             let closure = self.report_from_outcome(&outcome, 0, total_loops, true, false, true);
@@ -799,6 +1146,69 @@ impl Scanner {
         Some(closure)
     }
 
+    /// Drain a finished background graph result, if one is ready.
+    fn poll_graph(&mut self) {
+        if !self.graph_pending {
+            return;
+        }
+        let Some(worker) = self.graph_worker.as_mut() else {
+            self.graph_pending = false;
+            return;
+        };
+        match worker.receiver.try_recv() {
+            Ok(result) => {
+                self.graph_pending = false;
+                self.accept_graph_result(result);
+            }
+            Err(TryRecvError::Empty) => {}
+            Err(TryRecvError::Disconnected) => self.graph_pending = false,
+        }
+    }
+
+    /// Wait for an in-flight graph job before the final pass rewrites the
+    /// trajectory. A 30 s backstop matches the loop worker's.
+    fn flush_graph(&mut self) {
+        if !self.graph_pending {
+            return;
+        }
+        let Some(worker) = self.graph_worker.as_mut() else {
+            self.graph_pending = false;
+            return;
+        };
+        match worker.receiver.recv_timeout(Duration::from_secs(30)) {
+            Ok(result) => {
+                self.graph_pending = false;
+                self.accept_graph_result(result);
+            }
+            Err(_) => self.graph_pending = false,
+        }
+    }
+
+    fn accept_graph_result(&mut self, result: Option<(GraphOutcome, usize, bool)>) {
+        let Some((outcome, kept, within)) = result else {
+            return;
+        };
+        if within {
+            self.graph_updates += 1;
+            self.online_updates += 1;
+            self.last_online_correction = outcome.max_correction;
+            let closure = self.apply_corrections(
+                &outcome,
+                CorrectionMode::Online,
+                kept,
+                self.graph_total_loops,
+                true,
+            );
+            self.closure = Some(closure);
+        } else {
+            // Refuse the correction, but keep the report so the caller can see
+            // that the worker ran and why it was rejected.
+            let closure =
+                self.report_from_outcome(&outcome, 0, self.graph_total_loops, true, false, true);
+            self.closure = Some(closure);
+        }
+    }
+
     /// Build and optimise the keyframe graph, dropping the weakest loop while
     /// the requested correction stays implausible.
     ///
@@ -809,6 +1219,16 @@ impl Scanner {
         &self,
         loop_edges: Vec<Edge>,
     ) -> Option<(GraphOutcome, usize, bool)> {
+        // A sparse pose-adjustment shape, when asked for: submap nodes with the
+        // keyframes rigidly attached. If none of the loops actually cross a
+        // submap, fall through to the keyframe graph rather than returning no
+        // correction at all.
+        if self.config.submap_graph {
+            if let Some(result) = self.optimise_submap_graph(loop_edges.clone()) {
+                return Some(result);
+            }
+        }
+
         let finder = self.loops.as_ref()?;
         let keyframes: Vec<(usize, Isometry3<f32>)> = finder
             .keyframes()
@@ -890,6 +1310,9 @@ impl Scanner {
             let outcome = GraphOutcome {
                 poses,
                 nodes: keyframes.len(),
+                keyframe_nodes: keyframes.len(),
+                submap_nodes: 0,
+                submap_poses: None,
                 odometry_edges,
                 max_correction,
                 max_rotation,
@@ -909,6 +1332,20 @@ impl Scanner {
         }
     }
 
+    /// Optimise submap nodes with the keyframes rigidly attached.
+    ///
+    /// This is a sparse pose-adjustment shape. The graph is much
+    /// smaller than the keyframe graph, and a correction moves a whole submap,
+    /// which matches the cached surfaces and the incremental path. It cannot
+    /// deform inside a submap, so it is opt-in.
+    fn optimise_submap_graph(&self, loop_edges: Vec<Edge>) -> Option<(GraphOutcome, usize, bool)> {
+        solve_submap_graph(&SubmapGraphJob {
+            poses: self.poses.clone(),
+            loop_edges,
+            submap_starts: self.submap_starts.clone(),
+        })
+    }
+
     fn report_from_outcome(
         &self,
         outcome: &GraphOutcome,
@@ -920,6 +1357,8 @@ impl Scanner {
     ) -> ClosureReport {
         ClosureReport {
             nodes: outcome.nodes,
+            keyframe_nodes: outcome.keyframe_nodes,
+            submap_nodes: outcome.submap_nodes,
             odometry_edges: outcome.odometry_edges,
             loop_edges: kept_loops,
             dropped_loops: total_loops.saturating_sub(kept_loops),
@@ -945,25 +1384,38 @@ impl Scanner {
     ) -> ClosureReport {
         let old_poses = std::mem::replace(&mut self.poses, outcome.poses.clone());
 
-        // Correction at each frame, used to move a finished submap as one rigid
-        // piece. That is the keyframe-cloud trade-off: cheap, and correct for a
-        // rigid submap, but it cannot fix drift within one.
-        let corrections: Vec<Isometry3<f32>> = old_poses
-            .iter()
-            .zip(&outcome.poses)
-            .map(|(old, new)| new * old.inverse())
-            .collect();
-        for submap in &mut self.finished_submaps {
-            if let Some(correction) = corrections.get(submap.start) {
-                submap.transform = *correction * submap.transform;
+        if let Some(new_submap_poses) = &outcome.submap_poses {
+            // Submap graph: the optimiser produced an absolute pose for every
+            // tracking submap, so each cached chunk moves with its own node.
+            for submap in &mut self.finished_submaps {
+                if let Some(pose) = new_submap_poses.get(submap.submap) {
+                    submap.transform = *pose;
+                }
             }
-        }
+            if let Some(last) = new_submap_poses.last() {
+                self.world_from_submap = *last;
+            }
+        } else {
+            // Keyframe graph: move a finished chunk by the correction at its
+            // first frame. That is the keyframe-cloud trade-off: cheap, and
+            // correct for a rigid piece, but it cannot fix drift within one.
+            let corrections: Vec<Isometry3<f32>> = old_poses
+                .iter()
+                .zip(&outcome.poses)
+                .map(|(old, new)| new * old.inverse())
+                .collect();
+            for submap in &mut self.finished_submaps {
+                if let Some(correction) = corrections.get(submap.start) {
+                    submap.transform = *correction * submap.transform;
+                }
+            }
 
-        // The odometry's local frame did not move; the world transform did.
-        // Anchor the current submap on the last corrected world pose so the
-        // next frame continues from the corrected trajectory.
-        if let Some(last) = outcome.poses.last() {
-            self.world_from_submap = *last * self.odometry.pose().inverse();
+            // The odometry's local frame did not move; the world transform did.
+            // Anchor the current submap on the last corrected world pose so the
+            // next frame continues from the corrected trajectory.
+            if let Some(last) = outcome.poses.last() {
+                self.world_from_submap = *last * self.odometry.pose().inverse();
+            }
         }
 
         self.trajectory.clear();
@@ -1009,6 +1461,8 @@ impl Scanner {
         if self.frames > 0 {
             self.submap_starts.push(0);
         }
+        self.chunk_start = 0;
+        self.chunk_frames = 0;
         self.trajectory.clear();
 
         let mut fused = 0;
@@ -1090,10 +1544,10 @@ impl Scanner {
             warnings.push("no frames were captured".to_string());
         } else if self.fused == 0 {
             warnings.push("no frames were fused".to_string());
-        } else if self.fused * 2 < self.frames {
+        } else if (self.fused + self.fusion_skipped) * 2 < self.frames {
             warnings.push(format!(
-                "only {} of {} frames were fused",
-                self.fused, self.frames
+                "only {} of {} frames were fused ({} motion-filtered)",
+                self.fused, self.frames, self.fusion_skipped
             ));
         }
         if self.frames > 0 && self.rejected > 0 && self.rejected * 3 >= self.frames {
@@ -1260,6 +1714,17 @@ impl Scanner {
         self.rejected
     }
 
+    /// Frames that tracked but the fusion motion filter skipped.
+    pub fn fusion_skipped(&self) -> usize {
+        self.fusion_skipped
+    }
+
+    /// Cached TSDF chunks. Chunks are memory boundaries inside tracking
+    /// submaps, so this can exceed [`Self::submaps`].
+    pub fn chunks(&self) -> usize {
+        self.finished_submaps.len()
+    }
+
     pub fn block_count(&self) -> usize {
         self.volume.block_count()
     }
@@ -1311,6 +1776,16 @@ impl Scanner {
     /// Largest pose move from the most recent online correction, in metres.
     pub fn last_online_correction(&self) -> f32 {
         self.last_online_correction
+    }
+
+    /// True while a background graph solve is in flight.
+    pub fn graph_pending(&self) -> bool {
+        self.graph_pending
+    }
+
+    /// How many online corrections the background graph worker applied.
+    pub fn background_graph_updates(&self) -> usize {
+        self.graph_updates
     }
 
     /// Loop verifications still in flight on the background worker.
@@ -2135,6 +2610,46 @@ mod tests {
         )
     }
 
+    fn scanner_with_submap_graph() -> Scanner {
+        Scanner::new(
+            intrinsics(),
+            ScannerConfig {
+                tsdf: TsdfParams {
+                    voxel_size: 0.04,
+                    truncation: 0.16,
+                    ..TsdfParams::default()
+                },
+                loop_closure: Some(LoopClosureConfig {
+                    min_index_gap: 2,
+                    ..LoopClosureConfig::default()
+                }),
+                submap_graph: true,
+                ..ScannerConfig::default()
+            },
+        )
+    }
+
+    fn scanner_with_background_graph() -> Scanner {
+        Scanner::new(
+            intrinsics(),
+            ScannerConfig {
+                tsdf: TsdfParams {
+                    voxel_size: 0.04,
+                    truncation: 0.16,
+                    ..TsdfParams::default()
+                },
+                loop_closure: Some(LoopClosureConfig {
+                    min_index_gap: 2,
+                    ..LoopClosureConfig::default()
+                }),
+                submap_graph: true,
+                graph_worker: true,
+                online_loops: true,
+                ..ScannerConfig::default()
+            },
+        )
+    }
+
     /// Front, side, and a return to the front 20 cm to the right. The return
     /// starts a submap at the failed alignment's guess, so only a loop edge can
     /// put it back where it belongs.
@@ -2320,5 +2835,109 @@ mod tests {
             corrected[3].translation.x
         );
         assert!((corrected[4].translation.x - 0.6).abs() < 1e-5);
+    }
+
+    #[test]
+    fn the_fusion_motion_filter_skips_near_duplicate_frames() {
+        let mut scanner = Scanner::new(
+            intrinsics(),
+            ScannerConfig {
+                tsdf: TsdfParams {
+                    voxel_size: 0.04,
+                    truncation: 0.16,
+                    ..TsdfParams::default()
+                },
+                fusion_filter: Some(MotionFilterConfig {
+                    max_distance: 0.02,
+                    max_angle: 0.02,
+                    max_interval_frames: 100,
+                }),
+                ..ScannerConfig::default()
+            },
+        );
+        let frame = room_frame(WIDTH, HEIGHT, &intrinsics());
+
+        for _ in 0..6 {
+            scanner.add_frame(&frame, WIDTH, HEIGHT);
+        }
+
+        assert_eq!(scanner.fused(), 1, "only the first frame should fuse");
+        assert_eq!(scanner.fusion_skipped(), 5);
+        assert_eq!(scanner.rejected(), 0, "filtered frames are not rejections");
+        assert!(!scanner.mesh().is_empty());
+    }
+
+    #[test]
+    fn tsdf_chunks_bound_the_active_volume_without_a_pose_boundary() {
+        let mut scanner = Scanner::new(
+            intrinsics(),
+            ScannerConfig {
+                tsdf: TsdfParams {
+                    voxel_size: 0.04,
+                    truncation: 0.16,
+                    ..TsdfParams::default()
+                },
+                tsdf_chunk_frames: 2,
+                ..ScannerConfig::default()
+            },
+        );
+        let frame = room_frame(WIDTH, HEIGHT, &intrinsics());
+
+        for _ in 0..6 {
+            scanner.add_frame(&frame, WIDTH, HEIGHT);
+        }
+
+        assert_eq!(scanner.fused(), 6);
+        assert_eq!(scanner.submaps(), 1, "chunks must not become pose submaps");
+        assert_eq!(scanner.chunks(), 3, "six frames at two per chunk");
+        assert!(scanner.submap_surface_bytes() > 0);
+        assert!(!scanner.mesh().is_empty(), "the cached chunks are missing");
+    }
+
+    #[test]
+    fn the_submap_graph_uses_submap_nodes_and_moves_them_rigidly() {
+        let mut scanner = scanner_with_submap_graph();
+        add_revisit_sequence(&mut scanner);
+        assert_eq!(scanner.submaps(), 3);
+
+        let report = scanner.close_loops();
+        assert!(
+            report.rebuilt,
+            "the submap graph did not apply a correction"
+        );
+        assert_eq!(report.keyframe_nodes, 0);
+        assert_eq!(report.submap_nodes, 3);
+        assert_eq!(report.nodes, 3);
+        assert_eq!(report.odometry_edges, 2);
+
+        let last = scanner.pose();
+        assert!(
+            (last.translation.x - 0.2).abs() < 0.08,
+            "the final submap was not moved back to the revisit: {:.3}",
+            last.translation.x
+        );
+    }
+
+    #[test]
+    fn the_background_graph_worker_applies_an_online_correction() {
+        let mut scanner = scanner_with_background_graph();
+        add_revisit_sequence(&mut scanner);
+
+        // The last offer may still be in flight; close_loops has to flush it.
+        let report = scanner.close_loops();
+        assert!(report.rebuilt);
+        assert!(!scanner.graph_pending());
+        assert!(
+            scanner.background_graph_updates() > 0,
+            "the background solve never applied a correction"
+        );
+        assert!(scanner.online_loop_updates() > 0);
+
+        let last = scanner.pose();
+        assert!(
+            (last.translation.x - 0.2).abs() < 0.08,
+            "the worker's correction missed the revisit: {:.3}",
+            last.translation.x
+        );
     }
 }

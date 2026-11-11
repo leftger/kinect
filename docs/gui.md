@@ -49,13 +49,18 @@ the picker.
 ### Reconstruction and output
 
 Controls frames, voxel size, colour and its mode, colour-depth tolerance,
-filters, loop closure and its online/worker/incremental variants, frame-to-model,
-submaps, GPU decode, mirror, preview interval, playback rate, the output path,
-and the optional dataset directory.
+filters, fusion filtering and TSDF chunking, loop closure and its
+online/worker/incremental variants, the global-search fallbacks, the likelihood
+gate, submap-graph and graph-worker modes, frame-to-model, submaps, GPU decode,
+mirror, preview interval, playback rate, the output path, and the optional
+dataset directory.
 
-The loop variants imply loop closure, as they do on the command line: ticking
-**Online loops**, **Loop worker**, or **Incremental** turns correction on rather
-than silently doing nothing.
+The dependent modes imply loop closure, as they do on the command line: ticking
+**Online loops**, **Loop worker**, **Incremental**, **Global loops**,
+**Submap graph**, or **Graph worker** turns correction on rather than silently
+doing nothing. **Graph worker** also enables the submap graph and online loops.
+**Global relocalize** implies relocalisation. A non-zero **Match score** enables
+the loop likelihood gate.
 
 The output extension selects the mesh format exactly as it does on the command
 line. See [Command line](cli.md#output-format).
@@ -80,12 +85,12 @@ view.
 
 Shows:
 
-- frames, fused, rejected, and submap counts;
-- position and TSDF size;
+- frames, fused, rejected, motion-filtered, and submap counts;
+- position, TSDF size, and cached chunk count;
 - tracking, fusion, and submap-finalisation time;
 - preview rate and the worker log;
 - loops, loop ICP attempts, dropped loops, loop points, rehydrated clouds, online
-  corrections, and pending worker jobs;
+  corrections, background graph fixes, and pending loop/graph jobs;
 - exported mesh and dataset summary after Export.
 
 ### Splats

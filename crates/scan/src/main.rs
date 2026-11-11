@@ -44,14 +44,18 @@ use std::error::Error;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
+use geom::DepthImage;
 use geom::coloring::{ColorMode, ColoringParams, ColoringReport};
 use geom::export::{self, MeshFormat};
+use geom::frozen_map::{FrozenMap, FrozenMapParams};
 use geom::texturing::TexturingReport;
 use geom::tsdf::TsdfParams;
 use loop_closure::LoopClosureConfig;
-use nalgebra::Vector3;
+use nalgebra::{Isometry3, Vector3};
 use odometry::OdometryConfig;
-use scanner::{ExportMesh, FrameColor, FrameReport, ScanQuality, Scanner, ScannerConfig};
+use scanner::{
+    ExportMesh, FrameColor, FrameReport, MotionFilterConfig, ScanQuality, Scanner, ScannerConfig,
+};
 
 const DEFAULT_FRAMES: usize = 60;
 
@@ -140,11 +144,27 @@ struct Options {
     /// Correct the final model by moving the cached submap surfaces instead of
     /// re-integrating every frame. Implies `--loop-closure`.
     incremental_rebuild: bool,
+    /// Skip fusion for frames that barely moved since the last fused frame.
+    fusion_filter: bool,
+    /// Finish the active TSDF into a cached chunk every N fused frames.
+    tsdf_chunk_frames: usize,
+    /// Let spatial re-localisation fall back to the 4-DOF global search.
+    relocalize_global: bool,
+    /// Let loop verification fall back to the 4-DOF global search.
+    loop_global: bool,
+    /// Minimum likelihood for a loop's final alignment. Zero disables.
+    match_score: f32,
+    /// Optimise submap nodes instead of keyframe nodes.
+    submap_graph: bool,
+    /// Run the online submap-graph solve on a worker thread.
+    graph_worker: bool,
     /// Export a Nerfstudio dataset for a Gaussian-splatting trainer: the colour
     /// views, their masks, `transforms.json`, and an initial point cloud.
     /// Needs `--color`, because the dataset is built from the colour views.
     /// The dataset always stays in the sensor frame; the mirror does not apply.
     dataset: Option<PathBuf>,
+    /// Prior point cloud for `localize`, as ASCII or binary little-endian PLY.
+    map: Option<PathBuf>,
 }
 
 impl Default for Options {
@@ -175,7 +195,15 @@ impl Default for Options {
             loop_window: LoopClosureConfig::default().loop_target_keyframes,
             relocalize_keyframes: OdometryConfig::default().relocalize_keyframes,
             incremental_rebuild: false,
+            fusion_filter: false,
+            tsdf_chunk_frames: 0,
+            relocalize_global: false,
+            loop_global: false,
+            match_score: 0.0,
+            submap_graph: false,
+            graph_worker: false,
             dataset: None,
+            map: None,
         }
     }
 }
@@ -187,6 +215,8 @@ enum Command {
     Live,
     Record,
     Replay,
+    /// Localise a recording against a frozen prior map.
+    Localize,
     /// Build a synthetic coloured capture and write it as a dataset.
     Synth,
     Help,
@@ -199,6 +229,7 @@ async fn run() -> Result<(), Box<dyn Error>> {
         Command::Live => live(&options).await,
         Command::Record => record(&options).await,
         Command::Replay => replay(&options),
+        Command::Localize => localize(&options),
         Command::Synth => synth(&options),
         Command::Help => {
             print_usage();
@@ -222,6 +253,7 @@ fn parse_args(
         "live" => Command::Live,
         "record" => Command::Record,
         "replay" => Command::Replay,
+        "localize" => Command::Localize,
         "synth" => Command::Synth,
         other => return Err(format!("unknown command `{other}` (try --help)").into()),
     };
@@ -235,6 +267,7 @@ fn parse_args(
             }
             "--out" => options.out = Some(PathBuf::from(next_value(&mut args, "--out")?)),
             "--in" => options.input = Some(PathBuf::from(next_value(&mut args, "--in")?)),
+            "--map" => options.map = Some(PathBuf::from(next_value(&mut args, "--map")?)),
             "--voxel" => {
                 let voxel: f32 = next_value(&mut args, "--voxel")?.parse()?;
                 if !(voxel > 0.0) {
@@ -295,8 +328,42 @@ fn parse_args(
                 options.relocalize_keyframes = count;
                 options.relocalize = true;
             }
+            "--relocalize-global" => {
+                options.relocalize_global = true;
+                options.relocalize = true;
+            }
+            "--fusion-filter" => options.fusion_filter = true,
+            "--tsdf-chunk" => {
+                let frames: usize = next_value(&mut args, "--tsdf-chunk")?.parse()?;
+                if frames == 0 {
+                    return Err("--tsdf-chunk must be at least 1".into());
+                }
+                options.tsdf_chunk_frames = frames;
+            }
             "--loop-window" => {
                 options.loop_window = next_value(&mut args, "--loop-window")?.parse()?;
+            }
+            "--loop-global" => {
+                options.loop_global = true;
+                options.loop_closure = true;
+            }
+            "--match-score" => {
+                let score: f32 = next_value(&mut args, "--match-score")?.parse()?;
+                if !(score.is_finite() && (0.0..=1.0).contains(&score)) {
+                    return Err("--match-score must be between 0 and 1".into());
+                }
+                options.match_score = score;
+                options.loop_closure = true;
+            }
+            "--submap-graph" => {
+                options.submap_graph = true;
+                options.loop_closure = true;
+            }
+            "--graph-worker" => {
+                options.graph_worker = true;
+                options.submap_graph = true;
+                options.online_loops = true;
+                options.loop_closure = true;
             }
             "--online-loops" => {
                 options.online_loops = true;
@@ -343,6 +410,12 @@ fn parse_args(
             // `replay` is allowed with `--dataset`; the recording itself is checked in
             // `replay()` to ensure it carries a colour stream.
             Command::Replay => {}
+            // Localisation is against a frozen map; it builds no new dataset.
+            Command::Localize => {
+                return Err(
+                    "--dataset cannot be used with `localize`: it builds no new map".into(),
+                );
+            }
             // `synth` renders its own colour, so it needs no stream and no flag.
             Command::Synth => {}
             // The window has its own source picker. It refuses a live dataset
@@ -351,6 +424,17 @@ fn parse_args(
             Command::Gui => {}
             Command::Help => {}
         }
+    }
+
+    if matches!(command, Command::Localize) {
+        if options.map.is_none() {
+            return Err("`localize` needs --map <prior.ply>".into());
+        }
+        if options.input.is_none() {
+            return Err("`localize` needs --in <capture.k2df>".into());
+        }
+    } else if options.map.is_some() {
+        return Err("--map only applies to `scan localize`".into());
     }
 
     // A GUI source is either a sensor, a recording, or the synthetic room.
@@ -409,6 +493,8 @@ fn usage_text() -> String {
          \x20             [--color]\n\
          \x20 scan replay  --in capture.k2df [--out mesh.ply] [--voxel M] [--frames N]\n\
          \x20             [--loop-closure]\n\
+         \x20 scan localize --in capture.k2df --map prior.ply [--frames N]\n\
+         \x20             [--out trajectory.ply]\n\
          \x20 scan synth   --dataset DIR [--frames N] [--out mesh.ply] [--voxel M]\n\
          \n\
          COMMANDS:\n\
@@ -418,6 +504,8 @@ fn usage_text() -> String {
          \x20 live     Capture from the sensor and reconstruct as you go.\n\
          \x20 record   Capture depth frames to a file, for offline tuning.\n\
          \x20 replay   Reconstruct from a recording. Needs no sensor.\n\
+         \x20 localize Localise a recording against a frozen prior map. The map\n\
+         \x20          is never modified; the output is a trajectory.\n\
          \x20 synth    Render the analytic room and write a colour dataset. Needs\n\
          \x20          no sensor or display; the result feeds Brush directly.\n\
          \n\
@@ -431,6 +519,8 @@ fn usage_text() -> String {
          \x20               and .png), .gltf (plus .bin and .png), or .glb (one file).\n\
          \x20 --in FILE     Recording to replay. A .k2df file may carry colour\n\
          \x20               or be depth only. With `gui`, preselects replay.\n\
+         \x20 --map FILE    `localize`: prior map as ASCII or binary little-endian\n\
+         \x20               PLY. Only the vertex positions are read.\n\
          \x20 --synthetic   On `gui`: use the analytic room, no sensor needed.\n\
          \x20 --auto-start  On `gui`: start the selected source when the window\n\
          \x20               opens. `live --viewer` does this too.\n\
@@ -442,6 +532,17 @@ fn usage_text() -> String {
          \x20               10). Zero runs as fast as the reconstruction allows.\n\
          \x20 --voxel M     TSDF voxel size in metres (default 0.01). Sets the\n\
          \x20               truncation band to 4x this.\n\
+         \x20 --fusion-filter\n\
+         \x20               Track but do not fuse a frame that moved less than\n\
+         \x20               1 cm / 0.005 rad since the last fused frame. A forced\n\
+         \x20               refresh every 5 frames keeps a stationary model\n\
+         \x20               averaging. Fusion is the largest per-frame cost, so\n\
+         \x20               this is the cheapest way to recover time on slow scans.\n\
+         \x20 --tsdf-chunk N\n\
+         \x20               Finish the active TSDF into a cached chunk every N\n\
+         \x20               fused frames. Bounds the active volume and fusion cost\n\
+         \x20               without resetting the odometry or creating a pose\n\
+         \x20               boundary. Zero (default) disables.\n\
          \x20 --no-filter   Disable the decoder's bilateral/edge filters: roughly\n\
          \x20               doubles frame rate, keeps more junk points.\n\
          \x20 --color       On live: capture colour and paint the mesh. Off by\n\
@@ -503,10 +604,25 @@ fn usage_text() -> String {
          \x20               merged set within the map radius, not just the last\n\
          \x20               frame, which gives a turning sensor more to match.\n\
          \x20               Implies --relocalize.\n\
+         \x20 --relocalize-global\n\
+         \x20               If the spatial retry's ICP still fails, run the\n\
+         \x20               4-DOF yaw/translation branch-and-bound search against\n\
+         \x20               the local keyframe map. ICP still decides whether the\n\
+         \x20               result is real. Implies --relocalize.\n\
          \x20 --loop-window N\n\
          \x20               Merge N keyframes on each side of a loop candidate\n\
          \x20               into the ICP target (default 2). Zero restores the\n\
          \x20               single-keyframe target.\n\
+         \x20 --loop-global\n\
+         \x20               If loop ICP fails from the drifted pose, run the\n\
+         \x20               4-DOF branch-and-bound search before rejecting the\n\
+         \x20               candidate. The reciprocal and likelihood gates still\n\
+         \x20               apply. Implies --loop-closure.\n\
+         \x20 --match-score S\n\
+         \x20               Minimum mean likelihood of a verified loop against the\n\
+         \x20               target's surface grid (0..1). Zero disables. This is a\n\
+         \x20               different signal from ICP inliers and catches repetitive\n\
+         \x20               geometry that happens to fit. Implies --loop-closure.\n\
          \x20 --online-loops\n\
          \x20               Apply a verified loop during the scan instead of\n\
          \x20               waiting for the end. Future frames use the corrected\n\
@@ -520,6 +636,16 @@ fn usage_text() -> String {
          \x20               surfaces instead of re-integrating every frame.\n\
          \x20               Faster, but cannot fix drift inside a submap.\n\
          \x20               Implies --loop-closure.\n\
+         \x20 --submap-graph\n\
+         \x20               Optimise submap nodes rather than keyframe nodes,\n\
+         \x20               A sparse pose-adjustment shape. Smaller\n\
+         \x20               and rigid per submap, so it matches the cached surfaces\n\
+         \x20               but cannot deform inside one. Off by default.\n\
+         \x20               Implies --loop-closure.\n\
+         \x20 --graph-worker\n\
+         \x20               Run the online submap-graph solve on a worker thread,\n\
+         \x20               so capture does not stall behind a dense solve. Implies\n\
+         \x20               --submap-graph and --online-loops.\n\
          \x20 --no-submaps  Do not start a new submap when a frame cannot be\n\
          \x20               placed in the current one. Submaps are on by default:\n\
          \x20               the boundary keeps the fragments separate instead of\n\
@@ -749,6 +875,100 @@ fn replay(options: &Options) -> Result<(), Box<dyn Error>> {
     finish_scan(&mut scanner, options)
 }
 
+/// Localise a recording against a frozen prior point cloud.
+///
+/// This is a pure-localisation mode, reduced to the part a depth
+/// camera can support: the map is fixed, each frame gets a global search for an
+/// initial guess, ICP refines it, and the result is a trajectory. Nothing is
+/// fused, so the prior's accuracy is preserved.
+fn localize(options: &Options) -> Result<(), Box<dyn Error>> {
+    let input = options
+        .input
+        .clone()
+        .ok_or("`localize` needs --in <capture.k2df>")?;
+    let map_path = options
+        .map
+        .clone()
+        .ok_or("`localize` needs --map <prior.ply>")?;
+
+    let recording = recording::read(&input)?;
+    let prior_points = geom::mesh::read_points_ply(&map_path)?;
+    let params = FrozenMapParams {
+        voxel: options.tsdf.voxel_size,
+        ..FrozenMapParams::default()
+    };
+    let map = FrozenMap::from_points(&prior_points, &params)
+        .ok_or("prior map is too small after downsampling")?;
+
+    println!(
+        "[localize] prior {} points -> {} after downsampling from {}",
+        prior_points.len(),
+        map.len(),
+        map_path.display()
+    );
+    println!(
+        "[localize] {} frames of {}x{} from {}",
+        recording.frames.len(),
+        recording.width,
+        recording.height,
+        input.display()
+    );
+
+    let limit = options.frames.unwrap_or(usize::MAX);
+    let total = limit.min(recording.frames.len());
+    let mut pose = Isometry3::identity();
+    let mut trajectory = Vec::new();
+    let mut located = 0usize;
+
+    for (index, frame) in recording.frames.iter().take(limit).enumerate() {
+        let image = DepthImage::new(recording.width, recording.height, &frame.depth);
+        let mut points = image.to_points(&recording.intrinsics);
+        points
+            .retain(|point| point.z >= options.tsdf.min_depth && point.z <= options.tsdf.max_depth);
+
+        match map.localize(&points, pose, &params) {
+            Some(found) => {
+                pose = found.pose;
+                located += 1;
+                trajectory.push(pose.translation.vector);
+                println!(
+                    "[localize] {:5} t=({:+.3},{:+.3},{:+.3}) inliers {:.2} rmse {:.3}",
+                    index + 1,
+                    pose.translation.x,
+                    pose.translation.y,
+                    pose.translation.z,
+                    found.inlier_ratio,
+                    found.rmse
+                );
+            }
+            None => {
+                println!("[localize] {:5} lost; keeping the last pose", index + 1);
+            }
+        }
+    }
+
+    if let Some(out) = &options.out {
+        geom::mesh::save_points_ply(out, &trajectory)?;
+        println!(
+            "[localize] wrote {} poses to {}",
+            trajectory.len(),
+            out.display()
+        );
+    }
+
+    println!(
+        "[localize] located {} of {} frames ({:.0}%)",
+        located,
+        total,
+        if total == 0 {
+            0.0
+        } else {
+            located as f32 / total as f32 * 100.0
+        }
+    );
+    Ok(())
+}
+
 /// Build a synthetic coloured capture and write it as a dataset.
 ///
 /// The point is to exercise the exporter's whole path -- registration, colour
@@ -865,6 +1085,8 @@ fn scanner_config(options: &Options) -> ScannerConfig {
     let mut loops = LoopClosureConfig::default();
     loops.loop_target_keyframes = options.loop_window;
     loops.background = options.loop_worker;
+    loops.global_search = options.loop_global;
+    loops.min_match_score = options.match_score;
 
     ScannerConfig {
         tsdf: options.tsdf,
@@ -873,11 +1095,16 @@ fn scanner_config(options: &Options) -> ScannerConfig {
             frame_to_model: options.frame_to_model,
             relocalize: options.relocalize,
             relocalize_keyframes: options.relocalize_keyframes,
+            relocalize_global_search: options.relocalize_global,
             ..OdometryConfig::default()
         },
         submaps: options.submaps,
         online_loops: options.online_loops,
         incremental_rebuild: options.incremental_rebuild,
+        fusion_filter: options.fusion_filter.then(MotionFilterConfig::default),
+        tsdf_chunk_frames: options.tsdf_chunk_frames,
+        submap_graph: options.submap_graph,
+        graph_worker: options.graph_worker,
         coloring: ColoringParams {
             mode: options.color_mode,
             depth_tolerance: options.color_depth_tolerance,
@@ -934,30 +1161,43 @@ fn close_loops(scanner: &mut Scanner, options: &Options) {
     }
 
     let report = scanner.close_loops();
+    let graph = if report.submap_nodes > 0 {
+        format!("{} submap nodes", report.submap_nodes)
+    } else {
+        format!("{} keyframes", report.keyframe_nodes)
+    };
 
     if report.loop_edges == 0 && report.dropped_loops == 0 {
-        println!(
-            "loop closure: no revisits verified over {} keyframes, trajectory unchanged",
-            report.nodes
-        );
+        println!("loop closure: no revisits verified over {graph}, trajectory unchanged");
         return;
     }
 
     if report.loop_edges == 0 {
         println!(
-            "loop closure: all {} verified loops were discarded over {} keyframes",
-            report.dropped_loops, report.nodes
+            "loop closure: all {} verified loops were discarded over {graph}",
+            report.dropped_loops
         );
     } else {
         println!(
-            "loop closure: {} revisits over {} keyframes, cost {:.3} -> {:.3} in {} iterations",
-            report.loop_edges,
-            report.nodes,
-            report.cost_before,
-            report.cost_after,
-            report.iterations
+            "loop closure: {} revisits over {graph}, cost {:.3} -> {:.3} in {} iterations",
+            report.loop_edges, report.cost_before, report.cost_after, report.iterations
         );
     }
+    println!(
+        "  {} graph nodes, {} odometry edges",
+        report.nodes, report.odometry_edges
+    );
+    if !report.converged {
+        println!("  optimiser stopped before convergence");
+    }
+    println!(
+        "  correction applied {}",
+        if report.online {
+            "during the scan"
+        } else {
+            "at the end"
+        }
+    );
     if report.dropped_loops > 0 {
         println!(
             "  dropped {} weak loop(s) after an implausible correction",
@@ -1525,6 +1765,80 @@ mod tests {
     }
 
     #[test]
+    fn advanced_loop_flags_reach_the_scanner_config() {
+        let (_, options) = parse_args(words(&[
+            "replay",
+            "--in",
+            "capture.k2df",
+            "--fusion-filter",
+            "--tsdf-chunk",
+            "40",
+            "--relocalize-global",
+            "--loop-global",
+            "--match-score",
+            "0.6",
+            "--submap-graph",
+            "--graph-worker",
+        ]))
+        .expect("parse");
+
+        assert!(options.fusion_filter);
+        assert_eq!(options.tsdf_chunk_frames, 40);
+        assert!(options.relocalize_global);
+        assert!(options.loop_global);
+        assert!((options.match_score - 0.6).abs() < 1e-6);
+        assert!(options.submap_graph);
+        assert!(options.graph_worker);
+        assert!(options.online_loops, "--graph-worker implies online loops");
+
+        let config = scanner_config(&options);
+        assert!(config.fusion_filter.is_some());
+        assert_eq!(config.tsdf_chunk_frames, 40);
+        assert!(config.odometry.relocalize_global_search);
+        assert!(config.submap_graph);
+        assert!(config.graph_worker);
+        assert!(config.online_loops);
+        let loops = config.loop_closure.expect("loop config");
+        assert!(loops.global_search);
+        assert!((loops.min_match_score - 0.6).abs() < 1e-6);
+    }
+
+    #[test]
+    fn localize_requires_a_map_and_a_recording() {
+        let error = parse_args(words(&["localize", "--in", "capture.k2df"]))
+            .expect_err("a map is required");
+        assert!(error.to_string().contains("--map"), "{error}");
+
+        let error = parse_args(words(&["localize", "--map", "prior.ply"]))
+            .expect_err("an input is required");
+        assert!(error.to_string().contains("--in"), "{error}");
+
+        let (command, options) = parse_args(words(&[
+            "localize",
+            "--in",
+            "capture.k2df",
+            "--map",
+            "prior.ply",
+        ]))
+        .expect("parse");
+        assert!(matches!(command, Command::Localize));
+        assert_eq!(
+            options.map.as_deref(),
+            Some(std::path::Path::new("prior.ply"))
+        );
+
+        let error = parse_args(words(&[
+            "replay",
+            "--in",
+            "capture.k2df",
+            "--map",
+            "prior.ply",
+        ]))
+        .expect_err("--map only belongs to localize");
+        assert!(error.to_string().contains("--map"), "{error}");
+    }
+
+    #[test]
     fn a_zero_relocalization_ring_is_rejected() {
         let error = parse_args(words(&[
             "replay",
@@ -1546,6 +1860,27 @@ mod tests {
             "--incremental-rebuild",
             "--loop-window",
             "--relocalize-keyframes",
+        ] {
+            assert!(
+                usage.contains(flag),
+                "{flag} is missing from the usage text"
+            );
+        }
+    }
+
+    #[test]
+    fn usage_documents_the_advanced_loop_flags() {
+        let usage = usage_text();
+        for flag in [
+            "--fusion-filter",
+            "--tsdf-chunk",
+            "--relocalize-global",
+            "--loop-global",
+            "--match-score",
+            "--submap-graph",
+            "--graph-worker",
+            "--map",
+            "scan localize",
         ] {
             assert!(
                 usage.contains(flag),
