@@ -545,6 +545,10 @@ The RTAB-Map-inspired loop slice is now broader:
 - If the pose graph wants an implausible correction, the weakest loop is
   dropped and the graph is retried. `ClosureReport` and the window telemetry
   report loops kept, loops dropped, and ICP attempts.
+- Loop signatures have working memory: the most recent 80 keyframes keep their
+  full-resolution clouds and older ones keep every second point, so they remain
+  searchable without paying full long-term memory. Telemetry reports the point
+  count still held.
 
 After that change the real capture gives **1 revisit, 1 submap, 0.542 m,
 trainable**. It is slightly different from the older 2-revisit/0.555 m result

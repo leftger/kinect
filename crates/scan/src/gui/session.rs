@@ -137,6 +137,7 @@ pub(crate) struct SessionView {
     pub loops: usize,
     pub loops_dropped: usize,
     pub loop_attempts: usize,
+    pub loop_points: usize,
     pub position: [f32; 3],
     pub blocks: usize,
     pub allocated_bytes: usize,
@@ -169,6 +170,7 @@ impl Default for SessionView {
             loops: 0,
             loops_dropped: 0,
             loop_attempts: 0,
+            loop_points: 0,
             position: [0.0; 3],
             blocks: 0,
             allocated_bytes: 0,
@@ -211,6 +213,7 @@ impl SessionView {
             loops: self.loops,
             loops_dropped: self.loops_dropped,
             loop_attempts: self.loop_attempts,
+            loop_points: self.loop_points,
             position: self.position,
             blocks: self.blocks,
             allocated_bytes: self.allocated_bytes,
@@ -252,6 +255,7 @@ pub(crate) struct SessionSnapshot {
     pub loops: usize,
     pub loops_dropped: usize,
     pub loop_attempts: usize,
+    pub loop_points: usize,
     pub position: [f32; 3],
     pub blocks: usize,
     pub allocated_bytes: usize,
@@ -652,6 +656,7 @@ impl SessionState {
         view.submaps = self.scanner.submaps();
         view.loops = self.scanner.loops();
         view.loop_attempts = self.scanner.loop_attempts();
+        view.loop_points = self.scanner.loop_keyframe_points();
         view.blocks = report.blocks;
         view.allocated_bytes = report.allocated_bytes;
 

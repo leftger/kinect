@@ -1164,6 +1164,7 @@ impl ScannerApp {
             };
             stat(ui, "loops", loop_text);
             stat(ui, "loop ICP", snapshot.loop_attempts.to_string());
+            stat(ui, "loop pts", snapshot.loop_points.to_string());
             stat(
                 ui,
                 "position",

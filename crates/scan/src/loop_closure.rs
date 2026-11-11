@@ -155,6 +155,11 @@ pub struct LoopClosureConfig {
     pub keyframe_max_interval: usize,
     /// How many candidates to spend ICP on per frame.
     pub max_candidates: usize,
+    /// Recent keyframes whose clouds stay at full resolution. Older keyframes
+    /// move to long-term memory, still searchable but decimated.
+    pub working_memory_keyframes: usize,
+    /// Keep every Nth point when a keyframe leaves working memory.
+    pub long_term_decimation: usize,
     /// Appearance similarity that can propose a candidate whose pose is outside
     /// `search_radius`. Purely a proposal: ICP still has to accept it.
     pub appearance_min_similarity: f32,
@@ -185,6 +190,8 @@ impl Default for LoopClosureConfig {
             keyframe_min_rotation: 0.05,
             keyframe_max_interval: 5,
             max_candidates: 3,
+            working_memory_keyframes: 80,
+            long_term_decimation: 2,
             appearance_min_similarity: 0.78,
             min_inlier_ratio: 0.5,
             max_rmse: 0.03,
@@ -239,6 +246,8 @@ pub struct LoopFinder {
     loops: Vec<Loop>,
     attempts: usize,
     last_keyframe: Option<Isometry3<f32>>,
+    /// Index of the first keyframe still in full-resolution working memory.
+    working_start: usize,
 }
 
 impl LoopFinder {
@@ -249,11 +258,33 @@ impl LoopFinder {
             loops: Vec::new(),
             attempts: 0,
             last_keyframe: None,
+            working_start: 0,
         }
     }
 
     pub fn keyframes(&self) -> &[Keyframe] {
         &self.keyframes
+    }
+
+    /// Points still held by the loop index, after long-term decimation.
+    pub fn keyframe_points(&self) -> usize {
+        self.keyframes
+            .iter()
+            .map(|keyframe| keyframe.cloud.len())
+            .sum()
+    }
+
+    /// Move keyframes that have fallen out of working memory into the cheaper
+    /// long-term representation. Their pose and appearance signature stay, so
+    /// they can still be proposed and verified.
+    fn manage_memory(&mut self) {
+        let budget = self.config.working_memory_keyframes.max(1);
+        while self.keyframes.len().saturating_sub(self.working_start) > budget {
+            let index = self.working_start;
+            let stride = self.config.long_term_decimation.max(1);
+            self.keyframes[index].cloud = self.keyframes[index].cloud.decimated(stride);
+            self.working_start += 1;
+        }
     }
 
     pub fn loops(&self) -> &[Loop] {
@@ -326,6 +357,7 @@ impl LoopFinder {
             appearance: appearance.cloned(),
             cloud,
         });
+        self.manage_memory();
         self.last_keyframe = Some(pose);
 
         if let Some(ref loop_closure) = found {
@@ -639,6 +671,32 @@ mod tests {
         // Enough motion from the last keyframe: keep it.
         finder.consider(2, at(0.2, 0.0, 0.0), &view(&world, &at(0.2, 0.0, 0.0)));
         assert_eq!(finder.keyframes().len(), 2);
+    }
+
+    #[test]
+    fn old_keyframes_are_decimated_after_leaving_working_memory() {
+        let config = LoopClosureConfig {
+            keyframe_min_translation: 0.0,
+            keyframe_min_rotation: 0.0,
+            keyframe_max_interval: 1,
+            working_memory_keyframes: 1,
+            long_term_decimation: 2,
+            ..LoopClosureConfig::default()
+        };
+        let world = scene();
+        let mut finder = LoopFinder::new(config);
+
+        finder.consider(0, at(0.0, 0.0, 0.0), &view(&world, &at(0.0, 0.0, 0.0)));
+        let full = finder.keyframes()[0].point_count();
+        assert!(full > 1);
+
+        finder.consider(1, at(0.5, 0.0, 0.0), &view(&world, &at(0.5, 0.0, 0.0)));
+        let old = finder.keyframes()[0].point_count();
+        let new = finder.keyframes()[1].point_count();
+
+        assert_eq!(old, full.div_ceil(2), "the old cloud was not decimated");
+        assert!(new > old, "the newest keyframe should stay full-resolution");
+        assert_eq!(finder.keyframe_points(), old + new);
     }
 
     #[test]

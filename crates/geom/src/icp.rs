@@ -142,6 +142,21 @@ impl IcpCloud {
             .filter(|n| n.norm_squared() > 0.0)
             .count()
     }
+
+    /// Keep every `stride`-th point and normal, rebuilding the spatial index.
+    ///
+    /// This is the long-term-memory step for loop keyframes: the pose and the
+    /// appearance signature stay, while an old cloud becomes cheaper to hold and
+    /// search. `stride == 1` is a clone.
+    pub fn decimated(&self, stride: usize) -> Self {
+        let stride = stride.max(1);
+        if stride == 1 {
+            return Self::new(self.points.clone(), self.normals.clone(), self.query_radius);
+        }
+        let points: Vec<_> = self.points.iter().step_by(stride).copied().collect();
+        let normals: Vec<_> = self.normals.iter().step_by(stride).copied().collect();
+        Self::new(points, normals, self.query_radius)
+    }
 }
 
 /// Finds the surface point and normal that a transformed source point matches.
@@ -373,6 +388,18 @@ pub fn align_points(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn decimation_keeps_every_nth_point_and_normal() {
+        let (points, normals) = wavy_surface(5);
+        let cloud = IcpCloud::new(points, normals, 0.2);
+        let sparse = cloud.decimated(2);
+
+        assert_eq!(sparse.len(), cloud.len().div_ceil(2));
+        assert_eq!(sparse.normals.len(), sparse.len());
+        assert_eq!(sparse.points[0], cloud.points[0]);
+        assert_eq!(sparse.normals[0], cloud.normals[0]);
+    }
 
     /// A gently wavy surface. Deliberately not a plane: a plane leaves in-plane
     /// translation and rotation unobservable, so it cannot test all six degrees

@@ -683,6 +683,14 @@ impl Scanner {
             .unwrap_or(0)
     }
 
+    /// Points still held by the loop keyframe index.
+    pub fn loop_keyframe_points(&self) -> usize {
+        self.loops
+            .as_ref()
+            .map(|finder| finder.keyframe_points())
+            .unwrap_or(0)
+    }
+
     /// A pre-training sanity check. Call after `close_loops` so the submap
     /// count reflects any correction that was actually rebuilt.
     pub fn quality(&self) -> ScanQuality {

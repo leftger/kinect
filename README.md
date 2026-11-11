@@ -183,9 +183,12 @@ Useful options:
   cannot starve the loop index. An accepted loop must also align in reverse,
   and each edge is weighted by inlier coverage and residual. If the pose graph
   asks for an implausible correction, the weakest loop is dropped and the graph
-  is retried before giving up. The window's telemetry shows loops, loop ICP
-  attempts, and dropped loops. On a live colour scan the colour
-  views move onto those poses before the mesh is painted. The rebuild keeps
+  is retried before giving up. The loop index also has working memory: the
+  most recent 80 keyframes keep full-resolution clouds, and older signatures
+  keep every second point as long-term memory. The window's telemetry shows
+  loops, loop ICP attempts, dropped loops, and loop points. On a live colour
+  scan the colour views move onto those poses before the mesh is painted. The
+  rebuild keeps
   every depth frame, about 850 KB each, so a
   200-frame scan holds around 170 MB of depth. Each colour view is separate:
   about 1.66 MiB, and about 1 GiB at 600 views. It only helps a scan that
@@ -585,12 +588,12 @@ platform/linux      udev rule
 cargo test -p geom -p scan --features gui
 ```
 
-213 tests (3 ignored). The geometry is tested against synthetic scenes and known
+215 tests (3 ignored). The geometry is tested against synthetic scenes and known
 transforms rather than against recorded data, so the suite runs without a
 sensor. The window's tests are headless too: they exercise the session worker,
 a synthetic scan and its export, the trainer child-process worker, the splat
 loader/renderer, and the software renderer without opening a window. The
-non-GUI suite is 188 tests.
+non-GUI suite is 190 tests.
 
 Two tests need hardware and are ignored by default:
 
