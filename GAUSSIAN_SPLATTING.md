@@ -547,8 +547,10 @@ The RTAB-Map-inspired loop slice is now broader:
   report loops kept, loops dropped, and ICP attempts.
 - Loop signatures have working memory: the most recent 80 keyframes keep their
   full-resolution clouds and older ones keep every second point, so they remain
-  searchable without paying full long-term memory. Telemetry reports the point
-  count still held.
+  searchable without paying full long-term memory. A candidate that points at a
+  decimated keyframe rebuilds its full cloud from retained depth for that ICP,
+  then drops the temporary cloud. Telemetry reports the point count still held
+  and how many long-term clouds were rebuilt.
 
 After that change the real capture gives **1 revisit, 1 submap, 0.542 m,
 trainable**. It is slightly different from the older 2-revisit/0.555 m result

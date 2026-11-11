@@ -131,6 +131,8 @@ pub struct Keyframe {
     /// Appearance signature, when the scan had colour.
     appearance: Option<VisualDescriptor>,
     cloud: IcpCloud,
+    /// True once the cloud is the cheaper long-term copy.
+    decimated: bool,
 }
 
 impl Keyframe {
@@ -245,6 +247,7 @@ pub struct LoopFinder {
     keyframes: Vec<Keyframe>,
     loops: Vec<Loop>,
     attempts: usize,
+    rehydrations: usize,
     last_keyframe: Option<Isometry3<f32>>,
     /// Index of the first keyframe still in full-resolution working memory.
     working_start: usize,
@@ -257,6 +260,7 @@ impl LoopFinder {
             keyframes: Vec::new(),
             loops: Vec::new(),
             attempts: 0,
+            rehydrations: 0,
             last_keyframe: None,
             working_start: 0,
         }
@@ -264,6 +268,11 @@ impl LoopFinder {
 
     pub fn keyframes(&self) -> &[Keyframe] {
         &self.keyframes
+    }
+
+    /// The loop configuration, copied for callers that need to rebuild a cloud.
+    pub fn config(&self) -> LoopClosureConfig {
+        self.config
     }
 
     /// Points still held by the loop index, after long-term decimation.
@@ -283,6 +292,7 @@ impl LoopFinder {
             let index = self.working_start;
             let stride = self.config.long_term_decimation.max(1);
             self.keyframes[index].cloud = self.keyframes[index].cloud.decimated(stride);
+            self.keyframes[index].decimated = true;
             self.working_start += 1;
         }
     }
@@ -295,6 +305,11 @@ impl LoopFinder {
     /// loops means the candidate filter is not narrowing enough.
     pub fn attempts(&self) -> usize {
         self.attempts
+    }
+
+    /// How many long-term clouds were rebuilt for verification.
+    pub fn rehydrations(&self) -> usize {
+        self.rehydrations
     }
 
     /// Offer a frame. `points` are in this frame's camera space, and `pose` is the
@@ -323,6 +338,37 @@ impl LoopFinder {
         points: &[Vector3<f32>],
         appearance: Option<&VisualDescriptor>,
     ) -> Option<Loop> {
+        self.consider_inner(index, pose, points, appearance, None)
+    }
+
+    /// Offer a frame and rebuild a decimated long-term cloud on demand.
+    ///
+    /// The callback receives the frame index of a candidate that has left
+    /// working memory and returns a full-resolution cloud for that index. It is
+    /// only called while that candidate is being verified, so the scanner keeps
+    /// one temporary full cloud rather than every old frame's full cloud.
+    pub fn consider_with_rehydration<F>(
+        &mut self,
+        index: usize,
+        pose: Isometry3<f32>,
+        points: &[Vector3<f32>],
+        appearance: Option<&VisualDescriptor>,
+        mut rehydrate: F,
+    ) -> Option<Loop>
+    where
+        F: FnMut(usize) -> Option<IcpCloud>,
+    {
+        self.consider_inner(index, pose, points, appearance, Some(&mut rehydrate))
+    }
+
+    fn consider_inner(
+        &mut self,
+        index: usize,
+        pose: Isometry3<f32>,
+        points: &[Vector3<f32>],
+        appearance: Option<&VisualDescriptor>,
+        rehydrate: Option<&mut dyn FnMut(usize) -> Option<IcpCloud>>,
+    ) -> Option<Loop> {
         let due = match self.keyframes.last() {
             None => true,
             Some(last) => {
@@ -349,13 +395,14 @@ impl LoopFinder {
             &origin,
         );
 
-        let found = self.search(index, &pose, &cloud, appearance);
+        let found = self.search(index, &pose, &cloud, appearance, rehydrate);
 
         self.keyframes.push(Keyframe {
             index,
             pose,
             appearance: appearance.cloned(),
             cloud,
+            decimated: false,
         });
         self.manage_memory();
         self.last_keyframe = Some(pose);
@@ -374,6 +421,7 @@ impl LoopFinder {
         pose: &Isometry3<f32>,
         cloud: &IcpCloud,
         appearance: Option<&VisualDescriptor>,
+        mut rehydrate: Option<&mut dyn FnMut(usize) -> Option<IcpCloud>>,
     ) -> Option<Loop> {
         let debug = std::env::var_os("SCAN_DEBUG_LOOPS").is_some();
 
@@ -471,8 +519,21 @@ impl LoopFinder {
             // to this one. ICP then moves it onto the geometry.
             let initial = keyframe.pose.inverse() * pose;
 
+            // A long-term cloud is cheap but coarse. Before spending ICP on it,
+            // let the caller rebuild the full cloud from retained depth. The
+            // temporary full cloud is dropped as soon as this candidate is done.
+            let rehydrated = if keyframe.decimated {
+                rehydrate.as_mut().and_then(|build| build(keyframe.index))
+            } else {
+                None
+            };
+            let target = rehydrated.as_ref().unwrap_or(&keyframe.cloud);
+            if rehydrated.is_some() {
+                self.rehydrations += 1;
+            }
+
             self.attempts += 1;
-            let result = align(cloud, &keyframe.cloud, initial, &params);
+            let result = align(cloud, target, initial, &params);
             if debug {
                 eprintln!(
                     "[loop] align kf {} -> {index}: inliers {:.3} rmse {:.4} corr {}",
@@ -489,7 +550,7 @@ impl LoopFinder {
             // A real place match survives being aligned in the other direction.
             // Reverse ICP starts from the inverse of the forward result, so a
             // one-sided surface fit shows up as a large round-trip error.
-            let reverse = align(&keyframe.cloud, cloud, result.transform.inverse(), &params);
+            let reverse = align(target, cloud, result.transform.inverse(), &params);
             let round_trip = reverse.transform * result.transform;
             // Reverse RMSE is not a gate: a slightly noisier reverse fit with a
             // tiny round-trip error is exactly what a correct loop looks like.
@@ -697,6 +758,54 @@ mod tests {
         assert_eq!(old, full.div_ceil(2), "the old cloud was not decimated");
         assert!(new > old, "the newest keyframe should stay full-resolution");
         assert_eq!(finder.keyframe_points(), old + new);
+    }
+
+    #[test]
+    fn a_decimated_keyframe_is_rehydrated_for_verification() {
+        let config = LoopClosureConfig {
+            keyframe_min_translation: 0.0,
+            keyframe_min_rotation: 0.0,
+            keyframe_max_interval: 1,
+            working_memory_keyframes: 1,
+            long_term_decimation: 2,
+            min_index_gap: 1,
+            ..LoopClosureConfig::default()
+        };
+        let world = scene();
+        let mut finder = LoopFinder::new(config);
+
+        finder.consider(0, at(0.0, 0.0, 0.0), &view(&world, &at(0.0, 0.0, 0.0)));
+        finder.consider(1, at(0.5, 0.0, 0.0), &view(&world, &at(0.5, 0.0, 0.0)));
+        let old = finder.keyframes()[0].point_count();
+
+        let mut rebuilt = Vec::new();
+        finder.consider_with_rehydration(
+            2,
+            at(1.0, 0.0, 0.0),
+            &view(&world, &at(1.0, 0.0, 0.0)),
+            None,
+            |index| {
+                rebuilt.push(index);
+                Some(IcpCloud::build(
+                    &view(&world, &at(0.0, 0.0, 0.0)),
+                    config.voxel,
+                    config.normal_radius,
+                    config.max_distance,
+                    &Vector3::zeros(),
+                ))
+            },
+        );
+
+        assert_eq!(
+            rebuilt,
+            vec![0],
+            "only the long-term candidate should rebuild"
+        );
+        assert_eq!(
+            finder.keyframes()[0].point_count(),
+            old,
+            "the temporary full cloud must not be stored back"
+        );
     }
 
     #[test]

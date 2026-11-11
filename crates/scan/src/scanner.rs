@@ -1,6 +1,7 @@
 //! The scan pipeline: depth frame -> odometry -> TSDF fusion.
 
 use geom::coloring::{ColorView, ColoringParams, ColoringReport, colorize};
+use geom::icp::IcpCloud;
 use geom::mesh::Mesh;
 use geom::pose_graph::{PoseGraph, PoseGraphParams};
 use geom::texturing::{TexturedMesh, TexturingParams, TexturingReport, texture};
@@ -442,14 +443,55 @@ impl Scanner {
 
         // Offer this frame as somewhere the sensor might return to. The cloud is
         // the one already back-projected for fusion, so the extra cost is the
-        // voxel hashing and, when a candidate turns up, one ICP alignment.
+        // voxel hashing and, when a candidate turns up, one ICP alignment. An
+        // old candidate can be rebuilt from its retained depth before that
+        // alignment, so decimation costs memory rather than loop quality.
         if let Some(finder) = self.loops.as_mut() {
             if fuse {
-                finder.consider_with_appearance(
+                let loop_config = finder.config();
+                let kept = &self.kept;
+                let intrinsics = self.intrinsics;
+                let depth_min = self.config.depth_min;
+                let depth_max = self.config.depth_max;
+                finder.consider_with_rehydration(
                     self.frames,
                     pose,
                     &self.points,
                     appearance.as_ref(),
+                    |index| {
+                        let frame = kept.get(index)?;
+                        if frame.depth.len() != width * height {
+                            return None;
+                        }
+                        let image = DepthImage::new(width, height, &frame.depth);
+                        let mut points = Vec::new();
+                        for y in 0..height {
+                            for x in 0..width {
+                                let depth = image.at(x, y);
+                                if !depth.is_finite() || depth <= 0.0 {
+                                    continue;
+                                }
+                                if depth < depth_min || depth > depth_max {
+                                    continue;
+                                }
+                                points.push(intrinsics.back_project(
+                                    x as f32 + 0.5,
+                                    y as f32 + 0.5,
+                                    depth,
+                                ));
+                            }
+                        }
+                        if points.is_empty() {
+                            return None;
+                        }
+                        Some(IcpCloud::build(
+                            &points,
+                            loop_config.voxel,
+                            loop_config.normal_radius,
+                            loop_config.max_distance,
+                            &Vector3::zeros(),
+                        ))
+                    },
                 );
             }
         }
@@ -688,6 +730,14 @@ impl Scanner {
         self.loops
             .as_ref()
             .map(|finder| finder.keyframe_points())
+            .unwrap_or(0)
+    }
+
+    /// How many long-term keyframe clouds were rebuilt for verification.
+    pub fn loop_rehydrations(&self) -> usize {
+        self.loops
+            .as_ref()
+            .map(|finder| finder.rehydrations())
             .unwrap_or(0)
     }
 
@@ -1210,6 +1260,48 @@ mod tests {
         }));
 
         assert!(result.is_err(), "mismatched dimensions must be rejected");
+    }
+
+    #[test]
+    fn a_scan_rehydrates_a_long_term_keyframe_from_its_depth() {
+        let mut scanner = Scanner::new(
+            intrinsics(),
+            ScannerConfig {
+                tsdf: TsdfParams {
+                    voxel_size: 0.04,
+                    truncation: 0.16,
+                    ..TsdfParams::default()
+                },
+                loop_closure: Some(LoopClosureConfig {
+                    min_index_gap: 1,
+                    keyframe_min_translation: 0.0,
+                    keyframe_min_rotation: 0.0,
+                    keyframe_max_interval: 1,
+                    working_memory_keyframes: 1,
+                    long_term_decimation: 2,
+                    ..LoopClosureConfig::default()
+                }),
+                ..ScannerConfig::default()
+            },
+        );
+        let frame = room_frame(WIDTH, HEIGHT, &intrinsics());
+
+        for _ in 0..4 {
+            scanner.add_frame(&frame, WIDTH, HEIGHT);
+        }
+
+        assert!(
+            scanner.loop_attempts() > 0,
+            "no candidate was verified, so rehydration was never exercised"
+        );
+        assert!(
+            scanner.loop_rehydrations() > 0,
+            "the long-term cloud was never rebuilt from depth"
+        );
+        assert!(
+            scanner.loop_keyframe_points() > 0,
+            "the loop index lost its remaining clouds"
+        );
     }
 
     #[test]
