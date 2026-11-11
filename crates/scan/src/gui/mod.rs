@@ -107,6 +107,9 @@ struct UiConfig {
     color_mode: ColorMode,
     color_depth_tolerance: f32,
     loop_closure: bool,
+    online_loops: bool,
+    loop_worker: bool,
+    incremental_rebuild: bool,
     frame_to_model: bool,
     submaps: bool,
     gpu: bool,
@@ -127,6 +130,9 @@ impl UiConfig {
             color_mode: options.color_mode,
             color_depth_tolerance: options.color_depth_tolerance,
             loop_closure: options.loop_closure,
+            online_loops: options.online_loops,
+            loop_worker: options.loop_worker,
+            incremental_rebuild: options.incremental_rebuild,
             frame_to_model: options.frame_to_model,
             submaps: options.submaps,
             gpu: options.gpu,
@@ -345,6 +351,14 @@ impl ScannerApp {
         options.color_mode = self.config.color_mode;
         options.color_depth_tolerance = self.config.color_depth_tolerance;
         options.loop_closure = self.config.loop_closure;
+        // The dependent flags imply loop closure in the CLI too; keep the
+        // window honest so a checkbox cannot silently do nothing.
+        options.online_loops = self.config.online_loops;
+        options.loop_worker = self.config.loop_worker;
+        options.incremental_rebuild = self.config.incremental_rebuild;
+        if options.online_loops || options.loop_worker || options.incremental_rebuild {
+            options.loop_closure = true;
+        }
         options.frame_to_model = self.config.frame_to_model;
         options.submaps = self.config.submaps;
         options.gpu = self.config.gpu;
@@ -594,6 +608,21 @@ impl ScannerApp {
 
                     ui.label("Loop closure");
                     ui.checkbox(&mut self.config.loop_closure, "correct revisits");
+                    ui.end_row();
+
+                    ui.label("Online loops");
+                    ui.checkbox(&mut self.config.online_loops, "correct during the scan");
+                    ui.end_row();
+
+                    ui.label("Loop worker");
+                    ui.checkbox(&mut self.config.loop_worker, "verify off the capture thread");
+                    ui.end_row();
+
+                    ui.label("Incremental");
+                    ui.checkbox(
+                        &mut self.config.incremental_rebuild,
+                        "move submaps, do not re-fuse",
+                    );
                     ui.end_row();
 
                     ui.label("Frame to model");
@@ -1166,6 +1195,21 @@ impl ScannerApp {
             stat(ui, "loop ICP", snapshot.loop_attempts.to_string());
             stat(ui, "loop pts", snapshot.loop_points.to_string());
             stat(ui, "rehydrated", snapshot.loop_rehydrations.to_string());
+            stat(
+                ui,
+                "online fixes",
+                if snapshot.online_updates > 0 {
+                    format!(
+                        "{} ({:.2} m)",
+                        snapshot.online_updates, snapshot.last_online_correction
+                    )
+                } else {
+                    "0".to_string()
+                },
+            );
+            if snapshot.loop_pending > 0 {
+                stat(ui, "loop pending", snapshot.loop_pending.to_string());
+            }
             stat(
                 ui,
                 "position",

@@ -75,6 +75,7 @@ impl IcpResult {
 ///
 /// Build these once per frame per scale — the downsample and normal estimation
 /// are far more expensive than the ICP iterations themselves.
+#[derive(Clone)]
 pub struct IcpCloud {
     pub points: Vec<Vector3<f32>>,
     pub normals: Vec<Vector3<f32>>,

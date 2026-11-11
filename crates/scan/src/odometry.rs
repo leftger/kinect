@@ -6,10 +6,10 @@
 //! for the cases projective association cannot serve (aligning keyframes that are
 //! far apart, which is what loop closure will need).
 
-use geom::icp::{align, IcpCloud, IcpParams, IcpResult};
-use geom::projective::{align_level, DepthPyramid};
+use geom::icp::{IcpCloud, IcpParams, IcpResult, align};
+use geom::projective::{DepthPyramid, align_level};
 use geom::tsdf::{RaycastImage, TsdfVolume};
-use geom::{DepthImage, Intrinsics};
+use geom::{DepthImage, Intrinsics, transform_point};
 use nalgebra::{Isometry3, Translation3, UnitQuaternion, Vector3};
 
 /// One resolution of the alignment pyramid.
@@ -115,6 +115,23 @@ pub struct OdometryConfig {
     pub relocalize_max_translation: f32,
     /// Absolute sanity bound on a re-localisation rotation, in radians.
     pub relocalize_max_rotation: f32,
+    /// How many recent accepted keyframes to keep for the local map used by
+    /// spatial re-localisation. LIO-SAM aligns against a local submap rather
+    /// than a single scan; a ring of recent views gives the wide search more
+    /// surface, which matters most when the camera rotates in place and the
+    /// previous frame sees little of what the next one will. One reproduces the
+    /// original single-frame behaviour.
+    pub relocalize_keyframes: usize,
+    /// Only trusted keyframes this close to the failed candidate are merged,
+    /// in metres. The ring is a local map; pulling in a view from the far side
+    /// of the room would add outliers, not overlap.
+    pub relocalize_map_radius: f32,
+    /// A new accepted frame closer than this (metres) and
+    /// `relocalize_keyframe_min_rotation` (radians) to the newest ring entry
+    /// replaces it rather than taking another slot. Keeps the ring from filling
+    /// with near-identical views when the sensor is nearly stationary.
+    pub relocalize_keyframe_min_translation: f32,
+    pub relocalize_keyframe_min_rotation: f32,
 
     /// A frame with at least this inlier ratio and at most `max_rmse` may be
     /// accepted even when its motion exceeds the ordinary per-frame limits.
@@ -149,6 +166,13 @@ impl Default for OdometryConfig {
             relocalize_max_rmse: 0.025,
             relocalize_max_translation: 1.0,
             relocalize_max_rotation: 1.2,
+            // A short local map: at 5 fps and typical handheld speed this is a
+            // second or two of recent views, which is the window in which a
+            // rejected frame is most likely to still have overlap.
+            relocalize_keyframes: 6,
+            relocalize_map_radius: 2.0,
+            relocalize_keyframe_min_translation: 0.04,
+            relocalize_keyframe_min_rotation: 0.10,
             fast_motion_inlier_ratio: 0.80,
             fast_motion_max_translation: 0.50,
             fast_motion_max_rotation: 1.0,
@@ -257,9 +281,11 @@ pub struct Odometry {
     /// the next alignment without rebuilding anything. Also the fallback target
     /// whenever the model cannot be rendered.
     previous: Option<DepthPyramid>,
-    /// The last accepted frame, kept for spatial re-localisation. Its cloud is
-    /// built lazily, so a clean scan never pays for it.
-    trusted: Option<TrustedFrame>,
+    /// Recent accepted keyframes, kept for spatial re-localisation. The clouds
+    /// are built lazily, so a clean scan never pays for them. This is the local
+    /// map LIO-SAM's scan-to-map step uses: several nearby views merged into
+    /// one target, rather than the single last frame.
+    trusted: Vec<TrustedFrame>,
     /// Whether a frame has defined the world frame yet. Distinct from
     /// `previous` being set, which survives a frame that was too sparse to use.
     started: bool,
@@ -288,6 +314,10 @@ pub struct Odometry {
     search: Isometry3<f32>,
     /// Consecutive rejected frames since the last accepted one.
     gap: usize,
+    /// How many trusted keyframes the last successful merged target used.
+    /// Purely diagnostic, but it is the only way to tell a single-view
+    /// re-localisation from the local-map one in a live scan.
+    last_relocalize_frames: usize,
 }
 
 impl Odometry {
@@ -298,18 +328,29 @@ impl Odometry {
             intrinsics,
             config,
             previous: None,
-            trusted: None,
+            trusted: Vec::new(),
             started: false,
             guess: Isometry3::identity(),
             pose: Isometry3::identity(),
             search: Isometry3::identity(),
             gap: 0,
+            last_relocalize_frames: 0,
         }
     }
 
     /// Current camera-to-world pose.
     pub fn pose(&self) -> Isometry3<f32> {
         self.pose
+    }
+
+    /// How many recent accepted keyframes the re-localisation map is holding.
+    pub fn trusted_keyframes(&self) -> usize {
+        self.trusted.len()
+    }
+
+    /// How many keyframes the last merged re-localisation target contained.
+    pub fn relocalize_target_frames(&self) -> usize {
+        self.last_relocalize_frames
     }
 
     /// Render `volume` from the last trusted pose, if it holds enough to align to.
@@ -332,7 +373,10 @@ impl Odometry {
         let hits = rendered.hits();
         let coverage = hits as f32 / (width * height).max(1) as f32;
         if std::env::var_os("SCAN_DEBUG_F2M").is_some() {
-            eprintln!("[f2m] render hits {hits} ({:.1}% coverage)", coverage * 100.0);
+            eprintln!(
+                "[f2m] render hits {hits} ({:.1}% coverage)",
+                coverage * 100.0
+            );
         }
 
         if hits < self.config.min_points {
@@ -397,10 +441,16 @@ impl Odometry {
             ..IcpParams::default()
         };
 
-        // The last accepted frame's cloud is smaller and
-        // cheaper, but it only covers the view the sensor has just left.
-        let (result, trusted_pose, target_len, initial) = {
-            let trusted = self.trusted.as_mut()?;
+        // Build the local map target: every recent trusted keyframe within
+        // `relocalize_map_radius` of the failed candidate, transformed into the
+        // newest trusted frame and merged. A single view only covers the patch
+        // the sensor has just left; a few nearby views cover the wider surface
+        // the spatial search needs when the camera turns or steps sideways.
+        if self.trusted.is_empty() {
+            return None;
+        }
+
+        for trusted in &mut self.trusted {
             if trusted.cloud.is_none() {
                 let points = DepthImage::new(trusted.width, trusted.height, &trusted.depth)
                     .to_points(&intrinsics);
@@ -412,22 +462,57 @@ impl Odometry {
                     &origin,
                 ));
             }
+        }
 
-            let target = trusted.cloud.as_ref()?;
-            let initial = trusted.pose.inverse() * candidate;
-            (
-                align(&current_cloud, target, initial, &params),
-                trusted.pose,
-                target.len(),
-                initial,
-            )
-        };
+        let anchor_pose = self.trusted.last()?.pose;
+        let map_radius = self.config.relocalize_map_radius.max(0.0);
+        let newest = self.trusted.len() - 1;
+        let mut points = Vec::new();
+        let mut normals = Vec::new();
+        let mut merged_frames = 0;
+
+        for (position, trusted) in self.trusted.iter().enumerate() {
+            let distance = (trusted.pose.translation.vector - candidate.translation.vector).norm();
+            // Always anchor on the newest view, even when the candidate has
+            // drifted away from it. With no other overlap it is still the best
+            // target, which preserves the old single-frame behaviour.
+            if position != newest && distance > map_radius {
+                continue;
+            }
+
+            let cloud = trusted.cloud.as_ref()?;
+            let relative = anchor_pose.inverse() * trusted.pose;
+            points.extend(
+                cloud
+                    .points
+                    .iter()
+                    .map(|point| transform_point(&relative, point)),
+            );
+            normals.extend(
+                cloud
+                    .normals
+                    .iter()
+                    .map(|normal| relative.rotation * *normal),
+            );
+            merged_frames += 1;
+        }
+
+        if points.is_empty() {
+            return None;
+        }
+
+        let target = IcpCloud::new(points, normals, radius);
+        let target_len = target.len();
+        let initial = anchor_pose.inverse() * candidate;
+        let result = align(&current_cloud, &target, initial, &params);
+        self.last_relocalize_frames = merged_frames;
 
         if debug {
             eprintln!(
-                "[relocalize] frame source {} target {} init_move {:.3} init_rot {:.3} corr {} ({:.3}) rmse {:.4} move {:.3} rot {:.3} iters {} converged {}",
+                "[relocalize] frame source {} target {} ({} trusted frames) init_move {:.3} init_rot {:.3} corr {} ({:.3}) rmse {:.4} move {:.3} rot {:.3} iters {} converged {}",
                 current_cloud.len(),
                 target_len,
+                merged_frames,
                 initial.translation.vector.norm(),
                 initial.rotation.angle(),
                 result.correspondences,
@@ -440,8 +525,8 @@ impl Odometry {
             );
         }
 
-        let pose = trusted_pose * result.transform;
-        let motion = trusted_pose.inverse() * pose;
+        let pose = anchor_pose * result.transform;
+        let motion = anchor_pose.inverse() * pose;
         self.accept_relocalized(result, pose, motion, projective_iterations)
     }
 
@@ -486,12 +571,53 @@ impl Odometry {
     /// the new view's own internal motion.
     pub fn restart(&mut self) {
         self.previous = None;
-        self.trusted = None;
+        self.trusted.clear();
         self.started = false;
         self.guess = Isometry3::identity();
         self.pose = Isometry3::identity();
         self.search = Isometry3::identity();
         self.gap = 0;
+        self.last_relocalize_frames = 0;
+    }
+
+    /// Add an accepted frame to the local re-localisation map.
+    ///
+    /// Two policies keep the ring small and useful: a frame that barely moved
+    /// from the newest entry replaces it (there is no new viewpoint to add),
+    /// and the ring is capped at `relocalize_keyframes`. The newest entry is
+    /// also the anchor for a merged target, so replacing it keeps the target
+    /// centred on the most recent view.
+    fn remember_trusted(
+        &mut self,
+        width: usize,
+        height: usize,
+        depth: &[f32],
+        pose: Isometry3<f32>,
+    ) {
+        // The ring is only ever read by spatial re-localisation. A clean scan
+        // with it disabled should not pay six depth copies for nothing.
+        if !self.config.relocalize {
+            return;
+        }
+
+        if let Some(last) = self.trusted.last() {
+            let motion = last.pose.inverse() * pose;
+            if motion.translation.vector.norm() < self.config.relocalize_keyframe_min_translation
+                && motion.rotation.angle() < self.config.relocalize_keyframe_min_rotation
+            {
+                *self.trusted.last_mut().expect("checked above") =
+                    TrustedFrame::new(width, height, depth, pose);
+                return;
+            }
+        }
+
+        self.trusted
+            .push(TrustedFrame::new(width, height, depth, pose));
+
+        let limit = self.config.relocalize_keyframes.max(1);
+        while self.trusted.len() > limit {
+            self.trusted.remove(0);
+        }
     }
 
     /// Track a depth frame, against the model when one is supplied and the mode
@@ -517,12 +643,7 @@ impl Odometry {
         if !self.started {
             self.started = true;
             self.previous = Some(current);
-            self.trusted = Some(TrustedFrame::new(
-                depth.width,
-                depth.height,
-                depth.depth,
-                self.pose,
-            ));
+            self.remember_trusted(depth.width, depth.height, depth.depth, self.pose);
             self.search = self.pose;
             return TrackReport {
                 pose: self.pose,
@@ -687,12 +808,7 @@ impl Odometry {
                 self.pose = relocalized.pose;
                 self.search = relocalized.pose;
                 self.previous = Some(current);
-                self.trusted = Some(TrustedFrame::new(
-                    depth.width,
-                    depth.height,
-                    depth.depth,
-                    relocalized.pose,
-                ));
+                self.remember_trusted(depth.width, depth.height, depth.depth, relocalized.pose);
                 self.guess = average_motion(relocalized.motion, steps);
 
                 return TrackReport {
@@ -752,12 +868,7 @@ impl Odometry {
         self.search = candidate;
         self.guess = motion;
         self.previous = Some(current);
-        self.trusted = Some(TrustedFrame::new(
-            depth.width,
-            depth.height,
-            depth.depth,
-            self.pose,
-        ));
+        self.remember_trusted(depth.width, depth.height, depth.depth, self.pose);
 
         TrackReport {
             pose: self.pose,
@@ -1151,13 +1262,18 @@ mod tests {
         );
 
         let rendered = volume.raycast(&intrinsics, &Isometry3::identity(), WIDTH, HEIGHT);
-        assert!(rendered.hits() > WIDTH * HEIGHT / 2, "{} hits", rendered.hits());
+        assert!(
+            rendered.hits() > WIDTH * HEIGHT / 2,
+            "{} hits",
+            rendered.hits()
+        );
 
         // What the alignment can actually work with. `align_level` drops any
         // correspondence whose target pixel carries no normal, so the render's
         // *trackable* count bounds the achievable inlier ratio -- and the inlier
         // gate is what decides whether a frame is used at all.
-        let source = DepthPyramid::from_image(&DepthImage::new(WIDTH, HEIGHT, &room), intrinsics, 1);
+        let source =
+            DepthPyramid::from_image(&DepthImage::new(WIDTH, HEIGHT, &room), intrinsics, 1);
         let target = DepthPyramid::from_image_with_normals(
             &rendered.as_depth_image(),
             rendered.normals.clone(),
@@ -1295,6 +1411,84 @@ mod tests {
             report.accepted,
             "an unrenderable model should fall back, not fail: {:?}",
             report.rejection
+        );
+    }
+
+    #[test]
+    fn the_relocalization_ring_keeps_recent_keyframes_and_caps_itself() {
+        let mut odometry = Odometry::new(
+            intrinsics(),
+            OdometryConfig {
+                relocalize: true,
+                relocalize_keyframes: 3,
+                relocalize_keyframe_min_translation: 0.0,
+                relocalize_keyframe_min_rotation: 0.0,
+                ..OdometryConfig::default()
+            },
+        );
+
+        let first = render_room(Vector3::zeros());
+        odometry.track(&frame(&first), None);
+
+        for step in 1..8 {
+            let eye = Vector3::new(0.05 * step as f32, 0.0, 0.0);
+            let room = render_room(eye);
+            let report = odometry.track(&frame(&room), None);
+            assert!(
+                report.accepted,
+                "step {step} rejected: {:?}",
+                report.rejection
+            );
+        }
+
+        assert_eq!(
+            odometry.trusted_keyframes(),
+            3,
+            "the local map should keep the newest views and no more"
+        );
+    }
+
+    #[test]
+    fn a_rejected_frame_uses_the_local_keyframe_map_for_relocalization() {
+        let mut odometry = Odometry::new(
+            intrinsics(),
+            OdometryConfig {
+                relocalize: true,
+                relocalize_keyframes: 6,
+                // Wide enough that every recent view contributes, which is the
+                // point: the target is a local map, not one frame.
+                relocalize_map_radius: 5.0,
+                ..OdometryConfig::default()
+            },
+        );
+
+        let first = render_room(Vector3::zeros());
+        odometry.track(&frame(&first), None);
+
+        // Build a ring of nearby views.
+        for step in 1..5 {
+            let eye = Vector3::new(0.05 * step as f32, 0.0, 0.0);
+            let room = render_room(eye);
+            let report = odometry.track(&frame(&room), None);
+            assert!(
+                report.accepted,
+                "step {step} rejected: {:?}",
+                report.rejection
+            );
+        }
+        let ring = odometry.trusted_keyframes();
+        assert!(ring > 1, "the ring did not grow: {ring}");
+
+        // A view 2 m away cannot be matched projectively, and the spatial fit
+        // will not be trusted either. The attempt must still be made against
+        // the merged local map rather than a single frame.
+        let far = render_room(Vector3::new(0.0, 0.0, -2.0));
+        let report = odometry.track(&frame(&far), None);
+        assert!(!report.accepted, "a 2 m jump must not be accepted");
+        assert!(
+            odometry.relocalize_target_frames() > 1,
+            "the spatial retry used {} trusted frame(s), expected the local map",
+            odometry.relocalize_target_frames()
         );
     }
 }

@@ -31,6 +31,9 @@ use geom::icp::{IcpCloud, IcpParams, align};
 use geom::pose_graph::Edge;
 use geom::transform_point;
 use nalgebra::{Isometry3, Vector3};
+use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
+use std::thread::{self, JoinHandle};
+use std::time::Duration;
 
 /// A compact appearance signature for one colour frame.
 ///
@@ -181,6 +184,17 @@ pub struct LoopClosureConfig {
     pub normal_radius: f32,
     pub max_distance: f32,
     pub max_iterations: usize,
+    /// How many keyframes on each side of a loop candidate to merge into the
+    /// ICP target. LIO-SAM builds its loop target from a window of history
+    /// keyframes rather than a single scan; the wider surface makes a narrow
+    /// single view much less likely to miss a real revisit. Zero keeps the
+    /// original single-keyframe target.
+    pub loop_target_keyframes: usize,
+    /// Run loop verification on a worker thread instead of on the capture
+    /// thread. Keyframe indexing and candidate selection stay synchronous;
+    /// only the ICP alignment moves off-thread. The trade is one extra cloud
+    /// clone per keyframe, and results arrive a frame or two later.
+    pub background: bool,
 }
 
 impl Default for LoopClosureConfig {
@@ -206,6 +220,12 @@ impl Default for LoopClosureConfig {
             normal_radius: 0.12,
             max_distance: 0.25,
             max_iterations: 20,
+            // A three-keyframe window each way: LIO-SAM uses 25, but a depth
+            // camera already sees a dense surface and indoor rooms are small,
+            // so a handful is enough to widen the basin without burying the
+            // candidate in redundant geometry.
+            loop_target_keyframes: 2,
+            background: false,
         }
     }
 }
@@ -241,6 +261,196 @@ impl Loop {
     }
 }
 
+/// One candidate prepared for verification.
+///
+/// The target is a small local submap in the candidate keyframe's frame, not
+/// just one keyframe's cloud. See [`LoopClosureConfig::loop_target_keyframes`].
+struct LoopCandidate {
+    from: usize,
+    target: IcpCloud,
+    initial: Isometry3<f32>,
+    /// Pose-proximity candidate, as opposed to an appearance-only proposal.
+    spatial: bool,
+}
+
+/// Verify prepared candidates against `source`, returning the best accepted
+/// loop and how many alignments were spent.
+///
+/// Pure on purpose: the capture thread and the background worker run exactly
+/// the same verification, so turning the worker on cannot quietly change which
+/// loops are accepted.
+fn verify_candidates(
+    source: &IcpCloud,
+    candidates: &[LoopCandidate],
+    config: &LoopClosureConfig,
+    index: usize,
+    debug: bool,
+) -> (Option<Loop>, usize) {
+    let params = IcpParams {
+        max_correspondence_distance: config.max_distance,
+        max_iterations: config.max_iterations,
+        ..IcpParams::default()
+    };
+
+    let mut best: Option<Loop> = None;
+    let mut attempts = 0;
+
+    for candidate in candidates {
+        // A verified spatial loop is enough; only fall back to appearance when
+        // the entire pose-proximity pass produced nothing.
+        if !candidate.spatial && best.is_some() {
+            break;
+        }
+
+        attempts += 1;
+        let result = align(source, &candidate.target, candidate.initial, &params);
+        if debug {
+            eprintln!(
+                "[loop] align kf {} -> {index}: inliers {:.3} rmse {:.4} corr {}",
+                candidate.from, result.inlier_ratio, result.rmse, result.correspondences
+            );
+        }
+
+        if result.inlier_ratio < config.min_inlier_ratio || result.rmse > config.max_rmse {
+            continue;
+        }
+
+        // A real place match survives being aligned in the other direction.
+        // Reverse ICP starts from the inverse of the forward result, so a
+        // one-sided surface fit shows up as a large round-trip error.
+        let reverse = align(
+            &candidate.target,
+            source,
+            result.transform.inverse(),
+            &params,
+        );
+        let round_trip = reverse.transform * result.transform;
+        // Reverse RMSE is not a gate: a slightly noisier reverse fit with a
+        // tiny round-trip error is exactly what a correct loop looks like.
+        if reverse.inlier_ratio < config.min_inlier_ratio
+            || round_trip.translation.vector.norm() > config.reciprocal_max_translation
+            || round_trip.rotation.angle() > config.reciprocal_max_rotation
+        {
+            if debug {
+                eprintln!(
+                    "[loop] reject kf {} -> {index}: reverse inliers {:.3} rmse {:.4}, round-trip {:.3} m {:.3} rad",
+                    candidate.from,
+                    reverse.inlier_ratio,
+                    reverse.rmse,
+                    round_trip.translation.vector.norm(),
+                    round_trip.rotation.angle()
+                );
+            }
+            continue;
+        }
+
+        let loop_closure = Loop {
+            from: candidate.from,
+            to: index,
+            measurement: result.transform,
+            inlier_ratio: result.inlier_ratio,
+            rmse: result.rmse,
+        };
+
+        // Keep the best of the verified candidates rather than the first.
+        let better = match &best {
+            None => true,
+            Some(previous) => loop_closure.inlier_ratio > previous.inlier_ratio,
+        };
+        if better {
+            best = Some(loop_closure);
+        }
+    }
+
+    (best, attempts)
+}
+
+/// A verification handed to the background worker.
+struct LoopJob {
+    source: IcpCloud,
+    candidates: Vec<LoopCandidate>,
+    index: usize,
+    config: LoopClosureConfig,
+}
+
+/// The worker's answer. `attempts` is reported per job so the capture thread
+/// can keep its telemetry honest without sharing the candidate list.
+struct LoopOutcome {
+    found: Option<Loop>,
+    attempts: usize,
+}
+
+/// Optional ICP worker. Owned by [`LoopFinder`]; dropping it closes the job
+/// channel and joins the thread.
+struct LoopWorker {
+    sender: Option<Sender<LoopJob>>,
+    receiver: Receiver<LoopOutcome>,
+    handle: Option<JoinHandle<()>>,
+}
+
+impl LoopWorker {
+    fn spawn() -> Self {
+        let (job_sender, job_receiver) = mpsc::channel::<LoopJob>();
+        let (outcome_sender, outcome_receiver) = mpsc::channel::<LoopOutcome>();
+        let handle = thread::Builder::new()
+            .name("scan-loop-icp".to_string())
+            .spawn(move || {
+                let debug = std::env::var_os("SCAN_DEBUG_LOOPS").is_some();
+                while let Ok(job) = job_receiver.recv() {
+                    let (found, attempts) = verify_candidates(
+                        &job.source,
+                        &job.candidates,
+                        &job.config,
+                        job.index,
+                        debug,
+                    );
+                    if outcome_sender
+                        .send(LoopOutcome { found, attempts })
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            })
+            .expect("spawn loop verification worker");
+
+        Self {
+            sender: Some(job_sender),
+            receiver: outcome_receiver,
+            handle: Some(handle),
+        }
+    }
+
+    fn submit(&self, job: LoopJob) {
+        if let Some(sender) = &self.sender {
+            let _ = sender.send(job);
+        }
+    }
+
+    fn try_recv(&self) -> Option<LoopOutcome> {
+        match self.receiver.try_recv() {
+            Ok(outcome) => Some(outcome),
+            Err(TryRecvError::Empty | TryRecvError::Disconnected) => None,
+        }
+    }
+
+    fn recv_timeout(&self, timeout: Duration) -> Option<LoopOutcome> {
+        self.receiver.recv_timeout(timeout).ok()
+    }
+}
+
+impl Drop for LoopWorker {
+    fn drop(&mut self) {
+        // Close the job channel first, then wait for the thread to finish the
+        // job it already has. A scan that ends with a loop in flight still gets
+        // the chance to use it; `flush` is the normal path, this is the backstop.
+        self.sender.take();
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
 /// Collects keyframes and the loop closures between them.
 pub struct LoopFinder {
     config: LoopClosureConfig,
@@ -251,10 +461,15 @@ pub struct LoopFinder {
     last_keyframe: Option<Isometry3<f32>>,
     /// Index of the first keyframe still in full-resolution working memory.
     working_start: usize,
+    /// Verification worker, present only when `config.background` is set.
+    worker: Option<LoopWorker>,
+    /// Jobs submitted to the worker but not answered yet.
+    pending: usize,
 }
 
 impl LoopFinder {
     pub fn new(config: LoopClosureConfig) -> Self {
+        let worker = config.background.then(LoopWorker::spawn);
         Self {
             config,
             keyframes: Vec::new(),
@@ -263,7 +478,91 @@ impl LoopFinder {
             rehydrations: 0,
             last_keyframe: None,
             working_start: 0,
+            worker,
+            pending: 0,
         }
+    }
+
+    /// True when verification is running on a worker thread.
+    pub fn is_background(&self) -> bool {
+        self.worker.is_some()
+    }
+
+    /// Jobs submitted to the worker that have not been answered yet.
+    pub fn pending(&self) -> usize {
+        self.pending
+    }
+
+    /// Take any completed background results. Synchronous mode always returns
+    /// an empty vector, because loops are already in the index.
+    pub fn poll(&mut self) -> Vec<Loop> {
+        let mut outcomes = Vec::new();
+        if let Some(worker) = &self.worker {
+            while let Some(outcome) = worker.try_recv() {
+                outcomes.push(outcome);
+            }
+        }
+
+        let mut found = Vec::new();
+        for outcome in outcomes {
+            if let Some(loop_closure) = self.absorb(outcome) {
+                found.push(loop_closure);
+            }
+        }
+        found
+    }
+
+    /// Wait for every in-flight verification so a final optimisation sees all
+    /// the loops the scan produced. Returns the loops that arrived meanwhile.
+    ///
+    /// The timeout is a backstop against a wedged worker, not a normal path:
+    /// one ICP alignment is bounded by `max_iterations`, and 30 s is far above
+    /// anything a real keyframe pair costs. If it does expire, the scan keeps
+    /// the loops it already has rather than hanging.
+    pub fn flush(&mut self) -> Vec<Loop> {
+        let mut found = self.poll();
+        let mut outcomes = Vec::new();
+        if let Some(worker) = &self.worker {
+            while self.pending > 0 {
+                match worker.recv_timeout(Duration::from_secs(30)) {
+                    Some(outcome) => outcomes.push(outcome),
+                    None => break,
+                }
+            }
+        }
+        for outcome in outcomes {
+            if let Some(loop_closure) = self.absorb(outcome) {
+                found.push(loop_closure);
+            }
+        }
+        found
+    }
+
+    fn absorb(&mut self, outcome: LoopOutcome) -> Option<Loop> {
+        self.pending = self.pending.saturating_sub(1);
+        self.attempts += outcome.attempts;
+        if let Some(loop_closure) = outcome.found {
+            self.loops.push(loop_closure);
+            Some(loop_closure)
+        } else {
+            None
+        }
+    }
+
+    /// Point every keyframe at its corrected world pose.
+    ///
+    /// `poses` is indexed by arrival frame, exactly like `Scanner::poses`. The
+    /// clouds are camera-frame data and do not move; only the poses used for
+    /// candidate search and relative measurements need updating. Without this,
+    /// an online correction would leave the loop index proposing candidates
+    /// from the drifted trajectory it just corrected.
+    pub fn update_poses(&mut self, poses: &[Isometry3<f32>]) {
+        for keyframe in &mut self.keyframes {
+            if let Some(pose) = poses.get(keyframe.index) {
+                keyframe.pose = *pose;
+            }
+        }
+        self.last_keyframe = self.keyframes.last().map(|keyframe| keyframe.pose);
     }
 
     pub fn keyframes(&self) -> &[Keyframe] {
@@ -395,7 +694,41 @@ impl LoopFinder {
             &origin,
         );
 
-        let found = self.search(index, &pose, &cloud, appearance, rehydrate);
+        let candidates = self.prepare_candidates(index, &pose, appearance, rehydrate);
+
+        // The frame becomes a keyframe even when it produced no candidates, so
+        // later frames can match against it.
+        if self.worker.is_some() {
+            self.keyframes.push(Keyframe {
+                index,
+                pose,
+                appearance: appearance.cloned(),
+                cloud: cloud.clone(),
+                decimated: false,
+            });
+            self.manage_memory();
+            self.last_keyframe = Some(pose);
+
+            if candidates.is_empty() {
+                return None;
+            }
+
+            self.pending += 1;
+            self.worker
+                .as_ref()
+                .expect("worker was checked above")
+                .submit(LoopJob {
+                    source: cloud,
+                    candidates,
+                    index,
+                    config: self.config,
+                });
+            return None;
+        }
+
+        let debug = std::env::var_os("SCAN_DEBUG_LOOPS").is_some();
+        let (found, attempts) = verify_candidates(&cloud, &candidates, &self.config, index, debug);
+        self.attempts += attempts;
 
         self.keyframes.push(Keyframe {
             index,
@@ -407,22 +740,27 @@ impl LoopFinder {
         self.manage_memory();
         self.last_keyframe = Some(pose);
 
-        if let Some(ref loop_closure) = found {
-            self.loops.push(*loop_closure);
+        if let Some(loop_closure) = found {
+            self.loops.push(loop_closure);
         }
 
         found
     }
 
-    /// Align the new frame against the most plausible earlier ones.
-    fn search(
+    /// Select candidates and build each one's local target submap.
+    ///
+    /// The keyframe window follows LIO-SAM's `loopFindNearKeyframes`: the
+    /// candidate plus `loop_target_keyframes` on either side, all transformed
+    /// into the candidate's frame and merged into one cloud. A single depth
+    /// view is narrow, so a nearby keyframe often supplies the surface that
+    /// makes a real revisit verifiable.
+    fn prepare_candidates(
         &mut self,
         index: usize,
         pose: &Isometry3<f32>,
-        cloud: &IcpCloud,
         appearance: Option<&VisualDescriptor>,
         mut rehydrate: Option<&mut dyn FnMut(usize) -> Option<IcpCloud>>,
-    ) -> Option<Loop> {
+    ) -> Vec<LoopCandidate> {
         let debug = std::env::var_os("SCAN_DEBUG_LOOPS").is_some();
 
         // Spatial candidates first: they are the normal path and keep colourless
@@ -495,101 +833,82 @@ impl LoopFinder {
             )
             .collect();
 
-        if candidates.is_empty() {
-            return None;
-        }
-
-        let params = IcpParams {
-            max_correspondence_distance: self.config.max_distance,
-            max_iterations: self.config.max_iterations,
-            ..IcpParams::default()
-        };
-
-        let mut best: Option<Loop> = None;
+        let mut prepared = Vec::with_capacity(candidates.len());
+        let window = self.config.loop_target_keyframes;
 
         for (spatial, position) in candidates {
-            // A verified spatial loop is enough; only fall back to appearance
-            // when the entire pose-proximity pass produced nothing.
-            if !spatial && best.is_some() {
-                break;
+            let keyframe_index = self.keyframes[position].index;
+            let keyframe_pose = self.keyframes[position].pose;
+            let decimated = self.keyframes[position].decimated;
+            let initial = keyframe_pose.inverse() * pose;
+
+            // Rehydrate only the primary candidate. Neighbours are used at
+            // whatever resolution they are already held at; they are context
+            // for the alignment, not the thing being measured.
+            let mut rehydrated = None;
+            if decimated {
+                if let Some(build) = rehydrate.as_mut() {
+                    rehydrated = build(keyframe_index);
+                    if rehydrated.is_some() {
+                        self.rehydrations += 1;
+                    }
+                }
             }
-            let keyframe = &self.keyframes[position];
 
-            // Starting guess: where the poses say the earlier frame is, relative
-            // to this one. ICP then moves it onto the geometry.
-            let initial = keyframe.pose.inverse() * pose;
+            let start = position.saturating_sub(window);
+            let end = (position + window).min(self.keyframes.len().saturating_sub(1));
 
-            // A long-term cloud is cheap but coarse. Before spending ICP on it,
-            // let the caller rebuild the full cloud from retained depth. The
-            // temporary full cloud is dropped as soon as this candidate is done.
-            let rehydrated = if keyframe.decimated {
-                rehydrate.as_mut().and_then(|build| build(keyframe.index))
+            let target = if start == end && rehydrated.is_none() {
+                self.keyframes[position].cloud.clone()
             } else {
-                None
+                let mut points = Vec::new();
+                let mut normals = Vec::new();
+                for neighbour in start..=end {
+                    let frame = &self.keyframes[neighbour];
+                    let relative = keyframe_pose.inverse() * frame.pose;
+                    let cloud = if neighbour == position {
+                        rehydrated.as_ref().unwrap_or(&frame.cloud)
+                    } else {
+                        &frame.cloud
+                    };
+                    points.extend(
+                        cloud
+                            .points
+                            .iter()
+                            .map(|point| transform_point(&relative, point)),
+                    );
+                    normals.extend(
+                        cloud
+                            .normals
+                            .iter()
+                            .map(|normal| relative.rotation * *normal),
+                    );
+                }
+                if points.is_empty() {
+                    continue;
+                }
+                IcpCloud::new(points, normals, self.config.max_distance)
             };
-            let target = rehydrated.as_ref().unwrap_or(&keyframe.cloud);
-            if rehydrated.is_some() {
-                self.rehydrations += 1;
-            }
 
-            self.attempts += 1;
-            let result = align(cloud, target, initial, &params);
             if debug {
                 eprintln!(
-                    "[loop] align kf {} -> {index}: inliers {:.3} rmse {:.4} corr {}",
-                    keyframe.index, result.inlier_ratio, result.rmse, result.correspondences
+                    "[loop] {index} candidate kf {} window kf {}..={} target {} points",
+                    keyframe_index,
+                    self.keyframes[start].index,
+                    self.keyframes[end].index,
+                    target.len()
                 );
             }
 
-            if result.inlier_ratio < self.config.min_inlier_ratio
-                || result.rmse > self.config.max_rmse
-            {
-                continue;
-            }
-
-            // A real place match survives being aligned in the other direction.
-            // Reverse ICP starts from the inverse of the forward result, so a
-            // one-sided surface fit shows up as a large round-trip error.
-            let reverse = align(target, cloud, result.transform.inverse(), &params);
-            let round_trip = reverse.transform * result.transform;
-            // Reverse RMSE is not a gate: a slightly noisier reverse fit with a
-            // tiny round-trip error is exactly what a correct loop looks like.
-            if reverse.inlier_ratio < self.config.min_inlier_ratio
-                || round_trip.translation.vector.norm() > self.config.reciprocal_max_translation
-                || round_trip.rotation.angle() > self.config.reciprocal_max_rotation
-            {
-                if debug {
-                    eprintln!(
-                        "[loop] reject kf {} -> {index}: reverse inliers {:.3} rmse {:.4}, round-trip {:.3} m {:.3} rad",
-                        keyframe.index,
-                        reverse.inlier_ratio,
-                        reverse.rmse,
-                        round_trip.translation.vector.norm(),
-                        round_trip.rotation.angle()
-                    );
-                }
-                continue;
-            }
-
-            let candidate = Loop {
-                from: keyframe.index,
-                to: index,
-                measurement: result.transform,
-                inlier_ratio: result.inlier_ratio,
-                rmse: result.rmse,
-            };
-
-            // Keep the best of the verified candidates rather than the first.
-            let better = match &best {
-                None => true,
-                Some(previous) => candidate.inlier_ratio > previous.inlier_ratio,
-            };
-            if better {
-                best = Some(candidate);
-            }
+            prepared.push(LoopCandidate {
+                from: keyframe_index,
+                target,
+                initial,
+                spatial,
+            });
         }
 
-        best
+        prepared
     }
 
     /// Turn every accepted loop into a pose-graph edge.
@@ -949,5 +1268,90 @@ mod tests {
         assert_eq!(edges[0].from, 0);
         assert_eq!(edges[0].to, 50);
         assert!(edges[0].weight > 0.0);
+    }
+
+    /// The left or right half of the wavy surface, in world coordinates.
+    fn half_scene(left: bool) -> Vec<Vector3<f32>> {
+        scene()
+            .into_iter()
+            .filter(|point| (point.x < 0.0) == left)
+            .collect()
+    }
+
+    #[test]
+    fn a_keyframe_window_widens_a_narrow_loop_target() {
+        // Two complementary half-views from the same place, then a full view
+        // later. One keyframe alone only covers half the source, which is below
+        // the acceptance gate; the merged window covers all of it. This is the
+        // LIO-SAM `loopFindNearKeyframes` idea, expressed as a behaviour rather
+        // than a point count.
+        let left = half_scene(true);
+        let right = half_scene(false);
+        let full = scene();
+
+        let base = LoopClosureConfig {
+            search_radius: 1.5,
+            min_index_gap: 30,
+            keyframe_min_translation: 0.0,
+            keyframe_min_rotation: 0.0,
+            keyframe_max_interval: 100,
+            max_candidates: 1,
+            min_inlier_ratio: 0.7,
+            ..LoopClosureConfig::default()
+        };
+
+        let run = |window: usize| {
+            let mut finder = LoopFinder::new(LoopClosureConfig {
+                loop_target_keyframes: window,
+                ..base
+            });
+            finder.consider(0, Isometry3::identity(), &left);
+            finder.consider(1, Isometry3::identity(), &right);
+            finder.consider(50, at(0.1, 0.0, 0.0), &full)
+        };
+
+        assert!(
+            run(0).is_none(),
+            "a single half-view should not clear the inlier gate"
+        );
+        assert!(
+            run(1).is_some(),
+            "the merged keyframe window should verify the same revisit"
+        );
+    }
+
+    #[test]
+    fn background_verification_delivers_the_same_loop() {
+        let world = scene();
+        let config = LoopClosureConfig {
+            min_index_gap: 30,
+            background: true,
+            ..LoopClosureConfig::default()
+        };
+        let mut finder = LoopFinder::new(config);
+        assert!(finder.is_background());
+
+        finder.consider(
+            0,
+            Isometry3::identity(),
+            &view(&world, &Isometry3::identity()),
+        );
+
+        let returned = at(0.4, 0.0, 0.0);
+        assert!(
+            finder
+                .consider(50, returned, &view(&world, &returned))
+                .is_none(),
+            "background verification must not block the offering frame"
+        );
+        assert_eq!(finder.pending(), 1);
+
+        let found = finder.flush();
+        assert_eq!(found.len(), 1, "the worker's loop was not collected");
+        assert_eq!(finder.loops().len(), 1);
+        assert!(finder.attempts() > 0);
+        assert_eq!(finder.pending(), 0);
+        assert_eq!(found[0].from, 0);
+        assert_eq!(found[0].to, 50);
     }
 }

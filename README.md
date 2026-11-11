@@ -44,11 +44,15 @@ features, and the first-scan checklist.
 ## What it does
 
 - Captures, records, and replays depth and optional colour at 512x424.
-- Tracks frame-to-frame motion with projective point-to-plane ICP.
+- Tracks frame-to-frame motion with projective point-to-plane ICP, and can fall
+  back to a local map of recent keyframes for a spatial re-localisation.
 - Fuses frames into a voxel-hashed TSDF and extracts a triangle mesh.
 - Writes PLY, OBJ, glTF, and GLB with per-vertex colour or a texture atlas.
-- Detects revisits with loop closure, optimises a pose graph, and rebuilds the
-  model from corrected poses.
+- Detects revisits with loop closure, verifies each against a window of nearby
+  keyframes, optimises a keyframe pose graph, and corrects the model.
+- Applies a verified loop during the scan (`--online-loops`) or at the end, and
+  can move cached submap surfaces instead of re-fusing every frame
+  (`--incremental-rebuild`).
 - Keeps unplaceable frames in submaps instead of discarding them.
 - Exports a Nerfstudio/Brush dataset for Gaussian splatting.
 - Runs a scanner GUI with a live 3D preview, source picker, transport, export,
@@ -63,6 +67,9 @@ features, and the first-scan checklist.
 - Colour capture, registration, per-vertex colour, and texture atlases.
 - A real closed-loop colour capture: 120/120 frames, one submap, one verified
   revisit, 10.9 cm maximum correction, and a trainable dataset.
+- Keyframe-graph loop closure with multi-keyframe verification targets, optional
+  online correction, an optional background ICP worker, and an incremental
+  submap correction path.
 - Gaussian-splatting dataset export and a tested Brush hand-off on synthetic and
   real data. The window can launch Brush and load its `.ply` into a basic splat
   preview.
@@ -71,6 +78,9 @@ features, and the first-scan checklist.
 
 - Drift is real on long handheld captures. Loop closure corrects a revisit, but
   the final model still depends on capture quality.
+- Online correction moves cached submap surfaces rigidly and does not re-fuse the
+  volume until the final pass. Incremental rebuild makes the same trade: it is
+  fast, but it cannot remove drift *inside* a submap.
 - The GPU decoder frees host CPU time but does not shorten a scan, because
   capture waits on USB.
 - Fusion is the largest per-frame cost and grows with model size.
@@ -85,8 +95,9 @@ The long-form Gaussian-splatting plan and measurements are in
 ```text
 depth frame from USB
   -> decode            raw packet to metres
-  -> odometry          pose relative to the last frame
+  -> odometry          pose relative to the last frame, local keyframe map
   -> TSDF fusion       integrate into a voxel-hashed volume
+  -> loop closure      keyframe graph, online or end-of-scan correction
   -> mesh extraction   surface nets, then PLY / OBJ / glTF / GLB
   -> optional colour   register views, paint the mesh or atlas
   -> optional dataset  posed images, masks, and init.ply for a trainer
@@ -94,6 +105,12 @@ depth frame from USB
 
 Read [How it works](docs/how-it-works.md) for tracking, fusion, mesh extraction,
 loop closure, and submaps.
+
+The loop-closure architecture is adapted from
+[LIO-SAM](https://github.com/TixiaoShan/LIO-SAM): keyframe graph nodes, a local
+window of keyframes as the verification target, and corrections applied to
+cached pieces rather than an unconditional re-fuse. The front end is depth-only;
+there is no lidar and no IMU.
 
 ## Documentation
 

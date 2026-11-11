@@ -25,6 +25,7 @@ pub fn cell_of(point: &Vector3<f32>, cell: f32) -> Cell {
 /// Cell size does not affect correctness, only speed: the cell span scanned is
 /// `ceil(2 * radius / cell)` per axis. Setting `cell` near the query radius
 /// keeps that to a handful of cells.
+#[derive(Clone)]
 pub struct VoxelHash {
     cell: f32,
     buckets: HashMap<Cell, Vec<u32>>,
@@ -187,8 +188,9 @@ mod tests {
     fn returns_none_when_nothing_in_range() {
         let points = vec![Vector3::new(10.0, 10.0, 10.0)];
         let hash = VoxelHash::build(0.5, &points);
-        assert!(hash
-            .nearest_within(&points, &Vector3::zeros(), 1.0)
-            .is_none());
+        assert!(
+            hash.nearest_within(&points, &Vector3::zeros(), 1.0)
+                .is_none()
+        );
     }
 }

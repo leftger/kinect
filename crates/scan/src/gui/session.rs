@@ -139,6 +139,9 @@ pub(crate) struct SessionView {
     pub loop_attempts: usize,
     pub loop_points: usize,
     pub loop_rehydrations: usize,
+    pub online_updates: usize,
+    pub last_online_correction: f32,
+    pub loop_pending: usize,
     pub position: [f32; 3],
     pub blocks: usize,
     pub allocated_bytes: usize,
@@ -173,6 +176,9 @@ impl Default for SessionView {
             loop_attempts: 0,
             loop_points: 0,
             loop_rehydrations: 0,
+            online_updates: 0,
+            last_online_correction: 0.0,
+            loop_pending: 0,
             position: [0.0; 3],
             blocks: 0,
             allocated_bytes: 0,
@@ -217,6 +223,9 @@ impl SessionView {
             loop_attempts: self.loop_attempts,
             loop_points: self.loop_points,
             loop_rehydrations: self.loop_rehydrations,
+            online_updates: self.online_updates,
+            last_online_correction: self.last_online_correction,
+            loop_pending: self.loop_pending,
             position: self.position,
             blocks: self.blocks,
             allocated_bytes: self.allocated_bytes,
@@ -260,6 +269,9 @@ pub(crate) struct SessionSnapshot {
     pub loop_attempts: usize,
     pub loop_points: usize,
     pub loop_rehydrations: usize,
+    pub online_updates: usize,
+    pub last_online_correction: f32,
+    pub loop_pending: usize,
     pub position: [f32; 3],
     pub blocks: usize,
     pub allocated_bytes: usize,
@@ -662,6 +674,9 @@ impl SessionState {
         view.loop_attempts = self.scanner.loop_attempts();
         view.loop_points = self.scanner.loop_keyframe_points();
         view.loop_rehydrations = self.scanner.loop_rehydrations();
+        view.online_updates = self.scanner.online_loop_updates();
+        view.last_online_correction = self.scanner.last_online_correction();
+        view.loop_pending = self.scanner.loop_pending();
         view.blocks = report.blocks;
         view.allocated_bytes = report.allocated_bytes;
 

@@ -3,11 +3,11 @@
 use geom::coloring::{ColorView, ColoringParams, ColoringReport, colorize};
 use geom::icp::IcpCloud;
 use geom::mesh::Mesh;
-use geom::pose_graph::{PoseGraph, PoseGraphParams};
+use geom::pose_graph::{Edge, PoseGraph, PoseGraphParams};
 use geom::texturing::{TexturedMesh, TexturingParams, TexturingReport, texture};
 use geom::tsdf::{IntegrationStats, TsdfParams, TsdfVolume};
 use geom::{DepthImage, Intrinsics, transform_point};
-use nalgebra::{Isometry3, Vector3};
+use nalgebra::{Isometry3, Translation3, Vector3};
 use std::time::{Duration, Instant};
 
 use crate::loop_closure::{LoopClosureConfig, LoopFinder, VisualDescriptor};
@@ -40,6 +40,18 @@ pub struct ScannerConfig {
     /// instead of smearing it onto the old model; the boundary is a weak pose
     /// edge, so loop closure can move the whole submap later.
     pub submaps: bool,
+    /// Apply a verified loop as soon as it arrives, rather than waiting for
+    /// `close_loops` after the last frame. The keyframe graph is optimised and
+    /// the corrected poses are used for every subsequent frame; the fused
+    /// submaps are moved rigidly, and the final rebuild is still available.
+    /// Requires `loop_closure`.
+    pub online_loops: bool,
+    /// On the final correction, move the cached submap surfaces with the
+    /// corrected poses instead of throwing the volume away and re-integrating
+    /// every frame. Much cheaper and the LIO-SAM keyframe-map trade-off, but a
+    /// rigid submap move cannot fix drift *inside* a submap. The full rebuild
+    /// remains the accuracy default.
+    pub incremental_rebuild: bool,
 }
 
 impl Default for ScannerConfig {
@@ -54,6 +66,8 @@ impl Default for ScannerConfig {
             loop_closure: None,
             coloring: ColoringParams::default(),
             submaps: true,
+            online_loops: false,
+            incremental_rebuild: false,
         }
     }
 }
@@ -123,8 +137,13 @@ pub struct ClosureReport {
     /// Set when the correction exceeded `MAX_CORRECTION_METRES` and was thrown
     /// away. The trajectory and the model are then exactly as odometry left them.
     pub refused: bool,
-    /// Whether the volume was actually rebuilt with corrected poses.
+    /// Whether the model was actually corrected. A full rebuild, an incremental
+    /// submap move, and an online update all count; the trajectory and the
+    /// geometry both agree with the corrected poses afterwards.
     pub rebuilt: bool,
+    /// True when this report came from an in-scan correction rather than the
+    /// end-of-scan pass.
+    pub online: bool,
 }
 
 /// A pre-training sanity check of the reconstruction.
@@ -197,9 +216,11 @@ pub struct Scanner {
     /// Time spent finalising a finished submap's surface at a boundary.
     total_submap: Duration,
 
-    /// Pose-graph nodes, one per frame in arrival order. Consecutive poses
-    /// already encode the odometry measurement: the tracked pose *is* the
-    /// accumulation, so the relative motion is just `T[i]^-1 * T[i+1]`.
+    /// Pose of every frame in arrival order. The keyframe graph's nodes are a
+    /// subset of these; the in-between frames are corrected by interpolating
+    /// between the keyframe corrections. Consecutive poses already encode the
+    /// odometry measurement: the tracked pose *is* the accumulation, so the
+    /// relative motion is just `T[i]^-1 * T[i+1]`.
     poses: Vec<Isometry3<f32>>,
     /// Frames retained so the model can be rebuilt; parallel to `poses`.
     kept: Vec<KeptFrame>,
@@ -214,9 +235,11 @@ pub struct Scanner {
     dimensions: Option<(usize, usize)>,
     closure: Option<ClosureReport>,
 
-    /// Surface from submaps that were finished at a lost track, already
-    /// transformed into the scan's world frame.
-    finished_geometry: Mesh,
+    /// Surfaces from submaps that were finished at a lost track, kept in their
+    /// submap frame with the transform that places them in the world. A
+    /// correction updates the transform instead of re-integrating the volume,
+    /// which is the cheap, LIO-SAM-style way to move already-fused geometry.
+    finished_submaps: Vec<FinishedSubmap>,
     /// World-from-current-submap. Identity for the first submap.
     world_from_submap: Isometry3<f32>,
     /// Parallel to `poses`: true when the edge from the previous pose is a
@@ -224,6 +247,130 @@ pub struct Scanner {
     pose_boundaries: Vec<bool>,
     /// Arrival index of each submap's first frame.
     submap_starts: Vec<usize>,
+    /// True once an incremental correction has placed every piece in one world
+    /// frame, so the scan reports one model even though the pieces are stored
+    /// separately.
+    model_merged: bool,
+    /// In-scan corrections applied.
+    online_updates: usize,
+    /// Largest pose move from the most recent online correction, in metres.
+    last_online_correction: f32,
+}
+
+/// One finished submap surface and where it sits in the scan's world.
+struct FinishedSubmap {
+    /// Untransformed surface in the submap's own frame.
+    mesh: Mesh,
+    /// World-from-submap for this surface.
+    transform: Isometry3<f32>,
+    /// Arrival index of the submap's first frame, used to pick its correction.
+    start: usize,
+}
+
+/// What optimising the keyframe graph produced, projected onto every frame.
+struct GraphOutcome {
+    poses: Vec<Isometry3<f32>>,
+    nodes: usize,
+    odometry_edges: usize,
+    max_correction: f32,
+    max_rotation: f32,
+    cost_before: f64,
+    cost_after: f64,
+    iterations: usize,
+    converged: bool,
+}
+
+/// How an accepted correction is put into the model.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CorrectionMode {
+    /// In-scan: move the cached surfaces and carry on. No re-integration.
+    Online,
+    /// End of scan, accuracy path: discard the volume and re-fuse every frame.
+    FullRebuild,
+    /// End of scan, speed path: move the cached submap surfaces rigidly.
+    Incremental,
+}
+
+/// Interpolate two left-multiplied corrections. Translation and rotation are
+/// interpolated separately, which is exact for the small corrections a verified
+/// loop produces and keeps the in-between frames on a smooth path.
+fn interpolate_correction(a: Isometry3<f32>, b: Isometry3<f32>, t: f32) -> Isometry3<f32> {
+    let translation = a.translation.vector.lerp(&b.translation.vector, t);
+    let rotation = a.rotation.slerp(&b.rotation, t);
+    Isometry3::from_parts(Translation3::from(translation), rotation)
+}
+
+/// Spread keyframe corrections over the frames between them.
+///
+/// The graph only has keyframe nodes; every other frame still needs a pose for
+/// fusion, colour, and export. Inside one submap a frame between keyframes `a`
+/// and `b` gets the interpolation of their left corrections, clamped to the
+/// submap's own keyframes. Corrections are never blended across a submap
+/// boundary: the two sides are separate rigid pieces, and interpolation would
+/// shear a submap that the correction is supposed to move as a whole.
+fn project_keyframe_corrections(
+    poses: &[Isometry3<f32>],
+    boundaries: &[bool],
+    keyframes: &[(usize, Isometry3<f32>)],
+    optimised: &[Isometry3<f32>],
+) -> Vec<Isometry3<f32>> {
+    let deltas: Vec<Isometry3<f32>> = keyframes
+        .iter()
+        .zip(optimised)
+        .map(|((_, old), new)| new * old.inverse())
+        .collect();
+
+    // The submap that contains each frame.
+    let mut starts = Vec::with_capacity(poses.len());
+    let mut segment_start = 0;
+    for frame in 0..poses.len() {
+        if boundaries.get(frame).copied().unwrap_or(false) {
+            segment_start = frame;
+        }
+        starts.push(segment_start);
+    }
+
+    let mut ends = vec![poses.len(); poses.len()];
+    let mut next_boundary = poses.len();
+    for frame in (0..poses.len()).rev() {
+        // `ends[frame]` is the next boundary strictly after this frame, so a
+        // boundary frame starts a non-empty segment rather than ending one.
+        ends[frame] = next_boundary;
+        if boundaries.get(frame).copied().unwrap_or(false) {
+            next_boundary = frame;
+        }
+    }
+
+    poses
+        .iter()
+        .enumerate()
+        .map(|(frame, pose)| {
+            let start = starts[frame];
+            let end = ends[frame];
+
+            let left = keyframes.partition_point(|(index, _)| *index < start);
+            let right = keyframes.partition_point(|(index, _)| *index < end);
+
+            let delta = if left == right {
+                // A submap shorter than the keyframe policy has no node of its
+                // own; use the nearest keyframe rather than inventing one.
+                deltas[left.min(keyframes.len() - 1)]
+            } else if frame <= keyframes[left].0 {
+                deltas[left]
+            } else if frame >= keyframes[right - 1].0 {
+                deltas[right - 1]
+            } else {
+                let after = keyframes.partition_point(|(index, _)| *index <= frame);
+                let b = after.min(right - 1);
+                let a = b.saturating_sub(1).max(left);
+                let (index_a, _) = keyframes[a];
+                let (index_b, _) = keyframes[b];
+                let t = (frame - index_a) as f32 / (index_b - index_a) as f32;
+                interpolate_correction(deltas[a], deltas[b], t)
+            };
+            delta * pose
+        })
+        .collect()
 }
 
 impl Scanner {
@@ -259,10 +406,13 @@ impl Scanner {
             color_supplied: 0,
             dimensions: None,
             closure: None,
-            finished_geometry: Mesh::default(),
+            finished_submaps: Vec::new(),
             world_from_submap: Isometry3::identity(),
             pose_boundaries: Vec::new(),
             submap_starts: Vec::new(),
+            model_merged: false,
+            online_updates: 0,
+            last_online_correction: 0.0,
         }
     }
 
@@ -277,20 +427,33 @@ impl Scanner {
     /// Finish the current submap and start a new one at `world_from_submap`.
     ///
     /// Extracting the finished surface now, rather than keeping every TSDF
-    /// volume alive, frees the voxel blocks at the boundary. The mesh is baked
-    /// into the world frame; a later loop-closure rebuild regenerates it from
-    /// the retained frames at the corrected poses.
+    /// volume alive, frees the voxel blocks at the boundary. The mesh stays in
+    /// the submap's own frame with its world transform beside it, so a later
+    /// correction can move it without re-integrating anything. A full rebuild
+    /// still regenerates the surface from the retained frames when accuracy
+    /// matters more than time.
     fn begin_submap(&mut self, world_from_submap: Isometry3<f32>) {
         let mesh = self.volume.extract_mesh();
-        append_transformed(&mut self.finished_geometry, mesh, self.world_from_submap);
+        let start = self.submap_starts.last().copied().unwrap_or(0);
+        self.finished_submaps.push(FinishedSubmap {
+            mesh,
+            transform: self.world_from_submap,
+            start,
+        });
         self.volume = self.fresh_volume();
         self.world_from_submap = world_from_submap;
         self.submap_starts.push(self.frames);
+        // A new rigid piece means the model is no longer one merged world, even
+        // if an earlier correction had collapsed the count to one.
+        self.model_merged = false;
     }
 
     /// The union of every submap's surface, in the world frame.
     fn geometry(&self) -> Mesh {
-        let mut mesh = self.finished_geometry.clone();
+        let mut mesh = Mesh::default();
+        for submap in &self.finished_submaps {
+            append_transformed(&mut mesh, submap.mesh.clone(), submap.transform);
+        }
         append_transformed(
             &mut mesh,
             self.volume.extract_mesh(),
@@ -405,6 +568,17 @@ impl Scanner {
         self.pose_boundaries.push(new_submap && !first);
         self.dimensions.get_or_insert((width, height));
 
+        // Retain the frame before loop verification. An online correction
+        // rebuilds the fused trajectory from this list, so it has to include
+        // the frame being added; the rehydration callback only ever asks for
+        // older keyframes, so seeing this one changes nothing there.
+        if self.loops.is_some() {
+            self.kept.push(KeptFrame {
+                depth: depth_metres.to_vec(),
+                fused: fuse,
+            });
+        }
+
         // Same rule as fusion: the first frame, a submap's first frame, or a
         // pose the tracker accepted. A rejected frame's colour would paint the
         // model from a pose that was never used to build it. It is still
@@ -446,6 +620,7 @@ impl Scanner {
         // voxel hashing and, when a candidate turns up, one ICP alignment. An
         // old candidate can be rebuilt from its retained depth before that
         // alignment, so decimation costs memory rather than loop quality.
+        let mut loop_activity = false;
         if let Some(finder) = self.loops.as_mut() {
             if fuse {
                 let loop_config = finder.config();
@@ -453,61 +628,67 @@ impl Scanner {
                 let intrinsics = self.intrinsics;
                 let depth_min = self.config.depth_min;
                 let depth_max = self.config.depth_max;
-                finder.consider_with_rehydration(
-                    self.frames,
-                    pose,
-                    &self.points,
-                    appearance.as_ref(),
-                    |index| {
-                        let frame = kept.get(index)?;
-                        if frame.depth.len() != width * height {
-                            return None;
-                        }
-                        let image = DepthImage::new(width, height, &frame.depth);
-                        let mut points = Vec::new();
-                        for y in 0..height {
-                            for x in 0..width {
-                                let depth = image.at(x, y);
-                                if !depth.is_finite() || depth <= 0.0 {
-                                    continue;
-                                }
-                                if depth < depth_min || depth > depth_max {
-                                    continue;
-                                }
-                                points.push(intrinsics.back_project(
-                                    x as f32 + 0.5,
-                                    y as f32 + 0.5,
-                                    depth,
-                                ));
+                loop_activity |= finder
+                    .consider_with_rehydration(
+                        self.frames,
+                        pose,
+                        &self.points,
+                        appearance.as_ref(),
+                        |index| {
+                            let frame = kept.get(index)?;
+                            if frame.depth.len() != width * height {
+                                return None;
                             }
-                        }
-                        if points.is_empty() {
-                            return None;
-                        }
-                        Some(IcpCloud::build(
-                            &points,
-                            loop_config.voxel,
-                            loop_config.normal_radius,
-                            loop_config.max_distance,
-                            &Vector3::zeros(),
-                        ))
-                    },
-                );
+                            let image = DepthImage::new(width, height, &frame.depth);
+                            let mut points = Vec::new();
+                            for y in 0..height {
+                                for x in 0..width {
+                                    let depth = image.at(x, y);
+                                    if !depth.is_finite() || depth <= 0.0 {
+                                        continue;
+                                    }
+                                    if depth < depth_min || depth > depth_max {
+                                        continue;
+                                    }
+                                    points.push(intrinsics.back_project(
+                                        x as f32 + 0.5,
+                                        y as f32 + 0.5,
+                                        depth,
+                                    ));
+                                }
+                            }
+                            if points.is_empty() {
+                                return None;
+                            }
+                            Some(IcpCloud::build(
+                                &points,
+                                loop_config.voxel,
+                                loop_config.normal_radius,
+                                loop_config.max_distance,
+                                &Vector3::zeros(),
+                            ))
+                        },
+                    )
+                    .is_some();
             }
+
+            // In background mode verification finishes a frame or two after
+            // the keyframe was offered. Drain whatever is ready so the final
+            // pass and online correction both see it.
+            loop_activity |= !finder.poll().is_empty();
         }
 
-        if self.loops.is_some() {
-            self.kept.push(KeptFrame {
-                depth: depth_metres.to_vec(),
-                fused: fuse,
-            });
+        if loop_activity && self.config.online_loops {
+            self.optimize_online();
         }
 
         let submap = self.submap_starts.len().saturating_sub(1);
         self.frames += 1;
 
-        // The caller sees world poses, not the odometry's local ones.
-        track.pose = pose;
+        // The caller sees world poses, not the odometry's local ones. Read the
+        // committed pose back after the online correction, so a frame that was
+        // just moved reports where it actually sits.
+        track.pose = self.poses.last().copied().unwrap_or(pose);
         track.candidate = candidate;
 
         FrameReport {
@@ -522,35 +703,32 @@ impl Scanner {
         }
     }
 
-    /// Optimise the trajectory against the revisits that were verified, and
-    /// rebuild the model if the correction is worth having.
+    /// Optimise every verified loop and rebuild or move the model to the
+    /// corrected poses.
     ///
-    /// Call once, after the last frame. A no-op when loop closure is disabled, or
-    /// when no revisit survived verification.
+    /// Call once, after the last frame. When online loops are enabled some
+    /// corrections will already have been applied; this pass is still the final
+    /// global one, and it waits for any background verification still in flight.
     pub fn close_loops(&mut self) -> ClosureReport {
-        let mut loop_edges = self
+        if let Some(finder) = self.loops.as_mut() {
+            finder.flush();
+        }
+
+        let loop_edges = self
             .loops
             .as_ref()
             .map(|finder| finder.edges_ranked())
             .unwrap_or_default();
         let total_loops = loop_edges.len();
-
-        let nodes = self.poses.len();
-        // A submap boundary is a guess, not a measurement; it must not pin the
-        // new submap to the old one's frame.
-        let odometry_edges = (0..nodes.saturating_sub(1))
-            .filter(|index| {
-                !self
-                    .pose_boundaries
-                    .get(index + 1)
-                    .copied()
-                    .unwrap_or(false)
-            })
-            .count();
+        let nodes = self
+            .loops
+            .as_ref()
+            .map(|finder| finder.keyframes().len())
+            .unwrap_or(0);
 
         let nothing = ClosureReport {
             nodes,
-            odometry_edges,
+            odometry_edges: 0,
             loop_edges: total_loops,
             dropped_loops: 0,
             cost_before: 0.0,
@@ -561,6 +739,7 @@ impl Scanner {
             max_rotation: 0.0,
             refused: false,
             rebuilt: false,
+            online: false,
         };
 
         // With no revisit there is nothing to redistribute, so the odometry
@@ -570,95 +749,251 @@ impl Scanner {
             return nothing;
         }
 
-        // Optimise, and if the result wants to move a pose further than the
-        // odometry could plausibly be wrong, discard the weakest loop and try
-        // again. One bad edge should not throw away every good correction.
-        let (graph, optimised, max_correction, max_rotation, within) = loop {
-            let mut graph = PoseGraph::new(self.poses[0]);
-            for pose in &self.poses[1..] {
-                graph.add_node(*pose);
-            }
-
-            // The odometry edges are free: the tracked pose is the accumulation,
-            // so the measurement between neighbours is already encoded in the
-            // poses. A submap boundary is the exception: its relative pose is a
-            // guess, so leaving it out lets a cross-submap loop edge move the
-            // whole submap.
-            for index in 0..nodes - 1 {
-                if self
-                    .pose_boundaries
-                    .get(index + 1)
-                    .copied()
-                    .unwrap_or(false)
-                {
-                    continue;
-                }
-                let measurement = self.poses[index].inverse() * self.poses[index + 1];
-                graph.add_edge(index, index + 1, measurement, 1.0);
-            }
-            for edge in &loop_edges {
-                graph.add_edge(edge.from, edge.to, edge.measurement, edge.weight);
-            }
-
-            let optimised = graph.optimize(&PoseGraphParams::default());
-
-            let mut max_correction = 0.0f32;
-            let mut max_rotation = 0.0f32;
-            for (before, after) in self.poses.iter().zip(graph.nodes()) {
-                let delta = before.inverse() * after;
-                max_correction = max_correction.max(delta.translation.vector.norm());
-                max_rotation = max_rotation.max(delta.rotation.angle());
-            }
-
-            let within =
-                max_correction <= MAX_CORRECTION_METRES && max_rotation <= MAX_CORRECTION_RADIANS;
-
-            if within || loop_edges.len() <= 1 {
-                break (graph, optimised, max_correction, max_rotation, within);
-            }
-
-            // `edges_ranked` is best-first, so the weakest constraint is last.
-            loop_edges.pop();
-        };
-
-        let kept_loops = if within { loop_edges.len() } else { 0 };
-        let mut closure = ClosureReport {
-            nodes,
-            odometry_edges,
-            loop_edges: kept_loops,
-            dropped_loops: total_loops - kept_loops,
-            cost_before: optimised.cost_before,
-            cost_after: optimised.cost_after,
-            iterations: optimised.iterations,
-            converged: optimised.converged,
-            max_correction,
-            max_rotation,
-            refused: !within,
-            rebuilt: false,
+        let Some((outcome, kept, within)) = self.optimise_keyframe_graph(loop_edges) else {
+            self.closure = Some(nothing);
+            return nothing;
         };
 
         // Simplicity beats quiet corruption. If even the strongest loop wants
         // to fold the map, believe the odometry and leave the model alone.
         if !within {
+            let closure = self.report_from_outcome(&outcome, 0, total_loops, true, false, false);
             self.closure = Some(closure);
             return closure;
         }
 
-        self.poses = graph.nodes().to_vec();
-        self.rebuild();
-        // The views were stored at the odometry poses. The volume was just
-        // rebuilt at the corrected ones, so the colour has to follow.
-        self.update_color_view_poses();
-        closure.rebuilt = true;
-
+        let mode = if self.config.incremental_rebuild {
+            CorrectionMode::Incremental
+        } else {
+            CorrectionMode::FullRebuild
+        };
+        let closure = self.apply_corrections(&outcome, mode, kept, total_loops, false);
         self.closure = Some(closure);
         closure
+    }
+
+    /// Apply a verified loop during the scan.
+    ///
+    /// Returns `None` when there is nothing to do, or when the correction was
+    /// refused. A refusal leaves the trajectory exactly as odometry had it; the
+    /// final pass can still retry once more loops have arrived.
+    fn optimize_online(&mut self) -> Option<ClosureReport> {
+        let loop_edges = self.loops.as_ref()?.edges_ranked();
+        let total_loops = loop_edges.len();
+        if total_loops == 0 {
+            return None;
+        }
+
+        let (outcome, kept, within) = self.optimise_keyframe_graph(loop_edges)?;
+        if !within {
+            let closure = self.report_from_outcome(&outcome, 0, total_loops, true, false, true);
+            self.closure = Some(closure);
+            return Some(closure);
+        }
+
+        self.online_updates += 1;
+        self.last_online_correction = outcome.max_correction;
+        let closure =
+            self.apply_corrections(&outcome, CorrectionMode::Online, kept, total_loops, true);
+        self.closure = Some(closure);
+        Some(closure)
+    }
+
+    /// Build and optimise the keyframe graph, dropping the weakest loop while
+    /// the requested correction stays implausible.
+    ///
+    /// Returns the projected correction, how many loop edges were kept, and
+    /// whether the result is within the plausibility bounds. `None` when there
+    /// is no keyframe graph to optimise.
+    fn optimise_keyframe_graph(
+        &self,
+        loop_edges: Vec<Edge>,
+    ) -> Option<(GraphOutcome, usize, bool)> {
+        let finder = self.loops.as_ref()?;
+        let keyframes: Vec<(usize, Isometry3<f32>)> = finder
+            .keyframes()
+            .iter()
+            .map(|keyframe| (keyframe.index, keyframe.pose))
+            .collect();
+        if keyframes.len() < 2 {
+            return None;
+        }
+
+        let mut loop_edges = loop_edges;
+        loop {
+            if loop_edges.is_empty() {
+                return None;
+            }
+
+            let mut graph = PoseGraph::new(keyframes[0].1);
+            for (_, pose) in &keyframes[1..] {
+                graph.add_node(*pose);
+            }
+
+            // Only keyframes are nodes. The relative pose between consecutive
+            // keyframes is read from the current poses; a submap boundary is a
+            // guess, so its edge is omitted and a loop edge is free to move the
+            // whole submap.
+            let mut odometry_edges = 0;
+            for window in 0..keyframes.len() - 1 {
+                let from = keyframes[window].0;
+                let to = keyframes[window + 1].0;
+                let boundary = ((from + 1)..=to)
+                    .any(|frame| self.pose_boundaries.get(frame).copied().unwrap_or(false));
+                if boundary {
+                    continue;
+                }
+                let measurement = keyframes[window].1.inverse() * keyframes[window + 1].1;
+                graph.add_edge(window, window + 1, measurement, 1.0);
+                odometry_edges += 1;
+            }
+
+            let node_of = |frame: usize| {
+                keyframes
+                    .binary_search_by_key(&frame, |(index, _)| *index)
+                    .ok()
+            };
+            let mut added = 0;
+            for edge in &loop_edges {
+                let (Some(from), Some(to)) = (node_of(edge.from), node_of(edge.to)) else {
+                    continue;
+                };
+                if from == to {
+                    continue;
+                }
+                graph.add_edge(from, to, edge.measurement, edge.weight);
+                added += 1;
+            }
+            if added == 0 {
+                return None;
+            }
+
+            let optimised = graph.optimize(&PoseGraphParams::default());
+            let keyframe_poses = graph.nodes().to_vec();
+            let poses = project_keyframe_corrections(
+                &self.poses,
+                &self.pose_boundaries,
+                &keyframes,
+                &keyframe_poses,
+            );
+
+            let mut max_correction = 0.0f32;
+            let mut max_rotation = 0.0f32;
+            for (before, after) in self.poses.iter().zip(&poses) {
+                let delta = before.inverse() * after;
+                max_correction = max_correction.max(delta.translation.vector.norm());
+                max_rotation = max_rotation.max(delta.rotation.angle());
+            }
+            let within =
+                max_correction <= MAX_CORRECTION_METRES && max_rotation <= MAX_CORRECTION_RADIANS;
+
+            let outcome = GraphOutcome {
+                poses,
+                nodes: keyframes.len(),
+                odometry_edges,
+                max_correction,
+                max_rotation,
+                cost_before: optimised.cost_before,
+                cost_after: optimised.cost_after,
+                iterations: optimised.iterations,
+                converged: optimised.converged,
+            };
+
+            let kept = loop_edges.len();
+            if within || kept <= 1 {
+                return Some((outcome, kept, within));
+            }
+
+            // `edges_ranked` is best-first, so the weakest constraint is last.
+            loop_edges.pop();
+        }
+    }
+
+    fn report_from_outcome(
+        &self,
+        outcome: &GraphOutcome,
+        kept_loops: usize,
+        total_loops: usize,
+        refused: bool,
+        rebuilt: bool,
+        online: bool,
+    ) -> ClosureReport {
+        ClosureReport {
+            nodes: outcome.nodes,
+            odometry_edges: outcome.odometry_edges,
+            loop_edges: kept_loops,
+            dropped_loops: total_loops.saturating_sub(kept_loops),
+            cost_before: outcome.cost_before,
+            cost_after: outcome.cost_after,
+            iterations: outcome.iterations,
+            converged: outcome.converged,
+            max_correction: outcome.max_correction,
+            max_rotation: outcome.max_rotation,
+            refused,
+            rebuilt,
+            online,
+        }
+    }
+
+    fn apply_corrections(
+        &mut self,
+        outcome: &GraphOutcome,
+        mode: CorrectionMode,
+        kept_loops: usize,
+        total_loops: usize,
+        online: bool,
+    ) -> ClosureReport {
+        let old_poses = std::mem::replace(&mut self.poses, outcome.poses.clone());
+
+        // Correction at each frame, used to move a finished submap as one rigid
+        // piece. That is the keyframe-cloud trade-off: cheap, and correct for a
+        // rigid submap, but it cannot fix drift within one.
+        let corrections: Vec<Isometry3<f32>> = old_poses
+            .iter()
+            .zip(&outcome.poses)
+            .map(|(old, new)| new * old.inverse())
+            .collect();
+        for submap in &mut self.finished_submaps {
+            if let Some(correction) = corrections.get(submap.start) {
+                submap.transform = *correction * submap.transform;
+            }
+        }
+
+        // The odometry's local frame did not move; the world transform did.
+        // Anchor the current submap on the last corrected world pose so the
+        // next frame continues from the corrected trajectory.
+        if let Some(last) = outcome.poses.last() {
+            self.world_from_submap = *last * self.odometry.pose().inverse();
+        }
+
+        self.trajectory.clear();
+        for (index, kept) in self.kept.iter().enumerate() {
+            if kept.fused {
+                if let Some(pose) = outcome.poses.get(index) {
+                    self.trajectory.push(pose.translation.vector);
+                }
+            }
+        }
+
+        self.update_color_view_poses();
+        if let Some(finder) = self.loops.as_mut() {
+            finder.update_poses(&self.poses);
+        }
+
+        match mode {
+            CorrectionMode::Online => {}
+            CorrectionMode::Incremental => self.model_merged = true,
+            CorrectionMode::FullRebuild => self.rebuild(),
+        }
+
+        self.report_from_outcome(outcome, kept_loops, total_loops, false, true, online)
     }
 
     /// Re-integrate every kept frame with the corrected poses.
     ///
     /// A fresh volume, because geometry already fused at the old poses cannot be
-    /// moved -- only discarded and laid down again.
+    /// moved -- only discarded and laid down again. This is the accuracy path;
+    /// `CorrectionMode::Incremental` is the cheap one.
     fn rebuild(&mut self) {
         let Some((width, height)) = self.dimensions else {
             return;
@@ -668,7 +1003,7 @@ impl Scanner {
         self.volume = self.fresh_volume();
         // The rebuild lays every fused frame into one global volume at the
         // corrected poses, so the cached submap surfaces are now redundant.
-        self.finished_geometry = Mesh::default();
+        self.finished_submaps.clear();
         self.world_from_submap = Isometry3::identity();
         self.submap_starts.clear();
         if self.frames > 0 {
@@ -690,6 +1025,7 @@ impl Scanner {
         }
 
         self.fused = fused;
+        self.model_merged = true;
     }
 
     /// Point each kept colour view at the corrected pose of the frame it came from.
@@ -934,7 +1270,10 @@ impl Scanner {
 
     /// Memory held by the cached finished-submap surfaces, in bytes.
     pub fn submap_surface_bytes(&self) -> usize {
-        mesh_bytes(&self.finished_geometry)
+        self.finished_submaps
+            .iter()
+            .map(|submap| mesh_bytes(&submap.mesh))
+            .sum()
     }
 
     /// Cumulative time spent tracking frames.
@@ -953,8 +1292,33 @@ impl Scanner {
     }
 
     /// How many submaps the frames have been split across.
+    ///
+    /// An incremental or full correction places every piece in one world frame,
+    /// so the scan reports one model even when the pieces are stored separately.
     pub fn submaps(&self) -> usize {
-        self.submap_starts.len()
+        if self.model_merged {
+            1
+        } else {
+            self.submap_starts.len()
+        }
+    }
+
+    /// How many loop corrections were applied during the scan.
+    pub fn online_loop_updates(&self) -> usize {
+        self.online_updates
+    }
+
+    /// Largest pose move from the most recent online correction, in metres.
+    pub fn last_online_correction(&self) -> f32 {
+        self.last_online_correction
+    }
+
+    /// Loop verifications still in flight on the background worker.
+    pub fn loop_pending(&self) -> usize {
+        self.loops
+            .as_ref()
+            .map(|finder| finder.pending())
+            .unwrap_or(0)
     }
 
     /// Zero-based arrival index of each submap's first frame.
@@ -1746,5 +2110,215 @@ mod tests {
                 .any(|(before, after)| (after.x + before.x).abs() < 1e-4 && before.x.abs() > 1e-3),
             "export left the atlas in the unflipped frame"
         );
+    }
+
+    fn scanner_with_loop_flags(online: bool, incremental: bool, background: bool) -> Scanner {
+        Scanner::new(
+            intrinsics(),
+            ScannerConfig {
+                tsdf: TsdfParams {
+                    voxel_size: 0.04,
+                    truncation: 0.16,
+                    ..TsdfParams::default()
+                },
+                loop_closure: Some(LoopClosureConfig {
+                    // The synthetic scans are short; the default gap of 40
+                    // frames would reject every candidate.
+                    min_index_gap: 2,
+                    background,
+                    ..LoopClosureConfig::default()
+                }),
+                online_loops: online,
+                incremental_rebuild: incremental,
+                ..ScannerConfig::default()
+            },
+        )
+    }
+
+    /// Front, side, and a return to the front 20 cm to the right. The return
+    /// starts a submap at the failed alignment's guess, so only a loop edge can
+    /// put it back where it belongs.
+    fn add_revisit_sequence(scanner: &mut Scanner) {
+        let front = room_frame(WIDTH, HEIGHT, &intrinsics());
+        let side = room_frame_from(
+            WIDTH,
+            HEIGHT,
+            &intrinsics(),
+            &Vector3::zeros(),
+            std::f32::consts::FRAC_PI_2,
+        );
+        let returned = room_frame_from(
+            WIDTH,
+            HEIGHT,
+            &intrinsics(),
+            &Vector3::new(0.2, 0.0, 0.0),
+            0.0,
+        );
+
+        for _ in 0..2 {
+            scanner.add_frame(&front, WIDTH, HEIGHT);
+        }
+        for _ in 0..2 {
+            scanner.add_frame(&side, WIDTH, HEIGHT);
+        }
+        for _ in 0..3 {
+            scanner.add_frame(&returned, WIDTH, HEIGHT);
+        }
+    }
+
+    #[test]
+    fn the_keyframe_graph_uses_keyframes_not_every_frame() {
+        let mut scanner = scanner_with_loops();
+        add_revisit_sequence(&mut scanner);
+
+        let report = scanner.close_loops();
+        assert!(report.rebuilt);
+        assert!(
+            report.nodes >= 2,
+            "a graph needs at least two keyframes, got {}",
+            report.nodes
+        );
+        assert!(
+            report.nodes < scanner.frames(),
+            "the graph used {} nodes for {} frames",
+            report.nodes,
+            scanner.frames()
+        );
+    }
+
+    #[test]
+    fn online_loops_apply_a_revisit_during_the_scan() {
+        let mut scanner = scanner_with_loop_flags(true, false, false);
+        add_revisit_sequence(&mut scanner);
+
+        assert!(scanner.loops() > 0, "no revisit was verified");
+        assert!(
+            scanner.online_loop_updates() > 0,
+            "the verified revisit was not applied during the scan"
+        );
+        assert!(
+            scanner.last_online_correction() > 0.05,
+            "the online correction was only {:.3} m",
+            scanner.last_online_correction()
+        );
+
+        let closure = scanner.closure().copied().expect("an online report");
+        assert!(closure.online, "the report lost its in-scan origin");
+        assert!(
+            closure.rebuilt,
+            "the online correction did not move the model"
+        );
+
+        let position = scanner.pose().translation.vector;
+        assert!(
+            (position - Vector3::new(0.2, 0.0, 0.0)).norm() < 0.1,
+            "the tracked return pose is {position:?} before the final pass"
+        );
+
+        let report = scanner.close_loops();
+        assert!(report.rebuilt);
+        assert!(!report.online, "the final pass reported itself as online");
+        assert_eq!(scanner.submaps(), 1, "the final rebuild did not merge");
+        assert_eq!(scanner.fused(), 7, "the final rebuild dropped frames");
+        assert!(!scanner.mesh().is_empty());
+    }
+
+    #[test]
+    fn incremental_rebuild_moves_cached_submaps_without_refusing() {
+        let mut scanner = scanner_with_loop_flags(false, true, false);
+        add_revisit_sequence(&mut scanner);
+
+        assert!(
+            scanner.submap_surface_bytes() > 0,
+            "there are no cached submap surfaces to move"
+        );
+
+        let report = scanner.close_loops();
+        assert!(report.rebuilt);
+        assert!(!report.refused);
+        assert_eq!(
+            scanner.submaps(),
+            1,
+            "the pieces are not in one world frame"
+        );
+        assert_eq!(scanner.fused(), 7);
+        assert!(
+            scanner.submap_surface_bytes() > 0,
+            "incremental correction discarded the cached pieces and re-fused"
+        );
+        assert!(!scanner.mesh().is_empty());
+    }
+
+    #[test]
+    fn background_loops_are_flushed_by_close_loops() {
+        let mut scanner = scanner_with_loop_flags(false, false, true);
+        let frame = room_frame(WIDTH, HEIGHT, &intrinsics());
+
+        for _ in 0..6 {
+            scanner.add_frame(&frame, WIDTH, HEIGHT);
+        }
+        assert!(
+            scanner.loop_pending() > 0 || scanner.loops() > 0,
+            "no verification was ever submitted"
+        );
+
+        let report = scanner.close_loops();
+        assert!(
+            report.loop_edges > 0,
+            "close_loops did not wait for the worker's loop"
+        );
+        assert!(report.rebuilt);
+        assert_eq!(scanner.loop_pending(), 0);
+    }
+
+    #[test]
+    fn corrections_are_interpolated_within_a_submap_and_not_across_one() {
+        let at = |x: f32| {
+            Isometry3::from_parts(
+                Translation3::new(x, 0.0, 0.0),
+                nalgebra::UnitQuaternion::identity(),
+            )
+        };
+        let poses = vec![at(0.0), at(0.1), at(0.2), at(0.3), at(0.4)];
+        let keyframes = vec![(0, at(0.0)), (2, at(0.2)), (4, at(0.4))];
+
+        // No boundary: the corrections blend across the keyframes. The
+        // corrections are +0.2 at frame 2 and +0.4 at frame 4, so frame 1
+        // moves by +0.1 on top of its own 0.1 m pose, and frame 3 by +0.3 on
+        // top of 0.3 m.
+        let corrected = project_keyframe_corrections(
+            &poses,
+            &[false; 5],
+            &keyframes,
+            &[at(0.0), at(0.4), at(0.8)],
+        );
+        assert!((corrected[1].translation.x - 0.2).abs() < 1e-5);
+        assert!((corrected[3].translation.x - 0.6).abs() < 1e-5);
+
+        // Boundaries at frames 2 and 4: frame 3 belongs to the second submap,
+        // whose only keyframe is frame 2 and did not move. It must not pick up
+        // half of the third submap's correction.
+        let corrected = project_keyframe_corrections(
+            &poses,
+            &[false, false, true, false, true],
+            &keyframes,
+            &[at(0.0), at(0.2), at(0.6)],
+        );
+        assert!(
+            (corrected[1].translation.x - 0.1).abs() < 1e-5,
+            "frame 1 moved inside the first submap: {}",
+            corrected[1].translation.x
+        );
+        assert!(
+            (corrected[2].translation.x - 0.2).abs() < 1e-5,
+            "the second submap's keyframe moved: {}",
+            corrected[2].translation.x
+        );
+        assert!(
+            (corrected[3].translation.x - 0.3).abs() < 1e-5,
+            "frame 3 was sheared across the boundary: {}",
+            corrected[3].translation.x
+        );
+        assert!((corrected[4].translation.x - 0.6).abs() < 1e-5);
     }
 }

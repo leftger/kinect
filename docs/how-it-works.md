@@ -32,6 +32,15 @@ Frame-to-model tracking is also implemented. It renders the fused surface and
 aligns against that instead of the previous frame. On the closed-loop capture it
 did worse than frame-to-frame tracking, so it is optional.
 
+When a frame is rejected, the spatial fallback does not align against one stale
+frame. `--relocalize` keeps a ring of the most recent accepted keyframes and
+merges the ones near the failed candidate into a local map, then runs the
+spatial ICP against that. This extends LIO-SAM's scan-to-map step to a depth
+camera: several nearby views cover the surface that a single narrow view misses,
+which matters most when the sensor turns in place. The ring is bounded
+(`--relocalize-keyframes`, default 6) and only built when the spatial retry is
+actually needed.
+
 ## Fusion
 
 Fusion uses a voxel-hashed TSDF, one hash entry per 8x8x8 block. Each block is
@@ -51,26 +60,48 @@ of some detail.
 
 ## Loop closure
 
-Loop closure detects revisits and rebuilds the model from corrected poses.
+Loop closure detects revisits and corrects the model. It is split into
+detection, verification, and correction, following LIO-SAM's keyframe
+factor-graph structure rather than a single align-and-rebuild pass.
 
-1. A new frame is considered a keyframe after 2 cm / 3 degrees of motion, or
-   every five frames.
+1. A new frame becomes a loop keyframe after 2 cm / 3 degrees of motion, or
+   every five frames. Those keyframes are the graph's nodes; ordinary frames are
+   corrected by interpolating between the keyframes on either side.
 2. Pose proximity proposes nearby keyframes. On colour scans, a compact
    appearance signature (8x8 grayscale plus RGB histogram) can also propose a
    candidate outside the pose radius.
-3. Spatial ICP verifies the candidate. A reverse alignment and round-trip gate
+3. The verification target is a window of `--loop-window` keyframes on each
+   side of the candidate (default 2), transformed into the candidate's frame and
+   merged. This is LIO-SAM's `loopFindNearKeyframes`: one depth view is narrow,
+   and the extra surface turns a marginal revisit into a verifiable one.
+4. Spatial ICP verifies the candidate. A reverse alignment and round-trip gate
    must also pass.
-4. Accepted edges are weighted by inlier coverage and residual.
-5. A pose graph optimises odometry edges plus loop edges.
-6. If the correction is implausible, the weakest loop is dropped and the graph
+5. Accepted edges are weighted by inlier coverage and residual.
+6. A keyframe pose graph optimises keyframe odometry plus loop edges. A submap
+   boundary has no odometry edge, so a loop edge can move the whole submap.
+7. If the correction is implausible, the weakest loop is dropped and the graph
    is retried.
-7. The model is rebuilt from the corrected poses.
+8. The correction is applied online, incrementally, or by a full rebuild.
+
+`--loop-worker` moves only the ICP verification to a worker thread. Keyframe
+selection stays on the capture thread, results are drained each frame, and
+`close_loops` flushes anything still in flight. That keeps a candidate from
+stalling a live scan without changing which loops are accepted.
+
+`--online-loops` applies a verified loop as soon as it arrives. Future frames
+use the corrected trajectory, and the cached submap surfaces are moved by a
+rigid transform. `--incremental-rebuild` makes the same trade at the end of the
+scan: it moves the cached surfaces instead of re-integrating every frame. Both
+are fast and coherent, but a rigid submap move cannot fix drift *inside* a
+submap. The default full rebuild re-fuses every kept frame at the corrected
+poses, which is the accuracy path.
 
 The loop index has bounded working memory. The most recent 80 keyframes keep
 full-resolution clouds; older signatures keep every second point. When a
 candidate points at an old keyframe, its cloud is rebuilt from retained depth for
 that verification and then dropped again. Telemetry reports loops, attempts,
-dropped loops, points held, and rehydrated clouds.
+dropped loops, points held, rehydrated clouds, online corrections, and pending
+worker jobs.
 
 Loop closure keeps every depth frame (about 850 KB each), so a 200-frame scan
 holds around 170 MB of depth. Colour views add about 1.66 MiB each.
@@ -86,7 +117,9 @@ fragments, using 220 MB instead of 464 MB. No revisit is verified on that
 recording, so the fragments stay at guessed origins.
 
 Finalising each submap extracts its surface, about a second at each boundary.
-`--no-submaps` restores the single model and the skipped frames.
+The surface stays in the submap's own frame with its world transform beside it,
+so a correction can move it without touching the voxels. `--no-submaps` restores
+the single model and the skipped frames.
 
 ## Colour
 

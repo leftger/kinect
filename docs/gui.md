@@ -49,8 +49,13 @@ the picker.
 ### Reconstruction and output
 
 Controls frames, voxel size, colour and its mode, colour-depth tolerance,
-filters, loop closure, frame-to-model, submaps, GPU decode, mirror, preview
-interval, playback rate, the output path, and the optional dataset directory.
+filters, loop closure and its online/worker/incremental variants, frame-to-model,
+submaps, GPU decode, mirror, preview interval, playback rate, the output path,
+and the optional dataset directory.
+
+The loop variants imply loop closure, as they do on the command line: ticking
+**Online loops**, **Loop worker**, or **Incremental** turns correction on rather
+than silently doing nothing.
 
 The output extension selects the mesh format exactly as it does on the command
 line. See [Command line](cli.md#output-format).
@@ -79,7 +84,8 @@ Shows:
 - position and TSDF size;
 - tracking, fusion, and submap-finalisation time;
 - preview rate and the worker log;
-- loops, loop ICP attempts, dropped loops, loop points, and rehydrated clouds;
+- loops, loop ICP attempts, dropped loops, loop points, rehydrated clouds, online
+  corrections, and pending worker jobs;
 - exported mesh and dataset summary after Export.
 
 ### Splats

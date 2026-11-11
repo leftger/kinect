@@ -126,6 +126,20 @@ struct Options {
     /// candidate pose. On by default; `--no-submaps` restores the old
     /// drop-only behaviour for comparison.
     submaps: bool,
+    /// Apply a verified loop as soon as it arrives, instead of waiting for the
+    /// end-of-scan pass. Implies `--loop-closure`.
+    online_loops: bool,
+    /// Run loop ICP verification on a worker thread. Implies `--loop-closure`.
+    loop_worker: bool,
+    /// How many keyframes on each side of a loop candidate to merge into the
+    /// ICP target.
+    loop_window: usize,
+    /// How many recent accepted keyframes the spatial re-localisation map
+    /// keeps. Implies `--relocalize`.
+    relocalize_keyframes: usize,
+    /// Correct the final model by moving the cached submap surfaces instead of
+    /// re-integrating every frame. Implies `--loop-closure`.
+    incremental_rebuild: bool,
     /// Export a Nerfstudio dataset for a Gaussian-splatting trainer: the colour
     /// views, their masks, `transforms.json`, and an initial point cloud.
     /// Needs `--color`, because the dataset is built from the colour views.
@@ -156,6 +170,11 @@ impl Default for Options {
             frame_to_model: false,
             relocalize: false,
             submaps: true,
+            online_loops: false,
+            loop_worker: false,
+            loop_window: LoopClosureConfig::default().loop_target_keyframes,
+            relocalize_keyframes: OdometryConfig::default().relocalize_keyframes,
+            incremental_rebuild: false,
             dataset: None,
         }
     }
@@ -268,6 +287,29 @@ fn parse_args(
             "--no-mirror" | "--unmirror" => options.unmirror = true,
             "--frame-to-model" => options.frame_to_model = true,
             "--relocalize" => options.relocalize = true,
+            "--relocalize-keyframes" => {
+                let count: usize = next_value(&mut args, "--relocalize-keyframes")?.parse()?;
+                if count == 0 {
+                    return Err("--relocalize-keyframes must be at least 1".into());
+                }
+                options.relocalize_keyframes = count;
+                options.relocalize = true;
+            }
+            "--loop-window" => {
+                options.loop_window = next_value(&mut args, "--loop-window")?.parse()?;
+            }
+            "--online-loops" => {
+                options.online_loops = true;
+                options.loop_closure = true;
+            }
+            "--loop-worker" => {
+                options.loop_worker = true;
+                options.loop_closure = true;
+            }
+            "--incremental-rebuild" => {
+                options.incremental_rebuild = true;
+                options.loop_closure = true;
+            }
             "--no-submaps" => options.submaps = false,
             "--dataset" => {
                 options.dataset = Some(PathBuf::from(next_value(&mut args, "--dataset")?))
@@ -455,6 +497,29 @@ fn usage_text() -> String {
          \x20               the previous view; strict inlier and residual gates\n\
          \x20               decide whether to trust it. Pays a cloud build on\n\
          \x20               rejected frames only, so a clean scan is unaffected.\n\
+         \x20 --relocalize-keyframes N\n\
+         \x20               Keep N recent accepted keyframes as a local map for\n\
+         \x20               that spatial retry (default 6). The target is the\n\
+         \x20               merged set within the map radius, not just the last\n\
+         \x20               frame, which gives a turning sensor more to match.\n\
+         \x20               Implies --relocalize.\n\
+         \x20 --loop-window N\n\
+         \x20               Merge N keyframes on each side of a loop candidate\n\
+         \x20               into the ICP target (default 2). Zero restores the\n\
+         \x20               single-keyframe target.\n\
+         \x20 --online-loops\n\
+         \x20               Apply a verified loop during the scan instead of\n\
+         \x20               waiting for the end. Future frames use the corrected\n\
+         \x20               trajectory; cached submaps move rigidly. Implies\n\
+         \x20               --loop-closure.\n\
+         \x20 --loop-worker\n\
+         \x20               Run loop ICP on a worker thread so a candidate does\n\
+         \x20               not stall capture. Implies --loop-closure.\n\
+         \x20 --incremental-rebuild\n\
+         \x20               Correct the final model by moving cached submap\n\
+         \x20               surfaces instead of re-integrating every frame.\n\
+         \x20               Faster, but cannot fix drift inside a submap.\n\
+         \x20               Implies --loop-closure.\n\
          \x20 --no-submaps  Do not start a new submap when a frame cannot be\n\
          \x20               placed in the current one. Submaps are on by default:\n\
          \x20               the boundary keeps the fragments separate instead of\n\
@@ -797,15 +862,22 @@ fn report_tracking_error(scanner: &Scanner, shots: &[synthetic::Shot]) {
 }
 
 fn scanner_config(options: &Options) -> ScannerConfig {
+    let mut loops = LoopClosureConfig::default();
+    loops.loop_target_keyframes = options.loop_window;
+    loops.background = options.loop_worker;
+
     ScannerConfig {
         tsdf: options.tsdf,
-        loop_closure: options.loop_closure.then(LoopClosureConfig::default),
+        loop_closure: options.loop_closure.then_some(loops),
         odometry: OdometryConfig {
             frame_to_model: options.frame_to_model,
             relocalize: options.relocalize,
+            relocalize_keyframes: options.relocalize_keyframes,
             ..OdometryConfig::default()
         },
         submaps: options.submaps,
+        online_loops: options.online_loops,
+        incremental_rebuild: options.incremental_rebuild,
         coloring: ColoringParams {
             mode: options.color_mode,
             depth_tolerance: options.color_depth_tolerance,
@@ -865,7 +937,7 @@ fn close_loops(scanner: &mut Scanner, options: &Options) {
 
     if report.loop_edges == 0 && report.dropped_loops == 0 {
         println!(
-            "loop closure: no revisits verified over {} frames, trajectory unchanged",
+            "loop closure: no revisits verified over {} keyframes, trajectory unchanged",
             report.nodes
         );
         return;
@@ -873,12 +945,12 @@ fn close_loops(scanner: &mut Scanner, options: &Options) {
 
     if report.loop_edges == 0 {
         println!(
-            "loop closure: all {} verified loops were discarded over {} frames",
+            "loop closure: all {} verified loops were discarded over {} keyframes",
             report.dropped_loops, report.nodes
         );
     } else {
         println!(
-            "loop closure: {} revisits over {} frames, cost {:.3} -> {:.3} in {} iterations",
+            "loop closure: {} revisits over {} keyframes, cost {:.3} -> {:.3} in {} iterations",
             report.loop_edges,
             report.nodes,
             report.cost_before,
@@ -1404,6 +1476,82 @@ mod tests {
             parse_args(words(&["replay", "--in", "capture.k2df", "--no-submaps"])).expect("parse");
         assert!(!options.submaps);
         assert!(!scanner_config(&options).submaps);
+    }
+
+    #[test]
+    fn lio_style_loop_flags_reach_the_scanner_config() {
+        let (_, options) = parse_args(words(&["replay", "--in", "capture.k2df"])).expect("parse");
+        assert!(!options.online_loops);
+        assert!(!options.loop_worker);
+        assert!(!options.incremental_rebuild);
+        assert_eq!(
+            options.loop_window,
+            LoopClosureConfig::default().loop_target_keyframes
+        );
+        assert_eq!(
+            options.relocalize_keyframes,
+            OdometryConfig::default().relocalize_keyframes
+        );
+
+        let (_, options) = parse_args(words(&[
+            "replay",
+            "--in",
+            "capture.k2df",
+            "--online-loops",
+            "--loop-worker",
+            "--incremental-rebuild",
+            "--loop-window",
+            "4",
+            "--relocalize-keyframes",
+            "8",
+        ]))
+        .expect("parse");
+
+        // The three loop behaviours imply loop closure rather than silently
+        // doing nothing when the base flag is missing.
+        assert!(options.loop_closure);
+        assert!(options.online_loops);
+        assert!(options.loop_worker);
+        assert!(options.incremental_rebuild);
+
+        let config = scanner_config(&options);
+        assert!(config.online_loops);
+        assert!(config.incremental_rebuild);
+        let loops = config.loop_closure.expect("loop config");
+        assert!(loops.background);
+        assert_eq!(loops.loop_target_keyframes, 4);
+        assert_eq!(config.odometry.relocalize_keyframes, 8);
+        assert!(config.odometry.relocalize, "the ring needs relocalisation");
+    }
+
+    #[test]
+    fn a_zero_relocalization_ring_is_rejected() {
+        let error = parse_args(words(&[
+            "replay",
+            "--in",
+            "capture.k2df",
+            "--relocalize-keyframes",
+            "0",
+        ]))
+        .expect_err("zero must fail");
+        assert!(error.to_string().contains("at least 1"), "{error}");
+    }
+
+    #[test]
+    fn usage_documents_the_lio_style_flags() {
+        let usage = usage_text();
+        for flag in [
+            "--online-loops",
+            "--loop-worker",
+            "--incremental-rebuild",
+            "--loop-window",
+            "--relocalize-keyframes",
+        ] {
+            assert!(
+                usage.contains(flag),
+                "{flag} is missing from the usage text"
+            );
+        }
     }
 
     #[test]

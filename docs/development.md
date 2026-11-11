@@ -41,14 +41,16 @@ cargo build --release -p scan --features wgpu-decode
 cargo test -p geom -p scan --features gui
 ```
 
-217 tests, 3 ignored. The geometry is tested against synthetic scenes and known
-transforms rather than recorded data, so the suite runs without a sensor.
+229 tests, 3 ignored. The geometry is tested against synthetic scenes and known
+transforms rather than recorded data, so the suite runs without a sensor. The
+loop-closure tests cover the keyframe window, the background worker, online
+correction, and the incremental submap path.
 
 The window tests are headless too: they exercise the session worker, a synthetic
 scan and its export, the trainer child-process worker, the splat
 loader/renderer, and the software renderer without opening a window.
 
-The non-GUI suite is 192 tests.
+The non-GUI suite is 204 tests.
 
 ### Ignored hardware tests
 
@@ -119,6 +121,15 @@ cp -r /tmp/k1/src /tmp/verify/src
 4. **The GPU decoder frees the CPU and does not shorten the scan.** Either find a
    use for the spare cores, or accept the wall-clock result in
    [Performance](performance.md).
+
+5. **Benchmark the new correction paths on a real loop.** The tests prove online
+   correction, the background worker, and incremental submap moves on synthetic
+   scans. They do not yet show which wins on `out/closed-loop.k2df`. Online and
+   incremental moves are rigid per submap, so they cannot remove drift *inside*
+   one; the default full rebuild stays the accuracy reference. The keyframe graph
+   also still uses the dense numerical-Jacobian solve, fine at these node counts
+   but the next thing to replace (sparse linear algebra plus analytic SE(3)
+   Jacobians) before very long scans.
 
 ## Licence
 

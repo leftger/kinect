@@ -24,17 +24,23 @@ Omitting `--features gui` leaves `gui` unavailable but keeps the other commands.
 ```text
 scan gui    [--in FILE | --synthetic] [--auto-start] [--frames N]
             [--out mesh.ply] [--dataset DIR] [--color] [--preview-every N]
-            [--playback-fps F] [--no-submaps]
+            [--playback-fps F] [--loop-closure] [--online-loops]
+            [--loop-worker] [--loop-window N] [--incremental-rebuild]
+            [--no-submaps]
 
 scan live   [--frames N] [--out mesh.ply] [--voxel M] [--no-filter] [--color]
             [--color-mode best|blend|average] [--color-depth-tolerance M]
-            [--gpu] [--loop-closure] [--viewer] [--dataset DIR] [--no-submaps]
+            [--gpu] [--loop-closure] [--online-loops] [--loop-worker]
+            [--loop-window N] [--incremental-rebuild] [--relocalize]
+            [--relocalize-keyframes N] [--viewer] [--dataset DIR] [--no-submaps]
 
 scan record --out capture.k2df [--frames N] [--no-filter] [--drain-color]
             [--gpu] [--color]
 
 scan replay --in capture.k2df [--out mesh.ply] [--voxel M] [--frames N]
-            [--loop-closure] [--relocalize] [--no-submaps] [--dataset DIR]
+            [--loop-closure] [--online-loops] [--loop-worker]
+            [--loop-window N] [--incremental-rebuild] [--relocalize]
+            [--relocalize-keyframes N] [--no-submaps] [--dataset DIR]
 
 scan synth  --dataset DIR [--frames N] [--out mesh.ply] [--voxel M]
 ```
@@ -109,11 +115,37 @@ This is the cheapest way to exercise the Brush hand-off.
 | `--voxel M` | TSDF voxel size in metres; default `0.01` |
 | `--out FILE` | Mesh path; extension selects the format |
 | `--dataset DIR` | Also write a Gaussian-splatting dataset |
-| `--loop-closure` | Detect revisits and rebuild from corrected poses |
+| `--loop-closure` | Detect revisits, optimise the keyframe graph, and correct the model |
+| `--loop-window N` | Keyframes merged on each side of a loop candidate; default `2` |
+| `--online-loops` | Apply a verified loop during the scan; implies `--loop-closure` |
+| `--loop-worker` | Run loop ICP on a worker thread; implies `--loop-closure` |
+| `--incremental-rebuild` | Move cached submap surfaces instead of re-fusing; implies `--loop-closure` |
+| `--relocalize` | Retry a rejected frame with spatial ICP against a local keyframe map |
+| `--relocalize-keyframes N` | Recent keyframes in that local map; default `6`; implies `--relocalize` |
 | `--no-submaps` | Keep one model and skip unplaceable frames instead of starting a submap |
 | `--gpu` | GPU depth decode; requires `--features wgpu-decode` |
 | `--mirror` | Keep the raw sensor mirror orientation instead of flipping X |
 | `--no-filter` | Disable decoder bilateral and edge-aware filters |
+
+### Loop closure tuning
+
+The defaults are deliberately conservative. On a clean scan, the useful
+experiments are:
+
+```sh
+# Correct as the scan runs, and verify off the capture thread.
+scan replay --in out/closed-loop.k2df --loop-closure --online-loops --loop-worker
+
+# A wider verification window for a sensor that turns in place.
+scan replay --in out/closed-loop.k2df --loop-closure --loop-window 4
+
+# Fast final correction: move the cached submaps, do not re-fuse.
+scan replay --in out/closed-loop.k2df --loop-closure --incremental-rebuild
+```
+
+`--online-loops` and `--incremental-rebuild` trade accuracy inside a submap for
+speed: the cached surface moves rigidly. The default full rebuild re-integrates
+every kept frame at the corrected poses and is the one to compare against.
 
 ### Voxel size and memory
 
