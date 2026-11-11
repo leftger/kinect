@@ -1,640 +1,117 @@
 # kinect
 
-A handheld 3D scanner for the Kinect v2, in Rust. It captures depth frames,
-tracks the sensor's motion from the depth data alone, fuses the frames into a
+A handheld 3D scanner for the Kinect v2, written in Rust. It captures depth
+frames, recovers the sensor's motion from depth alone, fuses the frames into a
 TSDF volume, and extracts a triangle mesh.
 
-There is no IMU and no GPS. Motion is recovered from the depth images themselves,
-and drift is addressed with loop closure rather than with extra sensors. An IMU
-would help a little; a GPS is useless indoors, and the Kinect v2 has neither.
+There is no IMU and no GPS. Motion comes from the depth images, and drift is
+addressed with loop closure rather than extra sensors.
+
+## Quick start
+
+### Try it without a Kinect
+
+```sh
+cargo build --release -p scan --features gui
+./target/release/scan gui --synthetic --auto-start
+```
+
+That opens the scanner window and runs the full real-time path against an
+analytic room. No sensor or recording is needed.
+
+### Run a live scan
+
+```sh
+# One-time Linux USB setup
+sudo cp platform/linux/udev/90-kinect2.rules /etc/udev/rules.d/
+sudo udevadm control --reload-rules && sudo udevadm trigger
+
+# Check the sensor, then open the scanner window
+cargo run --release -p probe
+cargo build --release -p scan --features gui
+./target/release/scan gui --color
+```
+
+For the command-line path:
+
+```sh
+./target/release/scan live --color --frames 300 --out scan.ply
+```
+
+See [Getting started](docs/getting-started.md) for platform requirements, build
+features, and the first-scan checklist.
+
+## What it does
+
+- Captures, records, and replays depth and optional colour at 512x424.
+- Tracks frame-to-frame motion with projective point-to-plane ICP.
+- Fuses frames into a voxel-hashed TSDF and extracts a triangle mesh.
+- Writes PLY, OBJ, glTF, and GLB with per-vertex colour or a texture atlas.
+- Detects revisits with loop closure, optimises a pose graph, and rebuilds the
+  model from corrected poses.
+- Keeps unplaceable frames in submaps instead of discarding them.
+- Exports a Nerfstudio/Brush dataset for Gaussian splatting.
+- Runs a scanner GUI with a live 3D preview, source picker, transport, export,
+  telemetry, and an optional trainer/Splats panel.
 
 ## Status
 
-This is a working scanner with one large, measured weakness and several honest
-gaps. Read this section before the code.
+**Working**
 
-**Works**
+- Live capture, `.k2df` recording, and sensor-free replay.
+- Depth-only odometry, TSDF fusion, mesh extraction, trajectory export.
+- Colour capture, registration, per-vertex colour, and texture atlases.
+- A real closed-loop colour capture: 120/120 frames, one submap, one verified
+  revisit, 10.9 cm maximum correction, and a trainable dataset.
+- Gaussian-splatting dataset export and a tested Brush hand-off on synthetic and
+  real data. The window can launch Brush and load its `.ply` into a basic splat
+  preview.
 
-- Live capture, recording, and replay of depth frames at 512x424, with optional colour
-- Frame-to-frame odometry recovered from depth only, 81 ms per frame
-- TSDF fusion and triangle-mesh extraction, written as binary PLY
-- Trajectory export, which is the quickest way to see how badly a scan drifted
-- Loop closure and pose-graph optimisation, wired and tested
-- Optional live colour, painted onto the mesh as per-vertex PLY colour or as a texture atlas (OBJ, glTF, or a single GLB)
-- A scanner window (`scan gui`) with an interactive 3D preview, source picker,
-  start/pause/stop, parameters and export. It can run the synthetic room or a
-  recording, so the real-time path works with no sensor attached, and it can
-  record a `.k2df` while reconstructing.
-- Gaussian-splatting dataset export (`--dataset DIR`, or the window's output
-  field): posed colour views, masks and a coloured `init.ply` for an external
-  trainer. The window's Splats panel can launch a configured Brush command; no
-  trainer is bundled. See [GAUSSIAN_SPLATTING.md](GAUSSIAN_SPLATTING.md).
+**Limits**
 
-**Found by profiling, and fixed**
+- Drift is real on long handheld captures. Loop closure corrects a revisit, but
+  the final model still depends on capture quality.
+- The GPU decoder frees host CPU time but does not shorten a scan, because
+  capture waits on USB.
+- Fusion is the largest per-frame cost and grows with model size.
+- A recognisable real Brush result still needs a cleaner capture or longer,
+  higher-resolution training.
 
-- **The capture rate was capped by the colour stream.** The capture loop used to
-  read and discard a colour packet for every depth frame, on the reasoning that a
-  stream has to keep being drained or its transfers stop being resubmitted. The
-  colour stream delivers at about a third of the depth rate, so every frame
-  waited on it. Reading colour is now off by default and the `live` pipeline went
-  from 633 ms to 271 ms per frame over 100 frames.
-
-  It went unnoticed for a long time because it costs no CPU: it shows up purely
-  as waiting, and every earlier measurement had assumed the decode was the
-  expensive part. Building a GPU decoder to attack the decode is what disproved
-  that, which is the one useful thing that came out of that work.
-
-**Does not work, or has not been shown to**
-
-- **Drift is real.** On a 150-frame handheld capture the reconstructed trajectory
-  covers 4.8 m of path and ends 2.15 m from where it started. Loop closure exists
-  to correct exactly this, but it has never been exercised on a real loop: the
-  test capture contains none.
-- **The GPU depth decoder is correct but does not shorten a scan.** It cuts
-  host CPU time sharply and leaves the wall clock about where it was, because
-  capture waits on USB. See [GPU decoding](#gpu-decoding).
-- **Fusion is now the largest remaining per-frame cost**, about 100 ms at 1 cm
-  voxels, and it scales with the size of the model. Tracking is about 35 ms.
-
-## Requirements
-
-- A **Kinect v2** (the Xbox One sensor, USB id `045e:02c4`). This is not the
-  Kinect v1 and not the Azure Kinect DK; the Azure device is a different sensor
-  with a different driver and an IMU.
-- A **USB 3.0 port**. The sensor is SuperSpeed-only and needs its own power
-  supply; the USB cable carries data, not power.
-- Linux or macOS. On Linux, libusb access comes from the udev rule in
-  `platform/linux/udev/90-kinect2.rules`, installed as root:
-
-  ```
-  sudo cp platform/linux/udev/90-kinect2.rules /etc/udev/rules.d/
-  sudo udevadm control --reload-rules && sudo udevadm trigger
-  ```
-
-  Without it every capture fails with an opaque permission error.
-
-  On macOS, install libusb (`brew install libusb`). There is no udev rule.
-  The operating system is chosen when the binary is compiled. A Mac build
-  drives control, colour, and depth through libusb, because `nusb` opens the
-  device exclusively on macOS and has no isochronous transfers there. A Linux
-  build keeps the `nusb` path. Windows is not supported. `--gpu` selects the
-  wgpu depth decoder, which uses Metal on macOS and Vulkan on Linux.
-
-## Build
-
-Build on the machine that will run the scanner. The USB backend is selected
-at compile time, so a Mac binary does not become a Linux binary by being
-copied across.
-
-The workspace uses Rust 2024 edition and resolver 3, so it needs rustc 1.85 or
-newer; the manifests keep `rust-version = "1.85"` as the floor.
-
-```
-cargo build --release -p scan
-```
-
-GPU depth decode needs the wgpu feature. On macOS that is Metal; on Linux it
-is Vulkan.
-
-```
-cargo build --release -p scan --features wgpu-decode
-```
-
-The scanner window needs the `gui` feature. The old name, `viewer`, is an alias
-so an existing build command keeps working. The window uses the glow backend
-(Wayland and X11 on Linux), not wgpu, so it can be combined with `wgpu-decode`
-without pulling a second GPU stack in.
-
-```
-cargo build --release -p scan --features gui
-```
-
-The scanner binary is `target/release/scan`. To check that the sensor works
-before using the scanner, `cargo run --release -p probe`.
-
-`--frames` defaults to 60. A 300-frame GPU scan on this Mac is:
-
-```
-target/release/scan live --gpu --frames 300 --out scan.ply
-```
-
-Add `--color` to paint a live mesh. `--out scan.ply` keeps per-vertex colour; `--out room.obj`, `room.gltf`, or `room.glb` writes a texture atlas.
-
-## Use
-
-```
-scan gui    [--in FILE | --synthetic] [--auto-start] [--frames N]
-            [--out mesh.ply] [--dataset DIR] [--color] [--preview-every N]
-            [--playback-fps F] [--no-submaps]
-scan live   [--frames N] [--out mesh.ply] [--voxel M] [--no-filter] [--color]
-            [--color-mode best|blend|average] [--color-depth-tolerance M]
-            [--gpu] [--loop-closure] [--viewer] [--dataset DIR] [--no-submaps]
-scan record  --out capture.k2df [--frames N] [--no-filter] [--drain-color] [--gpu] [--color]
-scan replay  --in capture.k2df [--out mesh.ply] [--voxel M] [--frames N] [--loop-closure]
-            [--relocalize] [--no-submaps] [--dataset DIR]
-```
-
-- `gui` opens the scanner window. Pick a live sensor, Record, a recording, or
-  the synthetic room; start, pause, stop, adjust parameters, and export. Record
-  captures while reconstructing and writes a `.k2df` for later replays. The
-  output field can also write a Gaussian-splatting dataset. The 3D viewport
-  updates as frames fuse. It needs a build with `--features gui` and a display,
-  but not a sensor: `scan gui --synthetic --auto-start` runs the whole real-time
-  path on a machine with nothing plugged in.
-- `live` captures and reconstructs as it goes. `--dataset DIR` also writes a
-  Nerfstudio/Brush dataset for Gaussian splatting.
-- `record` stores frames to a file for offline work. With `--color` it stores
-  the registered colour too; without it the recording is depth only. A
-  recording is deterministic, so replaying a prefix of it is a repeatable test
-  case.
-- `replay` reconstructs from a recording and needs no sensor. If the recording
-  carries colour, the mesh is painted from it and `--dataset DIR` can write a
-  dataset. A depth-only recording cannot.
-- `--relocalize` is an experimental spatial search for rejected frames. It
-  aligns the frame's voxel cloud to the last accepted frame's cloud and accepts
-  only a strict fit (≥55% inliers, ≤25 mm RMSE). On `out/room.k2df` with
-  `--no-submaps` it recovers 0 of the 73 rejected frames — they are first views
-  of surfaces the last frame
-  never saw — and costs about 4.8x the tracking time. Off by default; see
-  `GAUSSIAN_SPLATTING.md` §5, M2.1 for the measurements.
-- Submaps are on by default. When the tracker cannot place a frame and the
-  spatial search does not recover it, that frame starts a new submap at the
-  failed alignment's candidate pose; tracking and fusion continue locally. On
-  `out/room.k2df` this turns 77 fused / 73 skipped into 150 / 0 across 19
-  fragments, using 220 MB instead of 464 MB, but no revisit is verified, so the
-  fragments stay at guessed origins. Finalising each submap extracts its
-  surface, about a second at each boundary. `--no-submaps` restores the single
-  model and the skipped frames. See `GAUSSIAN_SPLATTING.md` §5, M2.1b.
-
-Useful options:
-
-- `--voxel M` sets the TSDF voxel size in metres, default 0.01. Memory scales
-  with the inverse cube of this: a 1 cm model of a room reaches several hundred
-  megabytes, and `--voxel 0.02` cuts that by roughly eight.
-- `--no-filter` disables the decoder's bilateral and edge-aware filters. It is
-  faster and keeps more junk points.
-- `--frames N` is how many frames to capture or replay. The default is 60.
-- `--loop-closure` detects revisits and rebuilds the model from corrected poses.
-  Pose proximity proposes the normal candidates. On colour scans, if none of
-  those verifies, a compact appearance signature (8x8 grayscale plus an RGB
-  histogram) can propose a frame outside the pose radius, RTAB-Map style; the
-  same spatial ICP still has to accept it. Loop keyframes are thinned to every
-  2 cm / 3 degrees of motion, with a five-frame fallback, so a submap reset
-  cannot starve the loop index. An accepted loop must also align in reverse,
-  and each edge is weighted by inlier coverage and residual. If the pose graph
-  asks for an implausible correction, the weakest loop is dropped and the graph
-  is retried before giving up. The loop index also has working memory: the
-  most recent 80 keyframes keep full-resolution clouds, and older signatures
-  keep every second point as long-term memory. When a candidate points at one
-  of those old keyframes, its full cloud is rebuilt from the retained depth for
-  that verification and then dropped again. The window's telemetry shows loops,
-  loop ICP attempts, dropped loops, loop points, and rehydrated clouds. On a
-  live colour scan the
-  colour views move onto those poses before the mesh is painted. The rebuild
-  keeps
-  every depth frame, about 850 KB each, so a
-  200-frame scan holds around 170 MB of depth. Each colour view is separate:
-  about 1.66 MiB, and about 1 GiB at 600 views. It only helps a scan that
-  returns somewhere it has already been.
-- `--color` captures the colour stream during `live` and paints the finished
-  mesh. Off by default, because that stream is slower than depth. `record
-  --color` stores the registered colour in the `.k2df` file; `replay` paints
-  from it when present, and a depth-only recording has no colour to paint.
-  `--drain-color` on `record` reads and discards colour packets and does not
-  store them.
-- `--color-mode` is `best` (the default), `blend`, or `average`. It sets
-  per-vertex PLY colour. A texture atlas gives each triangle one best source
-  view. See [Colour](#colour).
-- `--color-depth-tolerance M` is how far, in metres, a vertex may disagree with
-  a view's measured depth and still be painted. The default is `0.02`. It must
-  be greater than zero.
-- `--out` selects the file by extension. `.ply` is per-vertex colour. `.obj`
-  also writes a sibling `.mtl` and `.png`. `.gltf` also writes a sibling `.bin`
-  and `.png`. `.glb` is the geometry and the PNG in one file.
-- `--dataset DIR` also writes a Nerfstudio dataset for a Gaussian-splatting
-  trainer: `transforms.json`, posed `images/`, `masks/`, and a coloured
-  `init.ply`. It needs colour views, so use `live --color`, or `record --color`
-  and replay. The seed cloud is voxel-decimated to at most 250,000 points; the
-  full surface stays in the exported mesh. The window preflights the path and
-  reports the result; its Splats panel can launch a configured trainer, but this
-  repo does not implement one. See
-  [GAUSSIAN_SPLATTING.md](GAUSSIAN_SPLATTING.md).
-- `--viewer` opens the scanner window on the live source and starts immediately.
-  It is the same window as `scan gui`; the old picture-only viewer is gone. Needs
-  a build with `--features gui` (or the `viewer` alias) and a display. Closing
-  the window stops the scan and exports it.
-- `--synthetic` on `gui` selects the analytic room instead of the sensor.
-- `--auto-start` on `gui` starts the selected source when the window opens.
-  `live --viewer` does this too.
-- `--preview-every N` on `gui` extracts a preview mesh every N frames, default
-  `2`. One updates every frame and costs the most; a larger value keeps capture
-  faster and the preview coarser.
-- `--playback-fps F` on `gui` paces replay and synthetic playback, default `10`.
-  Zero runs as fast as the reconstruction allows.
-- `--gpu` decodes depth on the GPU during `live` and `record`. `replay` reads
-  depth that was already decoded, so the flag does nothing there. Needs a build
-  with `--features wgpu-decode`. OpenCL (`--features gpu-decode`) is the other
-  backend and does not work with Rusticl; see below.
-- `--mirror` keeps the raw sensor mirror orientation instead of flipping X (un-mirrored by default).
-
-A trajectory PLY is written alongside the mesh as `<out>.trajectory.ply`.
-
-## The scanner window
-
-```
-scan gui --synthetic --auto-start --frames 60 --out out/room.ply
-scan gui --in out/capture.k2df --auto-start --voxel 0.02
-scan gui --color --out out/room.obj
-scan gui --color --dataset out/room-ds --out out/room.ply
-```
-
-The window has five parts:
-
-- **Source**: live sensor, Record (capture while writing a `.k2df`), a `.k2df`
-  recording, or the synthetic room. The source and the parameters are locked
-  once a scan starts; Reset returns to the picker.
-- **Reconstruction and output**: frames, voxel size, colour and its mode,
-  colour-depth tolerance, filters, loop closure, frame-to-model, submaps, GPU
-  decode, mirror, preview interval, playback rate, the output path, and the
-  optional dataset directory. The extension selects the mesh format exactly as
-  it does on the command line.
-- **3D viewport**: drag to orbit, right-drag (or middle-drag) to pan, scroll to
-  zoom, double-click or *Fit view* to frame the model. The surface is extracted
-  from the TSDF every `--preview-every` frames, so it refines as the scan
-  proceeds. The latest depth frame is drawn as coloured points, the camera path
-  as a cyan line, and the current sensor as a yellow frustum.
-- **Telemetry**: frames, fused, rejected and submap counts, position, TSDF size,
-  tracking, fusion and submap-finalisation time, preview rate, the worker's log,
-  and the exported mesh and dataset summary after Export.
-- **Splats**: after an export, run Brush on the dataset as a child process.
-  Editable executable, dataset, output directory and iteration count, with
-  Start/Cancel and a streamed log. An exported dataset with unmerged submaps or
-  too many rejected frames is marked *not trainable*; Start then requires
-  **Train anyway**. The trained `.ply` can be loaded into the viewport, with
-  Mesh/Splats, Fit-splats and First-person controls. The preview projects the
-  anisotropic covariance and blends DC colour; higher SH bands are not evaluated.
-  Splat-size and minimum-opacity sliders make under-trained or floating-splat
-  models inspectable. Clouds over 250k splats render at half raster resolution
-  and are scaled by egui; first-person splats use the colour frame's x direction.
-
-*Start* runs the selected source. *Pause* stops consuming frames without
-losing the scanner; *Resume* continues. *Stop* ends the capture but keeps the
-scanner in memory so the finished model can be inspected and exported.
-*Export* writes it, and if the scan is still running it stops first. *Reset*
-throws the scan away. Closing the window exports an unexported scan rather
-than losing it, so Reset is the explicit discard.
-
-Record streams the same frames to the `.k2df` path in the Source panel while
-they reconstruct, so a session can be replayed later. Stop, Reset, or a sensor
-dropout closes the recording rather than losing it.
-
-The optional **dataset directory** writes the Gaussian-splatting hand-off:
-`transforms.json`, posed `images/`, `masks/`, and a coloured `init.ply` that a
-Nerfstudio/Brush trainer can start from. It needs colour views, so tick Colour
-on a live or Record source, or replay a recording made with `record --color`.
-Start preflights the path; Export shows the view and initial-point counts in
-the telemetry panel. The Splats panel can then run a configured Brush child
-process and load its `.ply` into a basic splat preview. See
+The long-form Gaussian-splatting plan and measurements are in
 [GAUSSIAN_SPLATTING.md](GAUSSIAN_SPLATTING.md).
 
-**Brush smoke test without a sensor.** The dataset has been through the real
-Brush parser and trainer on this machine:
+## How it fits together
 
-```sh
-scan synth --dataset out/ds-synth --frames 24 --out out/synth.ply
-brush-cli out/ds-synth --total-train-iters 100 --export-every 100 \
-    --export-path /tmp/brush-synth --export-name export.ply
-```
-
-Brush loaded all 24 views and wrote a 119 MB PLY with 504,178 splats and the
-expected position/scale/rotation/opacity/SH properties. The 24-frame synthetic
-run also crosses a submap boundary at frame 23, so the parse covers a dataset
-with two fragments. This proves the format and trainer hand-off; it does not
-prove that a real room renders recognisably, which still needs a real capture.
-The synthetic fixture is harsher than a handheld scan, so the quality check
-marks this run *not trainable*; that is expected for a format smoke test, not a
-verdict on the exporter.
-
-The first real closed-loop capture (`out/closed-loop.k2df`) fused **120/120
-frames in one submap** over 31.6 s. With thinned loop keyframes, loop closure
-found **one verified revisit**, reduced cost from 0.020 to 0.000, and moved the
-largest pose by **10.9 cm**; the exported dataset was marked *trainable*. Brush
-loads and trains it. A
-5,000-iteration run (60 views at 256 px, 199k seed, densified to 519,041
-splats) now shows the couch, plant and table, but it is still visibly smeared;
-a full ~30k-iteration run is the next step. The exporter now caps `init.ply` at
-250k points (the 2.24M-vertex seed made training impractically slow).
-
-The preview is rasterised on the CPU into an ordinary egui texture. That keeps
-the window independent of the GPU decoder and testable without a display; at a
-few frames per second the cost is not the bottleneck. The mesh is painted from
-only the most recent colour views for preview, while the exported mesh still
-uses every view.
-
-## How it works
-
-```
+```text
 depth frame from USB
-  -> decode            raw packet to metres          (vendored libfreenect2 port)
+  -> decode            raw packet to metres
   -> odometry          pose relative to the last frame
   -> TSDF fusion       integrate into a voxel-hashed volume
-  -> mesh extraction   naive surface nets, then PLY, OBJ, glTF, or GLB
+  -> mesh extraction   surface nets, then PLY / OBJ / glTF / GLB
+  -> optional colour   register views, paint the mesh or atlas
+  -> optional dataset  posed images, masks, and init.ply for a trainer
 ```
 
-**Odometry** uses projective data association: each point in the current frame is
-projected into the previous depth image to find its correspondence, with an
-occlusion test on depth disagreement, rather than searching a spatial index. That
-change alone took tracking from 928 ms to 81 ms per frame with no loss of
-accuracy. Point-to-plane ICP with Huber weighting and a coarse-to-fine pyramid
-does the solving. Frames whose solution fails acceptance thresholds are dropped
-rather than fused, and the reference frame still advances so that one bad frame
-cannot lock out the rest of the scan.
+Read [How it works](docs/how-it-works.md) for tracking, fusion, mesh extraction,
+loop closure, and submaps.
 
-**Fusion** uses a voxel-hashed TSDF, one hash entry per 8x8x8 block. Each block
-is enumerated once per frame and the projective update runs over its voxels.
+## Documentation
 
-**Mesh extraction** is naive surface nets: one vertex per sign change, then
-connectivity is recovered by, for each grid edge with a sign change, joining the
-four surrounding cubes. It is far less code than marching cubes and produces
-cleaner quads at the cost of some detail.
-
-## Colour
-
-`--color` captures the colour stream during `live`, registers each frame into
-the depth camera's grid, and paints the finished mesh from those views.
-`record --color` stores the registered colour in the `.k2df` file, so `replay`
-can paint from it; a recording made without `--color` is depth only and has no
-colour to paint. `--drain-color` reads and discards colour packets without
-storing them.
-
-```
-scan live --color --frames 300 --out scan.ply
-scan live --color --color-mode blend --color-depth-tolerance 0.03 --out scan.ply
-scan live --color --loop-closure --out room.obj
-scan live --color --out room.glb
-scan live --color --out room.gltf
-scan record --color --out capture.k2df
-scan replay --in capture.k2df --out mesh.ply
-scan synth --dataset out/ds-synth --frames 24 --out out/synth.ply
-```
-
-`scan synth` needs no sensor or display: it renders the analytic room, writes
-the mesh, and writes a colour dataset. It is the cheapest way to exercise the
-Brush hand-off on a machine with no Kinect attached.
-
-The colour is registered as each frame arrives
-(`Registration::undistort_depth_and_color`), so a view is a 512x424 RGB image
-plus the undistorted depth and the registration mask from the same frame.
-That is about 1.66 MiB per kept view, about 1 GiB at 600 views, on top of the
-depth frames loop closure retains (about 850 KB each). Projecting a vertex needs
-only the depth intrinsics, and the view's own depth is the occlusion test, the same
-one projective odometry already does. A sample is kept only when that depth
-agrees with the vertex, the registration mask says the pixel was copied, the
-sample clears the image margin, and a known normal faces the camera. Without
-the depth test, a vertex on a far wall seen through a doorway would be painted
-with whatever is in front of it.
-
-Samples that survive are scored:
-
-```
-score = incidence × centrality × proximity × agreement × tracking
-```
-
-`incidence` is how squarely the camera looks at the surface. `centrality`
-prefers the middle of the frame. `proximity` prefers a nearer camera.
-`agreement` is how much of the depth tolerance is left. `tracking` is the
-inlier ratio of that frame.
-
-`--color-mode` chooses the per-vertex PLY colour. The default is `best`.
-
-- `best` keeps the single highest score, after a per-view exposure correction
-  applied in linear light.
-- `blend` mixes the top three scores in linear light, weighted by those scores,
-  with the same exposure correction.
-- `average` is the earlier painter: an equal mean of every visible sample in
-  the stored byte values. It does not apply the exposure correction. The
-  visibility test is unchanged.
-
-`.obj`, `.gltf`, and `.glb` write a texture atlas. An atlas assigns each
-triangle to the one source view that passes the visibility test on all three
-corners and on the triangle centroid, and that has the best score. `blend` and
-`average` apply to per-vertex PLY colour.
-
-The exposure correction is one scalar per view, estimated from vertices that
-view shares with the best-observed view. It is not a model of the colour
-camera's exposure, gain, or gamma; those values are kept for diagnostics. A
-correction needs several consistent overlaps, ignores near-black samples, and
-is clamped.
-
-`--color-depth-tolerance` defaults to 2 cm (`0.02`). That is about the depth
-noise at typical range, and it still allows a vertex that sits between voxels.
-The earlier painter used 5 cm, which let colour through thin structure. The
-value has to be greater than zero: too tight and nothing is visible, too loose
-and colour bleeds through walls.
-
-Colour is not fused into the volume. That costs no extra voxels, and once the
-model is final every accepted view that saw a surface can contribute, not only
-the frames that arrived while that surface was being integrated. A frame the
-tracker rejects is not kept: its pose was never used to build the model, so its
-colour is not used to paint it. The end-of-scan line reports how many colour
-views were kept against how many were dropped with rejected frames.
-
-**Loop closure moves the colour with the poses.** Views are stored at the
-odometry pose of the frame they came from. When a correction is accepted, the
-volume is rebuilt and each view is rewritten to the corrected pose of its
-frame (`frame_index` into the trajectory) before anything is painted. A refused
-correction leaves both the model and the views where odometry put them.
-Painting from the old poses after the mesh had moved would colour the surface
-from the wrong camera.
-
-**The extension picks the file.** `.ply` has no texture coordinates in its core
-format, so it stays per-vertex `uchar red/green/blue`, which MeshLab,
-CloudCompare, and Blender read, and that is the colour `--color-mode` controls.
-`.obj`, `.gltf`, and `.glb` carry a texture atlas. A triangle is given to the
-one view that passes the test on all three corners and on the centroid, and
-that has the best score. Charts are the bounding boxes of those faces,
-shelf-packed with a replicated gutter, and never larger than 8192 on a side.
-If the native charts would overflow that square they are downscaled together.
-
-| `--out` | files |
+| Guide | What is inside |
 | --- | --- |
-| `scan.ply` | per-vertex colour in that file |
-| `room.obj` | `room.obj`, `room.mtl`, `room.png` |
-| `room.gltf` | `room.gltf`, `room.bin`, `room.png` |
-| `room.glb` | one binary GLB, geometry and PNG inside it |
-
-An uncompressed PNG of an 8192 atlas would be about 192 MB, most of it the flat
-fallback colour around the charts. The PNG is deflate-compressed so that empty
-region collapses. The end-of-scan line for an atlas reports its size, how many
-triangles were painted, and the unpainted remainder. A PLY reports how many
-vertices were painted and how many samples contributed to each.
-
-The atlas is built in the volume's frame and only then mirrored, so positions,
-normals, and winding flip together and the texture coordinates stay on the
-image that was just painted.
-
-**It costs capture rate.** The colour stream delivers at about a third of the
-depth rate. On the Linux machine this was first measured on, waiting for a
-packet took a frame from roughly 270 ms to 530 ms. On the M4 Pro, a 20-frame
-colour scan and a 30-frame depth-only scan both took about 3 s of wall time, so
-colour still lowers throughput. Capturing colour every Nth frame would pay that
-less often.
-
-The alignment this relies on was checked before any of it was written:
-`crates/scan/examples/color_check.rs` writes the registered colour and the depth
-discontinuities overlaid, and the depth edges land on colour edges with a
-one-pixel offset. That is the check the GPU port should have had first.
-
-## The vendored driver
-
-`vendor/kinect-one` is the pure-Rust libfreenect2 port at upstream revision
-`24c6dc0`, MIT licensed. It is vendored rather than used as a git dependency so
-the patches are visible and reviewable.
-
-`vendor/kinect-one/VENDORED.txt` lists the local changes. One of them is a
-genuine upstream bug: `undistort_depth` indexes a frame with a sentinel that
-upstream libfreenect2 bounds-checks and the port does not, so a border pixel
-panics on real frames. The macOS build adds `src/libusb_host.rs` and does not
-yet appear in `UPSTREAM.patch`.
-
-`UPSTREAM.patch` is the diff from before the macOS host. Regenerating it is
-described in `VENDORED.txt`. Until then, this check does not cover
-`libusb_host.rs`:
-
-```
-cp -r /tmp/k1/src /tmp/verify/src
-(cd /tmp/verify && patch -p1 < UPSTREAM.patch && diff -rq src <crate>/src)
-```
-
-## GPU decoding
-
-Two backends exist. wgpu is the one that runs.
-
-- **OpenCL** (`--features gpu-decode`) is unusable on the Linux machine this was
-  developed on. Mesa's Rusticl enumerates a device, allocates buffers, and
-  transfers data correctly, then silently never executes a kernel.
-  `crates/scan/examples/ocl_check.rs` demonstrates this with a trivial kernel.
-- **wgpu** (`--features wgpu-decode`) works. The four libfreenect2 decode
-  kernels were translated to WGSL. On Linux, wgpu uses Vulkan. On macOS, the
-  same binary feature uses Metal. The log line names the adapter and the
-  backend, for example `Apple M4 Pro (Metal)`.
-
-The translation is verified against the CPU decoder on real sensor data, feeding
-one packet to both:
-
-| stage | agreement |
-| --- | --- |
-| stage 1, via the IR frame | 212842 of 216240 pixels within 1 count of 65535 |
-| stages 1 and 2, filters off | mean difference 1.73 mm, 0.104% of depth |
-| stages 1 and 2, filters on | 96.7% agreement on valid pixels, mean 2.02 mm |
-
-That residual is below the sensor's own noise, so it is not visible through it.
-
-What it buys is less wall-clock time than hoped.
-
-On Linux, 100 frames of `live` with the filters off:
-
-| | wall | per frame | user CPU |
-| --- | --- | --- | --- |
-| CPU decode | 25.6 s | 256 ms | 25.4 s |
-| Vulkan decode | 23.9 s | 239 ms | 16.7 s |
-
-About 6% off the wall clock, close to the run-to-run noise, and a third off the
-host CPU time.
-
-On an Apple M4 Pro, filters on, the sensor sitting still:
-
-| | wall | user CPU |
-| --- | --- | --- |
-| record, 40 frames, CPU | 3.52 s | 2.50 s |
-| record, 40 frames, Metal | 3.31 s | 0.25 s |
-| live, 30 frames, CPU | 2.91 s | 2.02 s |
-| live, 30 frames, Metal | 2.90 s | 0.22 s |
-| live --color, 20 frames, CPU | 2.97 s | 1.50 s |
-| live --color, 20 frames, Metal | 2.99 s | 0.35 s |
-
-Recording got about 6% faster. The live scans did not. Host CPU time dropped by
-about an order of magnitude. Tracking and fusion on that small scene were a few
-milliseconds per frame, so the frame time is the USB wait.
-
-The premise it was built on, that the decode caps capture rate, was wrong: the
-measurement that produced it was taken with the filters on, where the decode cost
-about 148 ms per frame. Measured now, decode is perhaps 50 ms of a 256 ms frame,
-and tracking plus fusion is 140 ms of it. Killing the decode entirely would buy
-about 20%, which is why the port is kept but is not the interesting problem.
-
-There are two driver diagnostics, both runnable without a sensor:
-
-```
-cargo run --release -p scan --example ocl_check   --features gpu-decode
-cargo run --release -p scan --example vk_check    --features wgpu-decode
-```
-
-## Layout
-
-```
-crates/geom         driver-independent geometry: voxel hashing, normals,
-                    point-to-plane ICP, projective association, TSDF, surface
-                    nets, colouring, texture atlases, PLY/OBJ/glTF/GLB output,
-                    pose-graph optimisation
-crates/scan         the scanner: capture, recording, odometry, fusion, CLI,
-                    and the scanner window (source picker, 3D preview,
-                    transport, export)
-crates/probe        bring-up probe: confirms the sensor streams on this machine
-vendor/kinect-one   vendored libfreenect2 port, with patches
-platform/linux      udev rule
-```
-
-## Tests
-
-```
-cargo test -p geom -p scan --features gui
-```
-
-217 tests (3 ignored). The geometry is tested against synthetic scenes and known
-transforms rather than against recorded data, so the suite runs without a
-sensor. The window's tests are headless too: they exercise the session worker,
-a synthetic scan and its export, the trainer child-process worker, the splat
-loader/renderer, and the software renderer without opening a window. The
-non-GUI suite is 192 tests.
-
-Two tests need hardware and are ignored by default:
-
-```
-cargo test --release -p scan --features wgpu-decode -- --ignored --nocapture
-```
-
-`live_decoders_agree` feeds one real sensor packet to both depth decoders, and
-`diagnose_the_divergence` prints the stage-by-stage comparison.
-
-The third ignored test is the manual splat load/render:
-
-```sh
-SCAN_SPLAT_PLY=/path/to/export.ply \
-  cargo test --release -p scan --features gui gui:: -- --ignored --nocapture
-```
-
-## Known gaps
-
-1. **Reduce fusion cost**, now the largest single per-frame item at about
-   100 ms, ahead of tracking at 35 ms and decode at about 50 ms. It scales with
-   the size of the model, so it is also what makes large `--voxel 0.01` scans
-   slow rather than merely memory-hungry.
-2. **Exercise loop closure on a real loop.** The synthetic
-   `a_revisit_merges_submaps_at_the_corrected_pose` test now verifies a
-   cross-submap revisit: front, side and returned-front views form three submaps,
-   the loop edge moves the third by 0.20 m, and the rebuild produces one model.
-   A real capture that walks out and returns is still needed to show that it
-   removes drift and makes a better room.
-3. **File the `undistort_depth` bug upstream**, since it affects anyone using the
-   port on real hardware.
-4. **The GPU decoder frees the CPU and does not shorten the scan.** Either find
-   a use for the spare cores, or accept the wall-clock result above.
+| [Getting started](docs/getting-started.md) | Hardware, USB permissions, builds, sensor check, first scan |
+| [Command line](docs/cli.md) | Commands, options, recording/replay, loop closure, submaps |
+| [Scanner window](docs/gui.md) | Sources, panels, viewport controls, transport, telemetry, Splats |
+| [Colour](docs/colour.md) | Registration, visibility tests, colour modes, output formats |
+| [Datasets and splats](docs/datasets.md) | Dataset layout, quality gate, Brush smoke test, real-capture results |
+| [How it works](docs/how-it-works.md) | Pipeline, odometry, fusion, mesh extraction, loop closure |
+| [Performance](docs/performance.md) | Measured timings, GPU decode results, profiling notes |
+| [Development](docs/development.md) | Layout, tests, vendored driver, diagnostics, known gaps |
+| [Gaussian-splatting plan](GAUSSIAN_SPLATTING.md) | Milestones, experiments, and open questions for the splat hand-off |
 
 ## Licence
 
-No licence has been chosen for this code yet, which means it is all rights
-reserved by default. The vendored driver keeps its own MIT licence in
-`vendor/kinect-one/LICENSE`. The decode kernels translated to WGSL in
-`crates/scan/shaders/depth_decode.wgsl` derive from libfreenect2 and carry its
-Apache-2.0 / GPL-2.0 dual licence, see `vendor/kinect-one/LIBFREENECT2_CONTRIB`.
+No licence has been chosen for this code yet, so it is all rights reserved by
+default. The vendored driver keeps its own MIT licence; the translated decode
+kernels carry libfreenect2's Apache-2.0 / GPL-2.0 dual licence. See
+[Development](docs/development.md#licence) for the exact file paths.
