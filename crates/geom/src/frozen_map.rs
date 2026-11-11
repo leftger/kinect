@@ -10,7 +10,7 @@
 //! cloud is already a surface, and re-fusing it would both lose the prior's
 //! accuracy and pay a needless integration cost.
 
-use crate::global_search::{self, GlobalSearchParams};
+use crate::global_search::{self, GlobalSearchParams, ScoreGrid};
 use crate::icp::{self, IcpCloud, IcpParams};
 use nalgebra::{Isometry3, Vector3};
 
@@ -36,12 +36,21 @@ pub struct FrozenMapParams {
 impl Default for FrozenMapParams {
     fn default() -> Self {
         Self {
-            voxel: 0.04,
-            normal_radius: 0.12,
-            max_distance: 0.25,
-            min_inlier_ratio: 0.55,
-            max_rmse: 0.03,
-            global_search: GlobalSearchParams::default(),
+            // A prior mesh can have millions of vertices. Six centimetres keeps
+            // the map index and the per-frame ICP affordable; the global grid
+            // still uses its own finer resolution.
+            voxel: 0.06,
+            normal_radius: 0.18,
+            max_distance: 0.35,
+            // A prior mesh and a live depth frame are sampled differently, so
+            // these are looser than the odometry gates. The trajectory is not
+            // fused, so a false accept costs a pose, not the map.
+            min_inlier_ratio: 0.40,
+            max_rmse: 0.05,
+            global_search: GlobalSearchParams {
+                min_score: 0.25,
+                ..GlobalSearchParams::default()
+            },
         }
     }
 }
@@ -60,17 +69,31 @@ pub struct FrozenMatch {
 /// A point cloud treated as an immutable map.
 pub struct FrozenMap {
     cloud: IcpCloud,
+    /// Built once; reused by every localisation query.
+    grid: Option<ScoreGrid>,
 }
 
 impl FrozenMap {
     /// Index a prior point cloud. Returns `None` when the cloud is too small to
     /// align against after downsampling.
+    ///
+    /// Non-finite points and the large sentinel values that surface-nets writes
+    /// for unmeshed vertices are discarded before the voxel hash sees them.
     pub fn from_points(points: &[Vector3<f32>], params: &FrozenMapParams) -> Option<Self> {
+        let points: Vec<Vector3<f32>> = points
+            .iter()
+            .copied()
+            .filter(|point| {
+                point
+                    .iter()
+                    .all(|value| value.is_finite() && value.abs() < 1.0e6)
+            })
+            .collect();
         if points.len() < 16 {
             return None;
         }
         let cloud = IcpCloud::build(
-            points,
+            &points,
             params.voxel,
             params.normal_radius,
             params.max_distance,
@@ -79,7 +102,11 @@ impl FrozenMap {
         if cloud.points.len() < 16 {
             return None;
         }
-        Some(Self { cloud })
+        // The grid depends only on the map, not on the query, so build it once
+        // here. Rebuilding it per frame turned a room-sized localisation into a
+        // multi-minute operation.
+        let grid = ScoreGrid::build(&cloud.points, &params.global_search);
+        Some(Self { cloud, grid })
     }
 
     pub fn points(&self) -> &[Vector3<f32>] {
@@ -97,9 +124,9 @@ impl FrozenMap {
     /// Localise one query cloud. `prior` is the previous pose, or identity on
     /// the first frame.
     ///
-    /// The global search is tried first; if it finds nothing, ICP still gets a
-    /// chance from the prior. Either way the same inlier/RMSE gates decide
-    /// whether the pose is returned.
+    /// ICP from the prior is the fast path. Only when it fails the inlier/RMSE
+    /// gates does the cached global grid supply an initial guess for a second
+    /// ICP pass. Either way the same gates decide whether the pose is returned.
     pub fn localize(
         &self,
         query: &[Vector3<f32>],
@@ -117,34 +144,42 @@ impl FrozenMap {
             return None;
         }
 
-        let mut initial = prior;
-        let mut score = None;
-        if let Some(found) = global_search::search(
-            &self.cloud.points,
-            &source.points,
-            prior,
-            &params.global_search,
-        ) {
-            initial = found.transform;
-            score = Some(found.score);
+        let icp_params = IcpParams {
+            max_correspondence_distance: params.max_distance,
+            huber_delta: 0.03,
+            // Live localisation needs a bounded per-frame cost. A mesh prior is
+            // coarser than an odometry target, so it does not need 30 sweeps.
+            max_iterations: 12,
+            ..IcpParams::default()
+        };
+
+        // Normal tracking: refine from the previous pose. This is the fast path
+        // and the one a live session takes almost every frame.
+        let result = icp::align(&source, &self.cloud, prior, &icp_params);
+        if result.inlier_ratio >= params.min_inlier_ratio && result.rmse <= params.max_rmse {
+            return Some(FrozenMatch {
+                pose: result.transform,
+                score: 0.0,
+                inlier_ratio: result.inlier_ratio,
+                rmse: result.rmse,
+            });
         }
 
-        let result = icp::align(
-            &source,
-            &self.cloud,
-            initial,
-            &IcpParams {
-                max_correspondence_distance: params.max_distance,
-                ..IcpParams::default()
-            },
-        );
+        // Lost: only now pay for the global search. The grid was built once with
+        // the map, so this is the branch-and-bound cost, not a grid rebuild.
+        let Some(grid) = &self.grid else {
+            return None;
+        };
+        let found =
+            global_search::search_with_grid(grid, &source.points, prior, &params.global_search)?;
+        let result = icp::align(&source, &self.cloud, found.transform, &icp_params);
         if result.inlier_ratio < params.min_inlier_ratio || result.rmse > params.max_rmse {
             return None;
         }
 
         Some(FrozenMatch {
             pose: result.transform,
-            score: score.unwrap_or(0.0),
+            score: found.score,
             inlier_ratio: result.inlier_ratio,
             rmse: result.rmse,
         })

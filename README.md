@@ -57,10 +57,12 @@ features, and the first-scan checklist.
   tracking or ICP loses its basin, and can use the same matcher as a loop gate.
 - Skips near-duplicate fusion (`--fusion-filter`) and chunks the active TSDF
   (`--tsdf-chunk`), so fusion time and memory stay bounded on long scans.
-- Can optimise submap nodes (`--submap-graph`) and run that solve on a worker
-  thread (`--graph-worker`), keeping capture off the dense solve.
-- Localises a recording against a frozen PLY map (`scan localize`) without
-  modifying the prior.
+- Can finish tracking submaps on a frame or distance budget
+  (`--submap-frames`, `--submap-metres`), optimise submap nodes
+  (`--submap-graph`), and run the keyframe or submap solve on a worker thread
+  (`--graph-worker`) over a sparse analytic pose graph.
+- Localises a recording or the live sensor against a frozen PLY map
+  (`scan localize`, `--live`) without modifying the prior.
 - Keeps unplaceable frames in submaps instead of discarding them.
 - Exports a Nerfstudio/Brush dataset for Gaussian splatting.
 - Runs a scanner GUI with a live 3D preview, source picker, transport, export,
@@ -78,9 +80,9 @@ features, and the first-scan checklist.
 - Keyframe-graph loop closure with multi-keyframe verification targets, optional
   online correction, an optional background ICP worker, and an incremental
   submap correction path.
-- Global 4-DOF relocalisation, motion-filtered fusion, chunked
-  TSDF, submap-node optimisation, a background graph worker, and frozen-map
-  localisation.
+- Global 4-DOF relocalisation, motion-filtered fusion, chunked TSDF, planned
+  submap nodes, sparse analytic pose-graph optimisation, a keyframe/submap graph
+  worker, and frozen-map localisation (offline or live).
 - Gaussian-splatting dataset export and a tested Brush hand-off on synthetic and
   real data. The window can launch Brush and load its `.ply` into a basic splat
   preview.
@@ -95,6 +97,13 @@ features, and the first-scan checklist.
 - The GPU decoder frees host CPU time but does not shorten a scan, because
   capture waits on USB.
 - Fusion is the largest per-frame cost and grows with model size.
+- The full loop-closure rebuild is the accuracy path, but on the 120-frame room
+  capture it re-fuses the whole room into one volume and takes minutes.
+  Incremental and online correction keep it interactive at the cost of rigid
+  submap moves.
+- Frozen-map localisation is CPU-bound; a 2.2M-vertex prior at 6 cm runs at about
+  1.5 s per frame after startup. Repetitive rooms can also be ambiguous from the
+  first view, so the prior needs a distinctive starting area.
 - A recognisable real Brush result still needs a cleaner capture or longer,
   higher-resolution training.
 
@@ -109,11 +118,12 @@ depth frame from USB
   -> odometry          pose relative to the last frame, local keyframe map
   -> global search     optional 4-DOF fallback when ICP loses the basin
   -> TSDF fusion       integrate into a voxel-hashed volume, optionally chunked
-  -> loop closure      keyframe or submap graph, online or end-of-scan
+  -> submap budget     finish on frames or metres, odometry stays continuous
+  -> loop closure      sparse keyframe or submap graph, optional worker
   -> mesh extraction   surface nets, then PLY / OBJ / glTF / GLB
   -> optional colour   register views, paint the mesh or atlas
   -> optional dataset  posed images, masks, and init.ply for a trainer
-  -> optional localize frozen prior map, trajectory only, no new TSDF
+  -> optional localize frozen prior map or live sensor, trajectory only
 ```
 
 Read [How it works](docs/how-it-works.md) for tracking, fusion, mesh extraction,

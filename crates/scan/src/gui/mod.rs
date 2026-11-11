@@ -116,6 +116,8 @@ struct UiConfig {
     loop_global: bool,
     match_score: f32,
     submap_graph: bool,
+    submap_max_frames: usize,
+    submap_max_translation: f32,
     graph_worker: bool,
     frame_to_model: bool,
     submaps: bool,
@@ -146,6 +148,8 @@ impl UiConfig {
             loop_global: options.loop_global,
             match_score: options.match_score,
             submap_graph: options.submap_graph,
+            submap_max_frames: options.submap_max_frames,
+            submap_max_translation: options.submap_max_translation,
             graph_worker: options.graph_worker,
             frame_to_model: options.frame_to_model,
             submaps: options.submaps,
@@ -376,6 +380,8 @@ impl ScannerApp {
         options.loop_global = self.config.loop_global;
         options.match_score = self.config.match_score;
         options.submap_graph = self.config.submap_graph;
+        options.submap_max_frames = self.config.submap_max_frames;
+        options.submap_max_translation = self.config.submap_max_translation;
         options.graph_worker = self.config.graph_worker;
         if options.online_loops
             || options.loop_worker
@@ -391,7 +397,6 @@ impl ScannerApp {
             options.relocalize = true;
         }
         if options.graph_worker {
-            options.submap_graph = true;
             options.online_loops = true;
         }
         options.frame_to_model = self.config.frame_to_model;
@@ -708,6 +713,22 @@ impl ScannerApp {
 
                     ui.label("Submaps");
                     ui.checkbox(&mut self.config.submaps, "restart when tracking is lost");
+                    ui.end_row();
+
+                    ui.label("Submap frames");
+                    ui.add(
+                        egui::DragValue::new(&mut self.config.submap_max_frames)
+                            .range(0..=500)
+                            .speed(1.0),
+                    );
+                    ui.end_row();
+
+                    ui.label("Submap metres");
+                    ui.add(
+                        egui::DragValue::new(&mut self.config.submap_max_translation)
+                            .range(0.0..=20.0)
+                            .speed(0.1),
+                    );
                     ui.end_row();
 
                     ui.label("GPU decode");

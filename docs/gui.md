@@ -51,16 +51,17 @@ the picker.
 Controls frames, voxel size, colour and its mode, colour-depth tolerance,
 filters, fusion filtering and TSDF chunking, loop closure and its
 online/worker/incremental variants, the global-search fallbacks, the likelihood
-gate, submap-graph and graph-worker modes, frame-to-model, submaps, GPU decode,
-mirror, preview interval, playback rate, the output path, and the optional
-dataset directory.
+gate, submap-graph and graph-worker modes, submap frame/metre budgets,
+frame-to-model, submaps, GPU decode, mirror, preview interval, playback rate,
+the output path, and the optional dataset directory.
 
 The dependent modes imply loop closure, as they do on the command line: ticking
 **Online loops**, **Loop worker**, **Incremental**, **Global loops**,
 **Submap graph**, or **Graph worker** turns correction on rather than silently
-doing nothing. **Graph worker** also enables the submap graph and online loops.
-**Global relocalize** implies relocalisation. A non-zero **Match score** enables
-the loop likelihood gate.
+doing nothing. **Graph worker** enables online loops but does not force the
+submap graph; it solves whichever graph is selected. **Global relocalize**
+implies relocalisation. A non-zero **Match score** enables the loop likelihood
+gate.
 
 The output extension selects the mesh format exactly as it does on the command
 line. See [Command line](cli.md#output-format).

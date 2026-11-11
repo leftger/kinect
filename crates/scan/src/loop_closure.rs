@@ -218,11 +218,14 @@ impl Default for LoopClosureConfig {
         Self {
             search_radius: 1.5,
             min_index_gap: 40,
-            keyframe_min_translation: 0.02,
-            keyframe_min_rotation: 0.05,
-            keyframe_max_interval: 5,
-            max_candidates: 3,
-            working_memory_keyframes: 80,
+            // Five centimetres is a real keyframe on a handheld depth scan. Two
+            // centimetres produced ~90 nodes and ~280 ICP verifications over the
+            // 120-frame room capture, for two accepted loops.
+            keyframe_min_translation: 0.05,
+            keyframe_min_rotation: 0.10,
+            keyframe_max_interval: 10,
+            max_candidates: 2,
+            working_memory_keyframes: 60,
             long_term_decimation: 2,
             appearance_min_similarity: 0.78,
             min_inlier_ratio: 0.5,

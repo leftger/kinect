@@ -27,6 +27,40 @@ capture fused 120/120 frames in one submap, found one verified revisit, and
 applied a 10.9 cm maximum correction. See
 [Datasets and splats](datasets.md#real-closed-loop-capture).
 
+## Loop closure and localisation
+
+Release build, 120-frame `out/closed-loop.k2df` (512x424, 299 MB). Wall clock
+includes reading the recording and writing an 89 MB mesh, so compare rows rather
+than the absolute baseline.
+
+| Path | Wall | Result |
+| --- | --- | --- |
+| replay, no loop closure | 43.4 s | 11 tracking submaps |
+| full graph, old 2 cm keyframes | 326.7 s | 93 keyframes, 2 loops |
+| full graph, 5 cm keyframes | 186.0 s | 69 keyframes, 2 loops |
+| incremental correction | 150.6 s | 2 loops, cached surfaces moved |
+| online loops + loop worker + incremental | 158.2 s | 2 loops applied during the scan |
+| submap graph + incremental | 148.6 s | 11 submap nodes |
+| keyframe graph worker + incremental | 205.6 s | 68 keyframes |
+| proactive 30-frame submaps + graph worker | 223.9 s | 11 submap nodes |
+| fusion filter + 40-frame chunks | 64.9 s | 113/120 fused |
+| relocalise + global search | 85.5 s | 10 tracking submaps |
+| loop global search fallback | 526.0 s | 2 loops; not a default |
+| likelihood gate 0.45 | 228.7 s | 2 loops |
+
+The old keyframe policy created a node every 2 cm and spent ICP on three
+candidates per frame: 93 nodes and roughly 280 verifications for two accepted
+loops. The shipped defaults use 5 cm / 0.10 rad, a 10-frame forced interval, and
+two candidates. That cut the full run by 43% with the same two loops. The
+`--loop-global` fallback is deliberately opt-in: when ICP fails, the
+branch-and-bound search is much more expensive than the rest of the frame.
+
+Localisation against `out/closed-loop.ply` (2.24M vertices, 6 cm prior) took
+47.7 s for 30 frames: 23 located, 6 after a global search. The first frame is
+ambiguous in a repetitive room; the global fallback recovers most later frames.
+A live session uses ICP from the previous pose first and only pays for the
+cached grid when tracking is lost.
+
 ## The colour-stream discovery
 
 The capture rate used to be capped by the colour stream. The capture loop read

@@ -337,12 +337,8 @@ impl Ord for SearchNode {
     }
 }
 
-/// Search for the yaw-plus-translation correction that best explains `source`
-/// under `prior`, scored against `target`.
-///
-/// Returns `None` when the grid cannot be built, the query is too small, or the
-/// best score is below `min_score`. The caller is expected to refine the result
-/// with ICP and apply its own verification gates.
+/// Build a grid from `target`, then search. Use [`search_with_grid`] to reuse a
+/// grid across frames or repeated verifications.
 pub fn search(
     target: &[Vector3<f32>],
     source: &[Vector3<f32>],
@@ -350,6 +346,21 @@ pub fn search(
     params: &GlobalSearchParams,
 ) -> Option<GlobalMatch> {
     let grid = ScoreGrid::build(target, params)?;
+    search_with_grid(&grid, source, prior, params)
+}
+
+/// Search against an already-built grid.
+///
+/// The grid depends only on the target surface and the search parameters, so a
+/// caller that localises many frames against one frozen map should build it
+/// once. Rebuilding it per frame is the difference between milliseconds and
+/// minutes on a room-sized prior.
+pub fn search_with_grid(
+    grid: &ScoreGrid,
+    source: &[Vector3<f32>],
+    prior: Isometry3<f32>,
+    params: &GlobalSearchParams,
+) -> Option<GlobalMatch> {
     let query = sample(source, params.max_points);
     if query.len() < 8 {
         return None;
@@ -365,7 +376,7 @@ pub fn search(
     for step in -coarse_steps..=coarse_steps {
         let yaw = step as f32 * params.yaw_step;
         let yawed = yaw_query(&query, &prior, yaw);
-        let (offset, score) = branch_and_bound(&grid, &yawed, params);
+        let (offset, score) = branch_and_bound(grid, &yawed, params);
         if score > best.score {
             best.score = score;
             best.transform = yaw_transform(&prior, yaw, offset);
@@ -380,7 +391,7 @@ pub fn search(
     for step in -5..=5 {
         let yaw = best_yaw + step as f32 * fine_step;
         let yawed = yaw_query(&query, &prior, yaw);
-        let (offset, score) = branch_and_bound(&grid, &yawed, params);
+        let (offset, score) = branch_and_bound(grid, &yawed, params);
         if score > best.score {
             best.score = score;
             best.transform = yaw_transform(&prior, yaw, offset);

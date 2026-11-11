@@ -20,7 +20,7 @@
 //!
 //! and the optimiser minimises the weighted sum of `|e_ij|^2`.
 //!
-//! # Two deliberate simplifications
+//! # The residual approximation
 //!
 //! **The residual is not the exact SE(3) log map.** It stacks the translation and
 //! the rotation vector rather than applying the coupling `V^-1` factor. The
@@ -28,12 +28,15 @@
 //! ends up, and it removes the small-angle special cases that are easy to get
 //! subtly wrong.
 //!
-//! **The Jacobians are numerical, not analytic.** A finite-difference Jacobian
-//! over six perturbation directions per edge is a few thousand small matrix
-//! products per iteration at the sizes this scanner produces, which is
-//! milliseconds -- and it cannot silently disagree with the residual the way a
-//! hand-derived Jacobian can. If the graph ever grows past a few hundred
-//! keyframes, this and the dense solve below are the two things to revisit.
+//! # Sparse normal equations
+//!
+//! The Jacobians are analytic 6x6 blocks. Each edge touches only two nodes, so
+//! the normal equations are assembled as a block-sparse system and solved with
+//! block-SSOR-preconditioned conjugate gradients. A long scan therefore does not
+//! allocate an `(6N x 6N)` dense matrix, and the per-edge work is a handful of
+//! fixed-size products. The rotation blocks use the first-order SO(3) Jacobian,
+//! consistent with the small residuals a verified graph converges to; a
+//! finite-difference Jacobian remains in the tests as a cross-check.
 //!
 //! # What makes it safe
 //!
@@ -42,7 +45,8 @@
 //! (see the scanner: ICP fitness thresholds). On top of that, a Huber kernel here
 //! stops any one edge that survives verification from dominating.
 
-use nalgebra::{DMatrix, Isometry3, Matrix6, Translation3, UnitQuaternion, Vector3, Vector6};
+use nalgebra::{Isometry3, Matrix3, Matrix6, Translation3, UnitQuaternion, Vector3, Vector6};
+use std::collections::HashMap;
 
 /// An observed relative pose between two nodes.
 #[derive(Clone, Copy, Debug)]
@@ -68,8 +72,10 @@ pub struct PoseGraphParams {
     /// Levenberg damping, so the normal equations stay solvable when the graph is
     /// weakly constrained.
     pub damping: f32,
-    /// Step used for the finite-difference Jacobian.
-    pub finite_difference_step: f32,
+    /// Relative residual tolerance for the sparse conjugate-gradient solve.
+    pub cg_tolerance: f32,
+    /// Cap on conjugate-gradient iterations per Gauss-Newton step.
+    pub cg_max_iterations: usize,
 }
 
 impl Default for PoseGraphParams {
@@ -81,7 +87,8 @@ impl Default for PoseGraphParams {
             // correction to follow.
             robust_delta: 0.5,
             damping: 1e-6,
-            finite_difference_step: 1e-5,
+            cg_tolerance: 1e-8,
+            cg_max_iterations: 200,
         }
     }
 }
@@ -92,6 +99,8 @@ pub struct OptimizationReport {
     pub cost_after: f64,
     pub iterations: usize,
     pub converged: bool,
+    /// Total conjugate-gradient iterations spent across all Gauss-Newton steps.
+    pub linear_solver_iterations: usize,
 }
 
 /// A trajectory of poses plus the measurements that constrain them.
@@ -193,24 +202,28 @@ impl PoseGraph {
                 cost_after: cost_before,
                 iterations: 0,
                 converged: true,
+                linear_solver_iterations: 0,
             };
         }
 
         // Node 0 is the anchor. The cost is invariant to a global rigid motion of
         // the whole trajectory, so without fixing something the normal equations
         // are singular in six directions and the solve is arbitrary.
-        let dimension = 6 * node_count;
         let mut converged = false;
         let mut iterations = 0;
+        let mut linear_solver_iterations = 0;
 
         for iteration in 0..params.iterations {
             iterations = iteration + 1;
 
-            let mut hessian = DMatrix::<f32>::zeros(dimension, dimension);
-            let mut gradient = DMatrix::<f32>::zeros(dimension, 1);
+            // Block-sparse normal equations: one 6x6 block per (row node,
+            // column node). An edge touches only two nodes, so the assembly is
+            // linear in the edge count and never allocates an N x N matrix.
+            let mut blocks: Vec<HashMap<usize, Matrix6<f32>>> = vec![HashMap::new(); node_count];
+            let mut gradient = vec![Vector6::<f32>::zeros(); node_count];
 
             for edge in &self.edges {
-                let (j_from, j_to, error) = self.linearise(edge, params.finite_difference_step);
+                let (j_from, j_to, error) = self.linearise(edge);
 
                 // Huber: quadratic near zero, linear in the tails, so one edge that
                 // survived verification but is still wrong cannot drag the map.
@@ -220,55 +233,40 @@ impl PoseGraph {
                     weight *= params.robust_delta / norm;
                 }
 
-                let i = 6 * edge.from;
-                let j = 6 * edge.to;
+                let h_ff = weight * (j_from.transpose() * j_from);
+                let h_ft = weight * (j_from.transpose() * j_to);
+                let h_tf = weight * (j_to.transpose() * j_from);
+                let h_tt = weight * (j_to.transpose() * j_to);
 
-                for a in 0..6 {
-                    for k in 0..6 {
-                        gradient[(i + k, 0)] += weight * j_from[(a, k)] * error[a];
-                        gradient[(j + k, 0)] += weight * j_to[(a, k)] * error[a];
+                add_block(&mut blocks, edge.from, edge.from, h_ff);
+                add_block(&mut blocks, edge.from, edge.to, h_ft);
+                add_block(&mut blocks, edge.to, edge.from, h_tf);
+                add_block(&mut blocks, edge.to, edge.to, h_tt);
 
-                        for l in 0..6 {
-                            hessian[(i + k, i + l)] += weight * j_from[(a, k)] * j_from[(a, l)];
-                            hessian[(i + k, j + l)] += weight * j_from[(a, k)] * j_to[(a, l)];
-                            hessian[(j + k, i + l)] += weight * j_to[(a, k)] * j_from[(a, l)];
-                            hessian[(j + k, j + l)] += weight * j_to[(a, k)] * j_to[(a, l)];
-                        }
-                    }
-                }
+                gradient[edge.from] += weight * (j_from.transpose() * error);
+                gradient[edge.to] += weight * (j_to.transpose() * error);
             }
 
-            for k in 0..dimension {
-                hessian[(k, k)] += params.damping;
+            for node in 1..node_count {
+                add_block(
+                    &mut blocks,
+                    node,
+                    node,
+                    params.damping * Matrix6::<f32>::identity(),
+                );
             }
+            gradient[0] = Vector6::zeros();
 
-            // Pin node 0: zero its row and column, unit diagonal, zero gradient.
-            for k in 0..6 {
-                for l in 0..dimension {
-                    hessian[(k, l)] = 0.0;
-                    hessian[(l, k)] = 0.0;
-                }
-            }
-            for k in 0..6 {
-                hessian[(k, k)] = 1.0;
-                gradient[(k, 0)] = 0.0;
-            }
-
-            let Some(step) = hessian.lu().solve(&(-gradient)) else {
-                break;
-            };
+            let (step, cg_iterations) = sparse_solve(&blocks, &gradient, params);
+            linear_solver_iterations += cg_iterations;
 
             let mut largest_update = 0.0f32;
-            for node in 1..node_count {
-                let mut translation = Vector3::zeros();
-                let mut rotation = Vector3::zeros();
-                for k in 0..3 {
-                    translation[k] = step[(6 * node + k, 0)];
-                    rotation[k] = step[(6 * node + 3 + k, 0)];
-                }
+            for (node, delta) in step.iter().enumerate().skip(1) {
+                let translation = Vector3::new(delta[0], delta[1], delta[2]);
+                let rotation = Vector3::new(delta[3], delta[4], delta[5]);
 
                 // Right-multiply: the increment is expressed in the node's own
-                // frame, which is what the numerical Jacobian perturbed.
+                // frame, which is what the Jacobian perturbed.
                 self.nodes[node] *= Isometry3::from_parts(
                     Translation3::from(translation),
                     UnitQuaternion::from_scaled_axis(rotation),
@@ -288,12 +286,57 @@ impl PoseGraph {
             cost_after: self.cost(),
             iterations,
             converged,
+            linear_solver_iterations,
         }
     }
 
-    /// Jacobians of one edge's residual with respect to its two nodes, by central
-    /// differences. Columns are the six perturbation directions of that node.
-    fn linearise(&self, edge: &Edge, step: f32) -> (Matrix6<f32>, Matrix6<f32>, Vector6<f32>) {
+    /// Analytic Jacobians of one edge's residual with respect to its two nodes.
+    ///
+    /// The perturbation is right-multiplied on each node, matching the update in
+    /// `optimize`. The rotation blocks use the first-order SO(3) Jacobian, which
+    /// is accurate where a verified graph converges; the tests compare this
+    /// against central differences.
+    fn linearise(&self, edge: &Edge) -> (Matrix6<f32>, Matrix6<f32>, Vector6<f32>) {
+        let from = self.nodes[edge.from];
+        let to = self.nodes[edge.to];
+        let relative = from.inverse() * to;
+        let error_pose = edge.measurement.inverse() * relative;
+        let error = error_vector(&error_pose);
+
+        let t = error_pose.translation.vector;
+        let r = error_pose.rotation.scaled_axis();
+
+        // Left and right first-order SO(3) Jacobian inverses.
+        let j_left_rot = Matrix3::<f32>::identity() + 0.5 * skew(&r);
+        let j_right_rot = Matrix3::<f32>::identity() - 0.5 * skew(&r);
+
+        let mut j_left = Matrix6::<f32>::zeros();
+        j_left
+            .fixed_view_mut::<3, 3>(0, 0)
+            .copy_from(&Matrix3::<f32>::identity());
+        j_left.fixed_view_mut::<3, 3>(0, 3).copy_from(&(-skew(&t)));
+        j_left.fixed_view_mut::<3, 3>(3, 3).copy_from(&j_left_rot);
+
+        let rotation = error_pose.rotation.to_rotation_matrix();
+        let mut j_right = Matrix6::<f32>::zeros();
+        j_right
+            .fixed_view_mut::<3, 3>(0, 0)
+            .copy_from(rotation.matrix());
+        j_right.fixed_view_mut::<3, 3>(3, 3).copy_from(&j_right_rot);
+
+        // The residual lives in the measurement frame, so a perturbation of the
+        // "from" node is conjugated by the measurement's inverse adjoint.
+        let j_from = -(j_left * adjoint_inverse(&edge.measurement));
+        (j_from, j_right, error)
+    }
+
+    /// Finite-difference Jacobians, retained as the analytic check in tests.
+    #[cfg(test)]
+    fn linearise_finite(
+        &self,
+        edge: &Edge,
+        step: f32,
+    ) -> (Matrix6<f32>, Matrix6<f32>, Vector6<f32>) {
         let from = self.nodes[edge.from];
         let to = self.nodes[edge.to];
         let base = error_between(&edge.measurement, &from, &to);
@@ -318,18 +361,175 @@ impl PoseGraph {
     }
 }
 
-/// Residual of the edge `measurement` under the two poses given.
-#[inline]
-fn error_between(
-    measurement: &Isometry3<f32>,
-    from: &Isometry3<f32>,
-    to: &Isometry3<f32>,
-) -> Vector6<f32> {
-    let error = measurement.inverse() * (from.inverse() * to);
+fn add_block(
+    blocks: &mut [HashMap<usize, Matrix6<f32>>],
+    row: usize,
+    column: usize,
+    block: Matrix6<f32>,
+) {
+    *blocks[row]
+        .entry(column)
+        .or_insert_with(Matrix6::<f32>::zeros) += block;
+}
 
+fn matvec(blocks: &[HashMap<usize, Matrix6<f32>>], vector: &[Vector6<f32>]) -> Vec<Vector6<f32>> {
+    let mut result = vec![Vector6::<f32>::zeros(); vector.len()];
+    for row in 1..vector.len() {
+        let mut sum = Vector6::<f32>::zeros();
+        for (column, block) in &blocks[row] {
+            if *column == 0 {
+                continue;
+            }
+            sum += block * vector[*column];
+        }
+        result[row] = sum;
+    }
+    result
+}
+
+fn precondition(
+    blocks: &[HashMap<usize, Matrix6<f32>>],
+    diagonal: &[Matrix6<f32>],
+    diagonal_inverse: &[Matrix6<f32>],
+    residual: &[Vector6<f32>],
+) -> Vec<Vector6<f32>> {
+    let nodes = residual.len();
+    let mut forward = vec![Vector6::<f32>::zeros(); nodes];
+
+    // Block forward substitution: (D + L) y = r.
+    for row in 1..nodes {
+        let mut sum = residual[row];
+        for (column, block) in &blocks[row] {
+            if *column < row && *column != 0 {
+                sum -= block * forward[*column];
+            }
+        }
+        forward[row] = diagonal_inverse[row] * sum;
+    }
+
+    // Scale by D, then block backward substitution: (D + L)^T z = D y.
+    let mut scaled = vec![Vector6::<f32>::zeros(); nodes];
+    for row in 1..nodes {
+        scaled[row] = diagonal[row] * forward[row];
+    }
+    let mut result = vec![Vector6::<f32>::zeros(); nodes];
+    for row in (1..nodes).rev() {
+        let mut sum = scaled[row];
+        for (column, block) in &blocks[row] {
+            if *column > row {
+                sum -= block.transpose() * result[*column];
+            }
+        }
+        result[row] = diagonal_inverse[row] * sum;
+    }
+    result
+}
+
+fn dot(left: &[Vector6<f32>], right: &[Vector6<f32>]) -> f32 {
+    left.iter()
+        .zip(right)
+        .map(|(left, right)| left.dot(right))
+        .sum()
+}
+
+/// Block-SSOR-preconditioned conjugate gradients over the block-sparse normal
+/// equations. Node 0 is the anchor, so its row and column are skipped.
+fn sparse_solve(
+    blocks: &[HashMap<usize, Matrix6<f32>>],
+    gradient: &[Vector6<f32>],
+    params: &PoseGraphParams,
+) -> (Vec<Vector6<f32>>, usize) {
+    let nodes = blocks.len();
+    let mut step = vec![Vector6::<f32>::zeros(); nodes];
+    if nodes <= 1 {
+        return (step, 0);
+    }
+
+    let diagonal: Vec<Matrix6<f32>> = (0..nodes)
+        .map(|node| {
+            blocks[node]
+                .get(&node)
+                .copied()
+                .unwrap_or_else(Matrix6::<f32>::identity)
+        })
+        .collect();
+    let diagonal_inverse: Vec<Matrix6<f32>> = diagonal
+        .iter()
+        .map(|block| block.try_inverse().unwrap_or_else(Matrix6::<f32>::identity))
+        .collect();
+
+    let mut residual: Vec<Vector6<f32>> = gradient.iter().map(|value| -*value).collect();
+    residual[0] = Vector6::zeros();
+    let mut preconditioned = precondition(blocks, &diagonal, &diagonal_inverse, &residual);
+    let mut direction = preconditioned.clone();
+    let mut rz = dot(&residual, &preconditioned);
+    let initial_norm = dot(&residual, &residual).sqrt();
+
+    if initial_norm <= params.cg_tolerance {
+        return (step, 0);
+    }
+
+    let mut iterations = 0;
+    for _ in 0..params.cg_max_iterations {
+        iterations += 1;
+        let applied = matvec(blocks, &direction);
+        let denominator = dot(&direction, &applied);
+        if !denominator.is_finite() || denominator <= 0.0 {
+            break;
+        }
+
+        let alpha = rz / denominator;
+        for node in 1..nodes {
+            step[node] += alpha * direction[node];
+            residual[node] -= alpha * applied[node];
+        }
+
+        if dot(&residual, &residual).sqrt() <= params.cg_tolerance * initial_norm.max(1.0) {
+            break;
+        }
+
+        preconditioned = precondition(blocks, &diagonal, &diagonal_inverse, &residual);
+        let next_rz = dot(&residual, &preconditioned);
+        if !next_rz.is_finite() || next_rz <= 0.0 {
+            break;
+        }
+        let beta = next_rz / rz;
+        for node in 1..nodes {
+            direction[node] = preconditioned[node] + beta * direction[node];
+        }
+        rz = next_rz;
+    }
+
+    (step, iterations)
+}
+
+#[inline]
+fn skew(vector: &Vector3<f32>) -> Matrix3<f32> {
+    Matrix3::new(
+        0.0, -vector.z, vector.y, vector.z, 0.0, -vector.x, -vector.y, vector.x, 0.0,
+    )
+}
+
+/// Adjoint of the inverse of a rigid transform, mapping a twist in the
+/// transform's child frame into the parent frame.
+fn adjoint_inverse(transform: &Isometry3<f32>) -> Matrix6<f32> {
+    let rotation = transform.rotation.to_rotation_matrix();
+    let rotation_t = rotation.matrix().transpose();
+    let translation = transform.translation.vector;
+
+    let mut adjoint = Matrix6::<f32>::zeros();
+    adjoint.fixed_view_mut::<3, 3>(0, 0).copy_from(&rotation_t);
+    adjoint
+        .fixed_view_mut::<3, 3>(0, 3)
+        .copy_from(&(-rotation_t * skew(&translation)));
+    adjoint.fixed_view_mut::<3, 3>(3, 3).copy_from(&rotation_t);
+    adjoint
+}
+
+#[inline]
+fn error_vector(error: &Isometry3<f32>) -> Vector6<f32> {
     let translation = error.translation.vector;
     let rotation = error.rotation.scaled_axis();
-
     Vector6::new(
         translation.x,
         translation.y,
@@ -340,8 +540,20 @@ fn error_between(
     )
 }
 
+/// Residual of the edge `measurement` under the two poses given.
+#[inline]
+fn error_between(
+    measurement: &Isometry3<f32>,
+    from: &Isometry3<f32>,
+    to: &Isometry3<f32>,
+) -> Vector6<f32> {
+    error_vector(&(measurement.inverse() * (from.inverse() * to)))
+}
+
 /// A unit-magnitude twist: translation for the first three directions, rotation
-/// for the last three. This is the basis the perturbations live in.
+/// for the last three. This is the basis the finite-difference test perturbation
+/// lives in.
+#[cfg(test)]
 #[inline]
 fn twist(index: usize, magnitude: f32) -> Isometry3<f32> {
     let mut translation = Vector3::zeros();
@@ -515,5 +727,81 @@ mod tests {
         let report = graph.optimize(&PoseGraphParams::default());
         assert_eq!(report.iterations, 0);
         assert_eq!(report.cost_after, 0.0);
+    }
+
+    #[test]
+    fn analytic_jacobians_match_finite_differences() {
+        let from = Isometry3::from_parts(
+            Translation3::new(0.3, -0.2, 0.1),
+            UnitQuaternion::from_euler_angles(0.2, -0.1, 0.15),
+        );
+        let to = Isometry3::from_parts(
+            Translation3::new(1.1, 0.4, -0.2),
+            UnitQuaternion::from_euler_angles(-0.1, 0.25, 0.05),
+        );
+        let truth = from.inverse() * to;
+        let measurement = truth
+            * Isometry3::from_parts(
+                Translation3::new(0.01, -0.005, 0.02),
+                UnitQuaternion::from_scaled_axis(Vector3::new(0.01, -0.02, 0.015)),
+            );
+
+        let mut graph = PoseGraph::new(from);
+        graph.add_node(to);
+        graph.add_edge(0, 1, measurement, 1.0);
+        let edge = graph.edges()[0];
+
+        let (analytic_from, analytic_to, _) = graph.linearise(&edge);
+        let (finite_from, finite_to, _) = graph.linearise_finite(&edge, 1e-5);
+
+        for row in 0..6 {
+            for column in 0..6 {
+                let from_difference =
+                    (analytic_from[(row, column)] - finite_from[(row, column)]).abs();
+                let to_difference = (analytic_to[(row, column)] - finite_to[(row, column)]).abs();
+                assert!(
+                    from_difference < 0.05,
+                    "from Jacobian ({row},{column}) differs by {from_difference}: {} vs {}",
+                    analytic_from[(row, column)],
+                    finite_from[(row, column)]
+                );
+                assert!(
+                    to_difference < 0.05,
+                    "to Jacobian ({row},{column}) differs by {to_difference}: {} vs {}",
+                    analytic_to[(row, column)],
+                    finite_to[(row, column)]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_long_chain_uses_the_sparse_solver() {
+        let mut graph = PoseGraph::new(Isometry3::identity());
+        let mut pose = Isometry3::identity();
+        let step = translate(0.1, 0.002);
+        for _ in 0..120 {
+            pose *= step;
+            graph.add_node(pose);
+        }
+        for index in 0..120 {
+            graph.add_edge(index, index + 1, step, 1.0);
+        }
+        // The chain has accumulated 0.24 m of lateral drift; the loop says the
+        // return is straight, so the graph has to redistribute it.
+        graph.add_edge(120, 0, translate(-12.0, 0.0), 1.0);
+
+        // A deliberately small budget keeps this a solver regression test rather
+        // than a benchmark. The full default budget is exercised by the real
+        // scans, where the graph is much shorter.
+        let report = graph.optimize(&PoseGraphParams {
+            iterations: 8,
+            convergence_epsilon: 1e-4,
+            cg_tolerance: 1e-6,
+            cg_max_iterations: 60,
+            ..PoseGraphParams::default()
+        });
+        assert!(report.cost_after < report.cost_before);
+        assert!(report.linear_solver_iterations > 0);
     }
 }

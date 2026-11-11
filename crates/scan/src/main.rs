@@ -156,7 +156,11 @@ struct Options {
     match_score: f32,
     /// Optimise submap nodes instead of keyframe nodes.
     submap_graph: bool,
-    /// Run the online submap-graph solve on a worker thread.
+    /// Finish a tracking submap after this many fused frames. Zero disables.
+    submap_max_frames: usize,
+    /// Finish a tracking submap after this much camera motion. Zero disables.
+    submap_max_translation: f32,
+    /// Run the online pose-graph solve on a worker thread.
     graph_worker: bool,
     /// Export a Nerfstudio dataset for a Gaussian-splatting trainer: the colour
     /// views, their masks, `transforms.json`, and an initial point cloud.
@@ -165,6 +169,8 @@ struct Options {
     dataset: Option<PathBuf>,
     /// Prior point cloud for `localize`, as ASCII or binary little-endian PLY.
     map: Option<PathBuf>,
+    /// `localize`: use the live sensor instead of a recording.
+    localize_live: bool,
 }
 
 impl Default for Options {
@@ -201,9 +207,12 @@ impl Default for Options {
             loop_global: false,
             match_score: 0.0,
             submap_graph: false,
+            submap_max_frames: 0,
+            submap_max_translation: 0.0,
             graph_worker: false,
             dataset: None,
             map: None,
+            localize_live: false,
         }
     }
 }
@@ -229,7 +238,7 @@ async fn run() -> Result<(), Box<dyn Error>> {
         Command::Live => live(&options).await,
         Command::Record => record(&options).await,
         Command::Replay => replay(&options),
-        Command::Localize => localize(&options),
+        Command::Localize => localize(&options).await,
         Command::Synth => synth(&options),
         Command::Help => {
             print_usage();
@@ -268,6 +277,7 @@ fn parse_args(
             "--out" => options.out = Some(PathBuf::from(next_value(&mut args, "--out")?)),
             "--in" => options.input = Some(PathBuf::from(next_value(&mut args, "--in")?)),
             "--map" => options.map = Some(PathBuf::from(next_value(&mut args, "--map")?)),
+            "--live" => options.localize_live = true,
             "--voxel" => {
                 let voxel: f32 = next_value(&mut args, "--voxel")?.parse()?;
                 if !(voxel > 0.0) {
@@ -359,9 +369,18 @@ fn parse_args(
                 options.submap_graph = true;
                 options.loop_closure = true;
             }
+            "--submap-frames" => {
+                options.submap_max_frames = next_value(&mut args, "--submap-frames")?.parse()?;
+            }
+            "--submap-metres" => {
+                let metres: f32 = next_value(&mut args, "--submap-metres")?.parse()?;
+                if !(metres.is_finite() && metres >= 0.0) {
+                    return Err("--submap-metres must be zero or positive".into());
+                }
+                options.submap_max_translation = metres;
+            }
             "--graph-worker" => {
                 options.graph_worker = true;
-                options.submap_graph = true;
                 options.online_loops = true;
                 options.loop_closure = true;
             }
@@ -430,11 +449,19 @@ fn parse_args(
         if options.map.is_none() {
             return Err("`localize` needs --map <prior.ply>".into());
         }
-        if options.input.is_none() {
-            return Err("`localize` needs --in <capture.k2df>".into());
+        match (options.input.is_some(), options.localize_live) {
+            (true, false) | (false, true) => {}
+            (true, true) => {
+                return Err("`localize` accepts --in or --live, not both".into());
+            }
+            (false, false) => {
+                return Err("`localize` needs --in <capture.k2df> or --live".into());
+            }
         }
     } else if options.map.is_some() {
         return Err("--map only applies to `scan localize`".into());
+    } else if options.localize_live {
+        return Err("--live only applies to `scan localize`".into());
     }
 
     // A GUI source is either a sensor, a recording, or the synthetic room.
@@ -493,7 +520,7 @@ fn usage_text() -> String {
          \x20             [--color]\n\
          \x20 scan replay  --in capture.k2df [--out mesh.ply] [--voxel M] [--frames N]\n\
          \x20             [--loop-closure]\n\
-         \x20 scan localize --in capture.k2df --map prior.ply [--frames N]\n\
+         \x20 scan localize (--in capture.k2df | --live) --map prior.ply [--frames N]\n\
          \x20             [--out trajectory.ply]\n\
          \x20 scan synth   --dataset DIR [--frames N] [--out mesh.ply] [--voxel M]\n\
          \n\
@@ -504,7 +531,7 @@ fn usage_text() -> String {
          \x20 live     Capture from the sensor and reconstruct as you go.\n\
          \x20 record   Capture depth frames to a file, for offline tuning.\n\
          \x20 replay   Reconstruct from a recording. Needs no sensor.\n\
-         \x20 localize Localise a recording against a frozen prior map. The map\n\
+         \x20 localize Localise a recording or live sensor against a frozen prior map. The map\n\
          \x20          is never modified; the output is a trajectory.\n\
          \x20 synth    Render the analytic room and write a colour dataset. Needs\n\
          \x20          no sensor or display; the result feeds Brush directly.\n\
@@ -520,7 +547,7 @@ fn usage_text() -> String {
          \x20 --in FILE     Recording to replay. A .k2df file may carry colour\n\
          \x20               or be depth only. With `gui`, preselects replay.\n\
          \x20 --map FILE    `localize`: prior map as ASCII or binary little-endian\n\
-         \x20               PLY. Only the vertex positions are read.\n\
+         \x20               PLY. With --live, use the sensor instead of --in. Only the vertex positions are read.\n\
          \x20 --synthetic   On `gui`: use the analytic room, no sensor needed.\n\
          \x20 --auto-start  On `gui`: start the selected source when the window\n\
          \x20               opens. `live --viewer` does this too.\n\
@@ -638,14 +665,21 @@ fn usage_text() -> String {
          \x20               Implies --loop-closure.\n\
          \x20 --submap-graph\n\
          \x20               Optimise submap nodes rather than keyframe nodes,\n\
-         \x20               A sparse pose-adjustment shape. Smaller\n\
+         \x20               A sparse pose-adjustment shape: smaller,\n\
          \x20               and rigid per submap, so it matches the cached surfaces\n\
          \x20               but cannot deform inside one. Off by default.\n\
          \x20               Implies --loop-closure.\n\
          \x20 --graph-worker\n\
-         \x20               Run the online submap-graph solve on a worker thread,\n\
-         \x20               so capture does not stall behind a dense solve. Implies\n\
-         \x20               --submap-graph and --online-loops.\n\
+         \x20               Run the online pose-graph solve (keyframe or submap)\n\
+         \x20               on a worker thread, so capture does not stall. Implies\n\
+         \x20               --online-loops.\n\
+         \x20 --submap-frames N\n\
+         \x20               Finish a tracking submap after N fused frames. Odometry\n\
+         \x20               continues across the boundary, so the edge is trusted.\n\
+         \x20               Zero disables.\n\
+         \x20 --submap-metres M\n\
+         \x20               Finish a tracking submap once the camera has moved M\n\
+         \x20               metres from its first pose. Zero disables.\n\
          \x20 --no-submaps  Do not start a new submap when a frame cannot be\n\
          \x20               placed in the current one. Submaps are on by default:\n\
          \x20               the boundary keeps the fragments separate instead of\n\
@@ -875,27 +909,26 @@ fn replay(options: &Options) -> Result<(), Box<dyn Error>> {
     finish_scan(&mut scanner, options)
 }
 
-/// Localise a recording against a frozen prior point cloud.
+/// Localise a recording or the live sensor against a frozen prior point cloud.
 ///
 /// This is a pure-localisation mode, reduced to the part a depth
 /// camera can support: the map is fixed, each frame gets a global search for an
 /// initial guess, ICP refines it, and the result is a trajectory. Nothing is
 /// fused, so the prior's accuracy is preserved.
-fn localize(options: &Options) -> Result<(), Box<dyn Error>> {
-    let input = options
-        .input
-        .clone()
-        .ok_or("`localize` needs --in <capture.k2df>")?;
+async fn localize(options: &Options) -> Result<(), Box<dyn Error>> {
     let map_path = options
         .map
         .clone()
         .ok_or("`localize` needs --map <prior.ply>")?;
 
-    let recording = recording::read(&input)?;
     let prior_points = geom::mesh::read_points_ply(&map_path)?;
+    let defaults = FrozenMapParams::default();
     let params = FrozenMapParams {
-        voxel: options.tsdf.voxel_size,
-        ..FrozenMapParams::default()
+        // The map is a prior surface, not a TSDF. A 1 cm `--voxel` would spend
+        // minutes estimating normals over millions of mesh vertices; four
+        // centimetres is plenty for a localisation prior.
+        voxel: options.tsdf.voxel_size.max(defaults.voxel),
+        ..defaults
     };
     let map = FrozenMap::from_points(&prior_points, &params)
         .ok_or("prior map is too small after downsampling")?;
@@ -906,43 +939,64 @@ fn localize(options: &Options) -> Result<(), Box<dyn Error>> {
         map.len(),
         map_path.display()
     );
-    println!(
-        "[localize] {} frames of {}x{} from {}",
-        recording.frames.len(),
-        recording.width,
-        recording.height,
-        input.display()
-    );
 
-    let limit = options.frames.unwrap_or(usize::MAX);
-    let total = limit.min(recording.frames.len());
     let mut pose = Isometry3::identity();
     let mut trajectory = Vec::new();
     let mut located = 0usize;
+    let mut global_hits = 0usize;
+    let total;
 
-    for (index, frame) in recording.frames.iter().take(limit).enumerate() {
-        let image = DepthImage::new(recording.width, recording.height, &frame.depth);
-        let mut points = image.to_points(&recording.intrinsics);
-        points
-            .retain(|point| point.z >= options.tsdf.min_depth && point.z <= options.tsdf.max_depth);
+    if options.localize_live {
+        let frames = options.frames.unwrap_or(DEFAULT_FRAMES);
+        total = frames;
 
-        match map.localize(&points, pose, &params) {
-            Some(found) => {
-                pose = found.pose;
+        let mut capture = capture::Capture::open(options.filters, false, options.gpu).await?;
+        let intrinsics = capture.intrinsics();
+        let (width, height) = capture.dimensions();
+        println!("[localize] live {frames} frames at {width}x{height}");
+
+        for index in 0..frames {
+            let frame = capture.next_frame().await?.to_vec();
+            let image = DepthImage::new(width, height, &frame);
+            let mut points = image.to_points(&intrinsics);
+            points.retain(|point| {
+                point.z >= options.tsdf.min_depth && point.z <= options.tsdf.max_depth
+            });
+            if let Some(global) =
+                localize_cloud(index, &points, &map, &params, &mut pose, &mut trajectory)
+            {
                 located += 1;
-                trajectory.push(pose.translation.vector);
-                println!(
-                    "[localize] {:5} t=({:+.3},{:+.3},{:+.3}) inliers {:.2} rmse {:.3}",
-                    index + 1,
-                    pose.translation.x,
-                    pose.translation.y,
-                    pose.translation.z,
-                    found.inlier_ratio,
-                    found.rmse
-                );
+                global_hits += global as usize;
             }
-            None => {
-                println!("[localize] {:5} lost; keeping the last pose", index + 1);
+        }
+    } else {
+        let input = options
+            .input
+            .clone()
+            .ok_or("`localize` needs --in <capture.k2df> or --live")?;
+        let recording = recording::read(&input)?;
+        println!(
+            "[localize] {} frames of {}x{} from {}",
+            recording.frames.len(),
+            recording.width,
+            recording.height,
+            input.display()
+        );
+
+        let limit = options.frames.unwrap_or(usize::MAX);
+        total = limit.min(recording.frames.len());
+
+        for (index, frame) in recording.frames.iter().take(limit).enumerate() {
+            let image = DepthImage::new(recording.width, recording.height, &frame.depth);
+            let mut points = image.to_points(&recording.intrinsics);
+            points.retain(|point| {
+                point.z >= options.tsdf.min_depth && point.z <= options.tsdf.max_depth
+            });
+            if let Some(global) =
+                localize_cloud(index, &points, &map, &params, &mut pose, &mut trajectory)
+            {
+                located += 1;
+                global_hits += global as usize;
             }
         }
     }
@@ -957,7 +1011,7 @@ fn localize(options: &Options) -> Result<(), Box<dyn Error>> {
     }
 
     println!(
-        "[localize] located {} of {} frames ({:.0}%)",
+        "[localize] located {} of {} frames ({:.0}%, {global_hits} after a global search)",
         located,
         total,
         if total == 0 {
@@ -967,6 +1021,38 @@ fn localize(options: &Options) -> Result<(), Box<dyn Error>> {
         }
     );
     Ok(())
+}
+
+fn localize_cloud(
+    index: usize,
+    points: &[Vector3<f32>],
+    map: &FrozenMap,
+    params: &FrozenMapParams,
+    pose: &mut Isometry3<f32>,
+    trajectory: &mut Vec<Vector3<f32>>,
+) -> Option<bool> {
+    match map.localize(points, *pose, params) {
+        Some(found) => {
+            *pose = found.pose;
+            trajectory.push(pose.translation.vector);
+            let global = found.score > 0.0;
+            println!(
+                "[localize] {:5} t=({:+.3},{:+.3},{:+.3}) inliers {:.2} rmse {:.3}{}",
+                index + 1,
+                pose.translation.x,
+                pose.translation.y,
+                pose.translation.z,
+                found.inlier_ratio,
+                found.rmse,
+                if global { " global" } else { "" }
+            );
+            Some(global)
+        }
+        None => {
+            println!("[localize] {:5} lost; keeping the last pose", index + 1);
+            None
+        }
+    }
 }
 
 /// Build a synthetic coloured capture and write it as a dataset.
@@ -1099,6 +1185,8 @@ fn scanner_config(options: &Options) -> ScannerConfig {
             ..OdometryConfig::default()
         },
         submaps: options.submaps,
+        submap_max_frames: options.submap_max_frames,
+        submap_max_translation: options.submap_max_translation,
         online_loops: options.online_loops,
         incremental_rebuild: options.incremental_rebuild,
         fusion_filter: options.fusion_filter.then(MotionFilterConfig::default),
@@ -1778,6 +1866,10 @@ mod tests {
             "--match-score",
             "0.6",
             "--submap-graph",
+            "--submap-frames",
+            "24",
+            "--submap-metres",
+            "1.5",
             "--graph-worker",
         ]))
         .expect("parse");
@@ -1788,6 +1880,8 @@ mod tests {
         assert!(options.loop_global);
         assert!((options.match_score - 0.6).abs() < 1e-6);
         assert!(options.submap_graph);
+        assert_eq!(options.submap_max_frames, 24);
+        assert!((options.submap_max_translation - 1.5).abs() < 1e-6);
         assert!(options.graph_worker);
         assert!(options.online_loops, "--graph-worker implies online loops");
 
@@ -1796,11 +1890,30 @@ mod tests {
         assert_eq!(config.tsdf_chunk_frames, 40);
         assert!(config.odometry.relocalize_global_search);
         assert!(config.submap_graph);
+        assert_eq!(config.submap_max_frames, 24);
+        assert!((config.submap_max_translation - 1.5).abs() < 1e-6);
         assert!(config.graph_worker);
         assert!(config.online_loops);
         let loops = config.loop_closure.expect("loop config");
         assert!(loops.global_search);
         assert!((loops.min_match_score - 0.6).abs() < 1e-6);
+    }
+
+    #[test]
+    fn graph_worker_uses_the_configured_graph() {
+        let (_, options) = parse_args(words(&["replay", "--in", "capture.k2df", "--graph-worker"]))
+            .expect("parse");
+
+        assert!(options.graph_worker);
+        assert!(
+            !options.submap_graph,
+            "--graph-worker should not force submap nodes"
+        );
+        assert!(options.online_loops);
+
+        let config = scanner_config(&options);
+        assert!(config.graph_worker);
+        assert!(!config.submap_graph, "the keyframe graph is the default");
     }
 
     #[test]
@@ -1826,6 +1939,27 @@ mod tests {
             options.map.as_deref(),
             Some(std::path::Path::new("prior.ply"))
         );
+        assert!(!options.localize_live);
+
+        let (_, options) =
+            parse_args(words(&["localize", "--live", "--map", "prior.ply"])).expect("live parse");
+        assert!(options.localize_live);
+        assert!(options.input.is_none());
+
+        let error = parse_args(words(&[
+            "localize",
+            "--in",
+            "capture.k2df",
+            "--live",
+            "--map",
+            "prior.ply",
+        ]))
+        .expect_err("--in and --live are exclusive");
+        assert!(error.to_string().contains("not both"), "{error}");
+
+        let error = parse_args(words(&["replay", "--in", "capture.k2df", "--live"]))
+            .expect_err("--live only belongs to localize");
+        assert!(error.to_string().contains("--live"), "{error}");
 
         let error = parse_args(words(&[
             "replay",
@@ -1878,8 +2012,11 @@ mod tests {
             "--loop-global",
             "--match-score",
             "--submap-graph",
+            "--submap-frames",
+            "--submap-metres",
             "--graph-worker",
             "--map",
+            "--live",
             "scan localize",
         ] {
             assert!(

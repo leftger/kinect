@@ -86,8 +86,8 @@ Loop closure detects revisits and corrects the model. It is split into
 detection, verification, and correction, following LIO-SAM's keyframe
 factor-graph structure rather than a single align-and-rebuild pass.
 
-1. A new frame becomes a loop keyframe after 2 cm / 3 degrees of motion, or
-   every five frames. Those keyframes are the graph's nodes; ordinary frames are
+1. A new frame becomes a loop keyframe after 5 cm / 0.10 rad of motion, or
+   every ten frames. Those keyframes are the graph's nodes; ordinary frames are
    corrected by interpolating between the keyframes on either side.
 2. Pose proximity proposes nearby keyframes. On colour scans, a compact
    appearance signature (8x8 grayscale plus RGB histogram) can also propose a
@@ -99,8 +99,9 @@ factor-graph structure rather than a single align-and-rebuild pass.
 4. Spatial ICP verifies the candidate. A reverse alignment and round-trip gate
    must also pass.
 5. Accepted edges are weighted by inlier coverage and residual.
-6. A keyframe pose graph optimises keyframe odometry plus loop edges. A submap
-   boundary has no odometry edge, so a loop edge can move the whole submap.
+6. A keyframe pose graph optimises keyframe odometry plus loop edges. A failure
+   boundary has no odometry edge, so a loop edge can move the whole submap. A
+   budget boundary is continuous odometry, so its edge is kept.
 7. If the correction is implausible, the weakest loop is dropped and the graph
    is retried.
 8. The correction is applied online, incrementally, or by a full rebuild.
@@ -120,10 +121,14 @@ adjustment shape. The graph is smaller and a correction moves whole submaps,
 which matches the cached surfaces, but it cannot deform inside one. The keyframe
 graph remains the default accuracy path.
 
-`--graph-worker` runs the online submap-graph solve on a worker thread and
-applies the result before the next frame's world pose is derived. This is the
-local-SLAM/global-SLAM split: capture does not stall behind a
-dense solve. `close_loops` flushes any in-flight job before the final pass.
+`--graph-worker` runs the online pose-graph solve on a worker thread and applies
+the result before the next frame's world pose is derived. It works for either
+graph: keyframe nodes by default, submap nodes with `--submap-graph`. The keyframe
+graph is larger than a submap graph, so the worker returns a correction per
+node; frames captured while the solve was in flight inherit the last correction
+instead of being truncated. This is the local-SLAM/global-SLAM split: capture
+does not stall behind the sparse solve. `close_loops` flushes any in-flight job
+before the final pass.
 
 `--loop-worker` moves only the ICP verification to a worker thread. Keyframe
 selection stays on the capture thread, results are drained each frame, and
@@ -138,7 +143,7 @@ are fast and coherent, but a rigid submap move cannot fix drift *inside* a
 submap. The default full rebuild re-fuses every kept frame at the corrected
 poses, which is the accuracy path.
 
-The loop index has bounded working memory. The most recent 80 keyframes keep
+The loop index has bounded working memory. The most recent 60 keyframes keep
 full-resolution clouds; older signatures keep every second point. When a
 candidate points at an old keyframe, its cloud is rebuilt from retained depth for
 that verification and then dropped again. Telemetry reports loops, attempts,
@@ -163,6 +168,12 @@ The surface stays in the submap's own frame with its world transform beside it,
 so a correction can move it without touching the voxels. `--no-submaps` restores
 the single model and the skipped frames.
 
+`--submap-frames N` and `--submap-metres M` add a planned boundary. Unlike a
+failure boundary, odometry and `world_from_submap` continue unchanged, so the
+edge across it is a real measurement. The finished piece becomes a graph node:
+the keyframe graph keeps the edge, and the submap graph weights it at full
+confidence instead of the 0.1 used for a guess. Both budgets are zero by default.
+
 `--tsdf-chunk N` is a separate, cheaper boundary: every N fused frames the
 active volume is extracted and cached, and a fresh volume starts in the same
 odometry frame. A chunk is not a pose-graph node and adds no boundary guess. It
@@ -171,15 +182,23 @@ bounds the active volume and the fusion cost on a long single-submap scan.
 ## Frozen-map localisation
 
 `scan localize --in capture.k2df --map prior.ply` treats an existing point cloud
-as an immutable map. Each frame gets a 4-DOF global search for an initial pose,
-point-to-plane ICP refines it, and the same inlier and RMSE gates decide whether
-the pose is returned. Nothing is fused and the prior is never modified; the
-output is a trajectory, optionally written as a point cloud of positions.
+as an immutable map. `--live` does the same against the sensor. The prior is
+indexed once and its multi-resolution likelihood grid is cached, so a session
+does not rebuild the grid per frame.
+
+Each frame first runs point-to-plane ICP from the previous pose. That is the
+normal, fast path. Only when ICP fails the inlier and RMSE gates does the cached
+4-DOF global search supply an initial guess for a second ICP pass. Nothing is
+fused and the prior is never modified; the output is a trajectory, optionally
+written as a point cloud of positions. Any exported mesh PLY can be the prior,
+which is what makes a previously scanned room reusable.
 
 The prior reader accepts ASCII and binary little-endian PLY. Only the vertex
-positions are used; colours, normals, and faces are skipped. This is the depth
-camera's version of pure localisation, not a general map
-editor.
+positions are used; colours, normals, and faces are skipped. Non-finite and
+sentinel vertices from unmeshed surface-nets output are discarded before the
+voxel hash, and the map defaults to 6 cm because a mesh prior is denser than it
+needs to be. This is the depth camera's version of pure localisation, not a
+general map editor.
 
 ## Colour
 

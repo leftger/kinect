@@ -9,7 +9,7 @@ generator:
 | `live` | Capture a new scan from the sensor |
 | `record` | Write a `.k2df` recording without reconstructing |
 | `replay` | Reconstruct from a `.k2df` recording |
-| `localize` | Localise a recording against a frozen PLY map |
+| `localize` | Localise a recording or the live sensor against a frozen PLY map |
 | `synth` | Render the analytic room and write a dataset |
 
 Build first:
@@ -28,6 +28,7 @@ scan gui    [--in FILE | --synthetic] [--auto-start] [--frames N]
             [--playback-fps F] [--loop-closure] [--online-loops]
             [--loop-worker] [--loop-window N] [--incremental-rebuild]
             [--loop-global] [--match-score S] [--submap-graph] [--graph-worker]
+            [--submap-frames N] [--submap-metres M]
             [--fusion-filter] [--tsdf-chunk N] [--relocalize]
             [--relocalize-global] [--relocalize-keyframes N] [--no-submaps]
 
@@ -36,6 +37,7 @@ scan live   [--frames N] [--out mesh.ply] [--voxel M] [--no-filter] [--color]
             [--gpu] [--loop-closure] [--online-loops] [--loop-worker]
             [--loop-window N] [--incremental-rebuild] [--loop-global]
             [--match-score S] [--submap-graph] [--graph-worker]
+            [--submap-frames N] [--submap-metres M]
             [--fusion-filter] [--tsdf-chunk N] [--relocalize]
             [--relocalize-global] [--relocalize-keyframes N] [--viewer]
             [--dataset DIR] [--no-submaps]
@@ -47,11 +49,12 @@ scan replay --in capture.k2df [--out mesh.ply] [--voxel M] [--frames N]
             [--loop-closure] [--online-loops] [--loop-worker]
             [--loop-window N] [--incremental-rebuild] [--loop-global]
             [--match-score S] [--submap-graph] [--graph-worker]
+            [--submap-frames N] [--submap-metres M]
             [--fusion-filter] [--tsdf-chunk N] [--relocalize]
             [--relocalize-global] [--relocalize-keyframes N] [--no-submaps]
             [--dataset DIR]
 
-scan localize --in capture.k2df --map prior.ply [--frames N]
+scan localize (--in capture.k2df | --live) --map prior.ply [--frames N]
             [--out trajectory.ply]
 
 scan synth  --dataset DIR [--frames N] [--out mesh.ply] [--voxel M]
@@ -110,21 +113,27 @@ used for a colour dataset.
 
 ### `localize`
 
-Localises a recording against a frozen prior map and writes a trajectory:
+Localises a recording or the live sensor against a frozen prior map and writes
+a trajectory:
 
 ```sh
 scan localize --in capture.k2df --map prior.ply --out trajectory.ply
+scan localize --live --map prior.ply --frames 60
 ```
 
 The prior is a PLY point cloud, ASCII or binary little-endian. Only vertex
-positions are read; colours, normals, and faces are skipped. Each frame gets a
-4-DOF global search for an initial pose, then ICP refines it; the same inlier and
-RMSE gates decide whether a pose is accepted. Nothing is fused and the prior is
-never changed. Without `--out`, the poses are printed only.
+positions are read; colours, normals, and faces are skipped. Non-finite and
+sentinel vertices from mesh PLYs are discarded. The prior is indexed once and
+its global-search grid is cached; each frame first runs ICP from the previous
+pose, and only a failed ICP falls back to the 4-DOF global search. Nothing is
+fused and the prior is never changed. Without `--out`, the poses are printed
+only.
 
-`--frames N` limits how many recording frames are localised. The first frame
-starts from identity, so the recording should begin near the prior map's origin
-or within the global search radius.
+`--frames N` limits how many recording frames or live frames are localised; live
+defaults to 60. The first frame starts from identity, so the recording should
+begin near the prior map's origin or within the global search radius. A room
+with repetitive geometry can be ambiguous from one view; the fallback recovers
+most later frames, but the first pose is the hardest.
 
 ### `synth`
 
@@ -158,8 +167,11 @@ This is the cheapest way to exercise the Brush hand-off.
 | `--loop-global` | Add a 4-DOF branch-and-bound fallback when loop ICP fails; implies `--loop-closure` |
 | `--match-score S` | Minimum mean likelihood for a verified loop, `0..1`; zero disables |
 | `--submap-graph` | Optimise submap nodes instead of keyframe nodes; implies `--loop-closure` |
-| `--graph-worker` | Solve the online submap graph off the capture thread; implies `--submap-graph` and `--online-loops` |
+| `--submap-frames N` | Finish a tracking submap after N fused frames; odometry stays continuous |
+| `--submap-metres M` | Finish a tracking submap after M metres of camera motion |
+| `--graph-worker` | Solve the online pose graph (keyframe or submap) off the capture thread; implies `--online-loops` |
 | `--map FILE` | `localize`: prior map as ASCII or binary little-endian PLY |
+| `--live` | `localize`: use the sensor instead of `--in` |
 | `--no-submaps` | Keep one model and skip unplaceable frames instead of starting a submap |
 | `--gpu` | GPU depth decode; requires `--features wgpu-decode` |
 | `--mirror` | Keep the raw sensor mirror orientation instead of flipping X |
@@ -210,8 +222,13 @@ memory boundary inside one submap, not a new pose boundary.
 
 `--submap-graph` moves whole submaps rigidly. It is cheaper than the keyframe
 graph and matches the cached surfaces, but it cannot deform inside a submap;
-keep the keyframe graph for the accuracy reference. `--graph-worker` only moves
-the online submap solve off the capture thread.
+keep the keyframe graph for the accuracy reference. `--graph-worker` moves the
+online keyframe **or** submap solve off the capture thread. It does not force a
+submap graph.
+
+`--submap-frames N` and `--submap-metres M` add a planned boundary that becomes
+a real graph node. Odometry continues across it, so the edge is trusted; this is
+different from a lost-track boundary, which is a guess. The defaults are zero.
 
 ### Voxel size and memory
 
@@ -259,13 +276,14 @@ source and starts immediately. Closing the window stops the scan and exports it.
 - On colour scans, if none of those verifies, a compact appearance signature
   (8x8 grayscale plus an RGB histogram) can propose a frame outside the pose
   radius. The same spatial ICP still has to accept it.
-- Loop keyframes are thinned to every 2 cm / 3 degrees of motion, with a
-  five-frame fallback, so a submap reset cannot starve the loop index.
+- Loop keyframes are thinned to every 5 cm / 0.10 rad of motion, with a
+  ten-frame fallback, so a submap reset cannot starve the loop index. Two
+  candidates are verified per keyframe.
 - An accepted loop must also align in reverse.
 - Each edge is weighted by inlier coverage and residual.
 - If the pose graph asks for an implausible correction, the weakest loop is
   dropped and the graph is retried.
-- The loop index has bounded working memory. The most recent 80 keyframes keep
+- The loop index has bounded working memory. The most recent 60 keyframes keep
   full-resolution clouds; older signatures keep every second point. A candidate
   that points at an old keyframe rebuilds its cloud from retained depth for that
   verification, then drops the temporary cloud again.

@@ -41,19 +41,20 @@ cargo build --release -p scan --features wgpu-decode
 cargo test -p geom -p scan --features gui
 ```
 
-245 tests, 3 ignored. The geometry is tested against synthetic scenes and known
+250 tests, 3 ignored. The geometry is tested against synthetic scenes and known
 transforms rather than recorded data, so the suite runs without a sensor. The
 loop-closure tests cover the keyframe window, the background worker, online
 correction, and the incremental submap path. The newer geometry tests cover the
 likelihood grid and branch-and-bound search, the PLY point reader, frozen-map
-localisation, motion-filtered fusion, TSDF chunks, submap-node optimisation, and
-the background graph worker.
+localisation, motion-filtered fusion, TSDF chunks, submap-node optimisation, the
+background graph worker, active-submap budgets, and the analytic Jacobian
+cross-check against finite differences.
 
 The window tests are headless too: they exercise the session worker, a synthetic
 scan and its export, the trainer child-process worker, the splat
 loader/renderer, and the software renderer without opening a window.
 
-The non-GUI suite is 220 tests.
+The non-GUI suite is 225 tests.
 
 ### Ignored hardware tests
 
@@ -125,18 +126,18 @@ cp -r /tmp/k1/src /tmp/verify/src
    use for the spare cores, or accept the wall-clock result in
    [Performance](performance.md).
 
-5. **Benchmark the new correction paths on real data.** The tests prove online
-   correction, the background worker, incremental submap moves, global search,
-   the likelihood gate, submap-node optimisation, the graph worker, motion
-   filtering, TSDF chunks, and frozen-map localisation on synthetic scans. They
-   do not yet show which wins on `out/closed-loop.k2df`, or how the 4-DOF search
-   behaves on a rolling or tilted capture: it assumes the scanner is roughly
-   upright and there is no gravity sensor to correct that assumption. Online and
-   incremental moves are rigid per submap, so they cannot remove drift *inside*
-   one; the default full rebuild stays the accuracy reference. The keyframe graph
-   also still uses the dense numerical-Jacobian solve, fine at these node counts
-   but the next thing to replace (sparse linear algebra plus analytic SE(3)
-   Jacobians) before very long scans.
+5. **Extend the matcher and the map, not the solver.** The pose graph now
+   assembles analytic 6x6 blocks and solves them with block-SSOR preconditioned
+   conjugate gradients; the dense numerical-Jacobian solve is gone. The
+   real-data benchmark is in [Performance](performance.md). What remains is
+   outside the solver: a 6-DOF search or a gravity/floor prior, a persistent
+   occupancy grid, and serialisation of the keyframe/submap graph so a map can
+   be resumed instead of re-read from a mesh PLY. Frozen-map localisation is
+   CPU-bound and repetitive rooms are ambiguous from one view: the 30-frame
+   benchmark located 77% of frames at about 1.5 s per frame after startup. Online
+   and incremental corrections are rigid per submap, so they cannot remove drift
+   *inside* one; the full rebuild remains the accuracy reference but takes
+   minutes on the 120-frame room.
 
 ## Licence
 
