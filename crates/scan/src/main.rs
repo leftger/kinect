@@ -1312,6 +1312,20 @@ pub(crate) struct FinishSummary {
     pub loops_dropped: usize,
     /// Spatial ICP attempts spent by the loop finder.
     pub loop_attempts: usize,
+    /// What `--level` did, so a caller with no terminal can say so.
+    pub level: LevelOutcome,
+}
+
+/// The result of the optional export-time levelling.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum LevelOutcome {
+    /// Levelling was not requested, or there was no surface to level.
+    Off,
+    /// The model was rotated by this many degrees.
+    Applied { tilt_degrees: f32 },
+    /// Levelling was requested but no large horizontal surface was found, so
+    /// the model was written exactly as scanned.
+    NotFound,
 }
 
 /// Level an exported model in place and say what happened.
@@ -1661,6 +1675,7 @@ pub(crate) fn finish(
             loops,
             loops_dropped,
             loop_attempts,
+            level: LevelOutcome::Off,
         });
     };
 
@@ -1760,6 +1775,13 @@ pub(crate) fn finish(
         loops,
         loops_dropped,
         loop_attempts,
+        level: match (options.level, &leveling) {
+            (true, Some(leveling)) => LevelOutcome::Applied {
+                tilt_degrees: leveling.tilt.to_degrees(),
+            },
+            (true, None) => LevelOutcome::NotFound,
+            (false, _) => LevelOutcome::Off,
+        },
     })
 }
 
@@ -2462,5 +2484,44 @@ mod tests {
             panic!("the export kind must not change");
         };
         assert_eq!(mesh.vertices, before, "an unlevelled scan must be unchanged");
+    }
+
+
+    /// Run a short synthetic scan through the real export path and report what
+    /// levelling did, so the GUI's "levelled" / "not found" log lines have a
+    /// guarantee behind them.
+    fn export_synthetic(level: bool, name: &str) -> FinishSummary {
+        let intrinsics = synthetic::intrinsics();
+        let mut scanner = Scanner::new(intrinsics, scanner_config(&Options::default()));
+        for shot in synthetic::shots(8) {
+            let rendered = synthetic::render(&shot, &intrinsics);
+            scanner.add_frame(&rendered.depth, synthetic::WIDTH, synthetic::HEIGHT);
+        }
+
+        let dir = std::env::temp_dir().join(format!("scan-level-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let mut options = Options::default();
+        options.level = level;
+        options.out = Some(dir.join("room.ply"));
+        let summary = finish_scan_with_report(&mut scanner, &options).expect("export");
+        std::fs::remove_dir_all(&dir).expect("remove temp dir");
+        summary
+    }
+
+    #[test]
+    fn export_reports_that_levelling_was_not_requested() {
+        assert_eq!(export_synthetic(false, "off").level, LevelOutcome::Off);
+    }
+
+    #[test]
+    fn export_reports_a_levelling_outcome_when_requested() {
+        // The synthetic room is 2.4 m tall, the camera sits at mid-height with a
+        // narrow field of view, and the far wall is only 2.4 m away, so the floor
+        // and ceiling barely reach the edge of the image. There is no large
+        // horizontal surface to find, and the right answer is `NotFound`: the
+        // request reached the exporter, nothing was moved, and the caller is
+        // told. (`Applied` is covered by `level_export_flattens_a_tilted_floor`.)
+        assert_eq!(export_synthetic(true, "on").level, LevelOutcome::NotFound);
     }
 }

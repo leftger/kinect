@@ -554,6 +554,7 @@ fn export_scanner(scanner: &mut Scanner, options: &Options, shared: &Arc<Mutex<S
         Ok(summary) => {
             let written = summary.output.display().to_string();
             let warnings = summary.quality.warnings.clone();
+            let level = summary.level;
             let dataset_log = summary.dataset.as_ref().map(|report| {
                 format!(
                     "dataset: {} views, {} initial points in {}",
@@ -580,6 +581,20 @@ fn export_scanner(scanner: &mut Scanner, options: &Options, shared: &Arc<Mutex<S
             view.finished = Some(Instant::now());
             view.error = None;
             view.log(format!("exported {written}"));
+            match level {
+                crate::LevelOutcome::Off => {}
+                crate::LevelOutcome::Applied { tilt_degrees } => {
+                    view.log(format!(
+                        "levelled: rotated {tilt_degrees:.1} degrees so the floor is horizontal"
+                    ));
+                }
+                crate::LevelOutcome::NotFound => {
+                    view.log(
+                        "level: no large horizontal surface found; exported as scanned"
+                            .to_string(),
+                    );
+                }
+            }
             if let Some(line) = dataset_log {
                 view.log(line);
             }

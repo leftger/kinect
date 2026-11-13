@@ -52,7 +52,7 @@ Controls frames, voxel size, colour and its mode, colour-depth tolerance,
 filters, fusion filtering and TSDF chunking, loop closure and its
 online/worker/incremental variants, the global-search fallbacks, the likelihood
 gate, submap-graph and graph-worker modes, submap frame/metre budgets,
-frame-to-model, submaps, GPU decode, mirror, preview interval, playback rate,
+frame-to-model, submaps, GPU decode, mirror, level, preview interval, playback rate,
 the output path, and the optional dataset directory.
 
 The dependent modes imply loop closure, as they do on the command line: ticking
@@ -65,6 +65,13 @@ gate.
 
 The output extension selects the mesh format exactly as it does on the command
 line. See [Command line](cli.md#output-format).
+
+**Level** is the `--level` flag: on export, the mesh and trajectory are rotated
+so the floor or ceiling is horizontal. The scan's frame is the first camera
+frame, so a tilted start gives a tilted model. It applies to the exported files
+only; the live preview stays as scanned, and a dataset is never levelled. If no
+large horizontal surface is found, the model is left unchanged and the status
+log says so.
 
 ### 3D viewport
 

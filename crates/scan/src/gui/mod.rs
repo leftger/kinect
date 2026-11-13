@@ -123,6 +123,7 @@ struct UiConfig {
     submaps: bool,
     gpu: bool,
     unmirror: bool,
+    level: bool,
     out: String,
     dataset: String,
     preview_every: usize,
@@ -155,6 +156,7 @@ impl UiConfig {
             submaps: options.submaps,
             gpu: options.gpu,
             unmirror: options.unmirror,
+            level: options.level,
             out: options
                 .out
                 .as_ref()
@@ -403,6 +405,7 @@ impl ScannerApp {
         options.submaps = self.config.submaps;
         options.gpu = self.config.gpu;
         options.unmirror = self.config.unmirror;
+        options.level = self.config.level;
         options.viewer = false;
         options.auto_start = false;
         options.synthetic = false;
@@ -737,6 +740,16 @@ impl ScannerApp {
 
                     ui.label("Mirror");
                     ui.checkbox(&mut self.config.unmirror, "un-mirror X");
+                    ui.end_row();
+
+                    ui.label("Level");
+                    ui.checkbox(&mut self.config.level, "level on export")
+                        .on_hover_text(
+                            "Rotate the exported mesh and trajectory so the floor or \
+                             ceiling is horizontal. Needs a large flat surface within \
+                             25 degrees of level; otherwise the model is left as scanned. \
+                             The live preview is not levelled.",
+                        );
                     ui.end_row();
 
                     ui.label("Preview every");
@@ -1585,5 +1598,16 @@ mod tests {
         assert!(dataset.session.is_none());
 
         std::fs::remove_dir_all(&dir).expect("remove temp dir");
+    }
+
+
+    #[test]
+    fn the_level_checkbox_starts_from_the_command_line_option() {
+        // Off unless asked for, like the flag; and `--level` pre-ticks the box.
+        assert!(!UiConfig::from_options(&Options::default()).level);
+
+        let mut options = Options::default();
+        options.level = true;
+        assert!(UiConfig::from_options(&options).level);
     }
 }
