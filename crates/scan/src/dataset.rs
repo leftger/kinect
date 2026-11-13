@@ -51,18 +51,33 @@
 //!
 //! # The mirror
 //!
-//! `--mirror` and `--unmirror` flip X on the exported mesh so real-world left and
-//! right line up. A dataset must not do that: the images, the poses and the
-//! point cloud all have to stay in one frame, and the frame they are all in is
-//! the sensor's. A reflected scan with reflected poses would train just as well,
-//! but mixing a flipped point cloud with unflipped images would not train at
-//! all. So this module writes everything unflipped, and says so.
+//! The Kinect v2 reads out mirrored frames, so the sensor frame is a reflection
+//! of the room: left and right are swapped. The exported mesh is flipped back by
+//! default (`--mirror` keeps it raw), and a dataset has to follow it, or a
+//! trainer builds a perfectly consistent but mirrored world that no longer lines
+//! up with the mesh.
+//!
+//! The danger is doing it by halves: flipped images with unflipped poses, or a
+//! flipped point cloud with unflipped images, train to nothing. So the reflection
+//! is applied to everything at once, as the single mirror `M = diag(-1, 1, 1)`
+//! of the world, which is also the first camera's frame:
+//!
+//! * each image and mask is flipped left to right, which is the camera seeing
+//!   the mirrored scene;
+//! * each pose becomes `M * T * M`, a proper rotation, so the file stays a rigid
+//!   transform and the trainer's maths is untouched;
+//! * the principal point moves to `width - cx`, because pixel columns reversed;
+//! * the seed cloud's x is negated.
+//!
+//! A point the camera sees at column `u` is then seen at `width - u`, which is the
+//! property the tests check. With `unmirror` false everything is written as the
+//! sensor saw it, again all at once.
 
 use geom::Intrinsics;
 use geom::coloring::ColorView;
 use geom::mesh::save_colored_points_ply;
 use geom::png;
-use nalgebra::{Isometry3, Vector3};
+use nalgebra::{Isometry3, Translation3, UnitQuaternion, Vector3};
 use std::collections::HashSet;
 use std::fs;
 use std::io::{self, ErrorKind};
@@ -114,7 +129,10 @@ struct Frame {
 /// Needs colour views: `live --color`, a colour `.k2df` replay, or the synthetic
 /// room. A depth-only scan has nothing to export, which is an error rather than
 /// an empty dataset.
-pub fn write_dataset(scanner: &Scanner, dir: &Path) -> io::Result<DatasetReport> {
+///
+/// With `unmirror` the whole dataset is reflected to match the un-mirrored mesh
+/// (see the module docs); without it everything stays in the sensor's frame.
+pub fn write_dataset(scanner: &Scanner, dir: &Path, unmirror: bool) -> io::Result<DatasetReport> {
     let views = scanner.color_views();
     if views.is_empty() {
         return Err(invalid(
@@ -126,7 +144,7 @@ pub fn write_dataset(scanner: &Scanner, dir: &Path) -> io::Result<DatasetReport>
     let image_dir = dir.join(IMAGE_DIR);
     let mask_dir = dir.join(MASK_DIR);
 
-    let (frames, skipped) = write_views(views, &image_dir, &mask_dir)?;
+    let (frames, skipped) = write_views(views, &image_dir, &mask_dir, unmirror)?;
 
     // Every view carries the same intrinsics: the scanner copies one `Intrinsics`
     // onto each. Taking the first is therefore not a sample, it is the value.
@@ -134,19 +152,24 @@ pub fn write_dataset(scanner: &Scanner, dir: &Path) -> io::Result<DatasetReport>
     let width = views[0].width;
     let height = views[0].height;
 
-    // The mesh is in the same frame as the poses: `Scanner::mesh` extracts from
-    // the volume without applying the export mirror. Its colours come from the
-    // same views that were just written, so the cloud starts near the colour the
-    // trainer is about to optimise towards.
+    // The mesh is in the sensor frame, like the poses: `Scanner::mesh` extracts
+    // from the volume without applying the export mirror. Its colours come from
+    // the same views that were just written, so the cloud starts near the colour
+    // the trainer is about to optimise towards.
     //
     // This extracts and paints the surface a second time, the first being the
-    // mesh export. That is deliberate: reusing the exported mesh would mean
-    // un-mirroring it again first, and the mirror is exactly the thing this
-    // module exists to keep away from the dataset.
+    // mesh export. Reusing the exported mesh would work only if its mirror
+    // matched this dataset's, and one function owning both is simpler than
+    // keeping two in step.
     let mesh = scanner.mesh();
     let source_points = mesh.vertices.len();
     let (seed, seed_colors) =
         decimate_init(&mesh.vertices, mesh.colors.as_deref(), MAX_INIT_POINTS);
+    let seed: Vec<Vector3<f32>> = if unmirror {
+        seed.iter().map(mirror_point).collect()
+    } else {
+        seed
+    };
     let points = seed.len();
     if source_points > points {
         println!(
@@ -159,6 +182,12 @@ pub fn write_dataset(scanner: &Scanner, dir: &Path) -> io::Result<DatasetReport>
         println!("[scan] no surface to seed the splats with; the trainer will start from its own");
     }
 
+    // Columns were reversed, so the principal point moves with them.
+    let intrinsics = if unmirror {
+        mirror_intrinsics(&intrinsics, width)
+    } else {
+        intrinsics
+    };
     let transforms = build_transforms(&intrinsics, width, height, &frames, points > 0);
     fs::write(dir.join(TRANSFORMS), transforms)?;
 
@@ -234,6 +263,7 @@ fn write_views(
     views: &[ColorView],
     image_dir: &Path,
     mask_dir: &Path,
+    unmirror: bool,
 ) -> io::Result<(Vec<Frame>, usize)> {
     let Some(first) = views.first() else {
         return Err(invalid(
@@ -276,17 +306,27 @@ fn write_views(
 
         // A real 512x424 frame is far larger than Brush's header sniff, but a
         // small capture (the synthetic room) is not, and would fail to load.
-        let image = png::encode_rgb8(width as u32, height as u32, &view.color)?;
+        let (color, valid, pose);
+        let (color, valid, pose) = if unmirror {
+            color = flip_rows(width, height, 3, &view.color);
+            valid = flip_rows(width, height, 1, &view.valid);
+            pose = mirror_pose(&view.pose);
+            (&color[..], &valid[..], &pose)
+        } else {
+            (&view.color[..], &view.valid[..], &view.pose)
+        };
+
+        let image = png::encode_rgb8(width as u32, height as u32, color)?;
         let image = png::pad_to_min_size(image, MIN_IMAGE_BYTES);
         fs::write(image_dir.join(&name), image)?;
 
-        let mask = validity_mask(width, height, &view.valid);
+        let mask = validity_mask(width, height, valid);
         let mask = png::encode_rgb8(width as u32, height as u32, &mask)?;
         fs::write(mask_dir.join(&name), mask)?;
 
         frames.push(Frame {
             file_path: format!("{IMAGE_DIR}/{name}"),
-            matrix: camera_to_world(&view.pose),
+            matrix: camera_to_world(pose),
         });
     }
 
@@ -297,6 +337,65 @@ fn write_views(
     }
 
     Ok((frames, skipped))
+}
+
+/// Reverse every row of a `width` x `height` image with `channels` bytes per
+/// pixel: the picture a camera would take of the mirrored scene.
+fn flip_rows(width: usize, height: usize, channels: usize, data: &[u8]) -> Vec<u8> {
+    let row = width * channels;
+    let mut out = data.to_vec();
+    for y in 0..height {
+        let start = y * row;
+        let Some(line) = out.get_mut(start..start + row) else {
+            break;
+        };
+        for x in 0..width / 2 {
+            for c in 0..channels {
+                line.swap(x * channels + c, (width - 1 - x) * channels + c);
+            }
+        }
+    }
+    out
+}
+
+/// The same camera after its image columns are reversed: only the principal
+/// point's x moves, to `width - cx`. The focal lengths and `cy` are untouched.
+///
+/// This is not a no-op even though it looks like one for a centred lens: the
+/// Kinect's depth camera has `cx` about 261 on a 512-wide image, so skipping it
+/// would shift every ray by around ten pixels.
+fn mirror_intrinsics(intrinsics: &Intrinsics, width: usize) -> Intrinsics {
+    Intrinsics {
+        cx: width as f32 - intrinsics.cx,
+        ..*intrinsics
+    }
+}
+
+/// Reflect a point through the plane `x = 0`.
+fn mirror_point(point: &Vector3<f32>) -> Vector3<f32> {
+    Vector3::new(-point.x, point.y, point.z)
+}
+
+/// The pose of the same camera in the mirrored world: `M * T * M` with
+/// `M = diag(-1, 1, 1)`.
+///
+/// Conjugating by a reflection gives a rotation again, not a reflection (the
+/// determinant is `(-1) * 1 * (-1) = 1`), so the result is an ordinary rigid
+/// transform. Element-wise, `R'[i][j] = m_i * m_j * R[i][j]` with `m = (-1, 1, 1)`,
+/// and the translation's x is negated.
+fn mirror_pose(pose: &Isometry3<f32>) -> Isometry3<f32> {
+    let r = pose.rotation.to_rotation_matrix();
+    let m = [-1.0f32, 1.0, 1.0];
+    let mut mirrored = nalgebra::Matrix3::zeros();
+    for i in 0..3 {
+        for j in 0..3 {
+            mirrored[(i, j)] = m[i] * m[j] * r[(i, j)];
+        }
+    }
+    Isometry3::from_parts(
+        Translation3::from(mirror_point(&pose.translation.vector)),
+        UnitQuaternion::from_rotation_matrix(&nalgebra::Rotation3::from_matrix_unchecked(mirrored)),
+    )
 }
 
 /// The camera-to-world matrix in the convention the dataset formats use.
@@ -409,6 +508,25 @@ fn invalid(message: impl Into<String>) -> io::Error {
 /// enough that every frame tracks.
 #[cfg(test)]
 pub(crate) fn write_synthetic_dataset(dir: &Path, shots: usize) -> DatasetReport {
+    write_synthetic_dataset_with(dir, shots, true)
+}
+
+/// As [`write_synthetic_dataset`], choosing the orientation.
+#[cfg(test)]
+pub(crate) fn write_synthetic_dataset_with(
+    dir: &Path,
+    shots: usize,
+    unmirror: bool,
+) -> DatasetReport {
+    write_dataset(&synthetic_scanner(shots), dir, unmirror).expect("write synthetic dataset")
+}
+
+/// A scanner that has seen the synthetic room, for tests that write more than
+/// one dataset from the same scan. Two separate scanners do not agree on vertex
+/// order (the volume's hash map iterates differently per instance), so only one
+/// scanner makes two datasets comparable point by point.
+#[cfg(test)]
+pub(crate) fn synthetic_scanner(shots: usize) -> Scanner {
     use crate::scanner::{FrameColor, ScannerConfig};
     use geom::tsdf::TsdfParams;
 
@@ -440,7 +558,7 @@ pub(crate) fn write_synthetic_dataset(dir: &Path, shots: usize) -> DatasetReport
             }),
         );
     }
-    write_dataset(&scanner, dir).expect("write synthetic dataset")
+    scanner
 }
 
 #[cfg(test)]
@@ -647,6 +765,7 @@ mod tests {
             &views,
             &dir.path().join("images"),
             &dir.path().join("masks"),
+            false,
         )
         .expect("write");
 
@@ -687,6 +806,7 @@ mod tests {
             &views,
             &dir.path().join("images"),
             &dir.path().join("masks"),
+            false,
         )
         .expect("write");
 
@@ -737,6 +857,7 @@ mod tests {
             &[view(good, 0), resized],
             &dir.path().join("images"),
             &dir.path().join("masks"),
+            false,
         )
         .expect_err("mixed sizes");
 
@@ -867,7 +988,7 @@ mod tests {
         let scanner = scanner_with_color();
         let dir = TempDir::new("round-trip");
 
-        let report = write_dataset(&scanner, dir.path()).expect("write");
+        let report = write_dataset(&scanner, dir.path(), false).expect("write");
 
         assert_eq!(report.views, 1);
         assert_eq!(report.skipped, 0);
@@ -935,7 +1056,7 @@ mod tests {
         scanner.add_frame(&vec![2.0f32; WIDTH * HEIGHT], WIDTH, HEIGHT);
 
         let dir = TempDir::new("no-color");
-        let error = write_dataset(&scanner, dir.path()).expect_err("no views");
+        let error = write_dataset(&scanner, dir.path(), false).expect_err("no views");
 
         assert!(
             error.to_string().contains("live --color"),
@@ -948,7 +1069,7 @@ mod tests {
     fn no_views_at_all_is_reported_as_a_missing_colour_stream() {
         let dir = TempDir::new("empty");
 
-        let error = write_views(&[], &dir.path().join("images"), &dir.path().join("masks"))
+        let error = write_views(&[], &dir.path().join("images"), &dir.path().join("masks"), false)
             .expect_err("no views");
 
         assert!(error.to_string().contains("live --color"), "{error}");
@@ -966,6 +1087,7 @@ mod tests {
             &[view(broken, 0)],
             &dir.path().join("images"),
             &dir.path().join("masks"),
+            false,
         )
         .expect_err("nothing usable");
 
@@ -1023,7 +1145,7 @@ mod tests {
         }
 
         let dir = TempDir::new("synthetic");
-        let report = write_dataset(&scanner, dir.path()).expect("write");
+        let report = write_dataset(&scanner, dir.path(), false).expect("write");
 
         assert_eq!(report.skipped, 0, "no synthetic frame should be dropped");
         assert!(
@@ -1137,4 +1259,258 @@ mod tests {
         }
         assert_eq!(checked, report.views);
     }
+
+    // --- the mirror: the dataset follows the un-mirrored mesh ---
+
+    #[test]
+    fn flip_rows_reverses_each_row_whatever_the_channel_count() {
+        // 3 x 2 RGB: rows [a b c] [d e f], each pixel three distinct bytes.
+        let rgb: Vec<u8> = (0..18).collect();
+        let flipped = flip_rows(3, 2, 3, &rgb);
+        assert_eq!(
+            flipped,
+            vec![
+                6, 7, 8, 3, 4, 5, 0, 1, 2, //
+                15, 16, 17, 12, 13, 14, 9, 10, 11
+            ]
+        );
+        // One channel, even width, and flipping twice is the identity.
+        assert_eq!(flip_rows(4, 1, 1, &[1, 2, 3, 4]), vec![4, 3, 2, 1]);
+        assert_eq!(flip_rows(3, 2, 3, &flipped), rgb);
+        // A buffer shorter than the image is left alone rather than indexed out of range.
+        assert_eq!(flip_rows(3, 2, 3, &rgb[..6]), flip_rows(3, 2, 3, &rgb[..6]));
+    }
+
+    #[test]
+    fn a_mirrored_pose_is_a_proper_rotation_that_undoes_itself() {
+        let original = pose(
+            Vector3::new(0.3, -0.7, 0.5),
+            0.9,
+            Vector3::new(1.0, 2.0, 3.0),
+        );
+        let mirrored = mirror_pose(&original);
+
+        // Translation: only x changes sign.
+        assert!((mirrored.translation.vector - Vector3::new(-1.0, 2.0, 3.0)).norm() < 1e-6);
+        // Still a unit rotation, not a reflection or a scaled one.
+        assert!((mirrored.rotation.quaternion().norm() - 1.0).abs() < 1e-5);
+        assert!(
+            (mirrored.rotation.to_rotation_matrix().matrix().determinant() - 1.0).abs() < 1e-5
+        );
+        // M * (M * T * M) * M is T again.
+        assert_same_pose(&original, &mirror_pose(&mirrored));
+
+        // A turn about y reverses (the mirror swaps left and right); a turn about
+        // x does not, because x is the axis the mirror acts along.
+        let yaw = Isometry3::from_parts(
+            Translation3::new(0.0, 0.0, 0.0),
+            UnitQuaternion::from_axis_angle(&Vector3::y_axis(), 0.3),
+        );
+        assert!((mirror_pose(&yaw).rotation.angle() - 0.3).abs() < 1e-5);
+        let yaw_axis = mirror_pose(&yaw).rotation.axis().unwrap();
+        assert!((yaw_axis.into_inner() - Vector3::new(0.0, -1.0, 0.0)).norm() < 1e-5);
+        let pitch = Isometry3::from_parts(
+            Translation3::new(0.0, 0.0, 0.0),
+            UnitQuaternion::from_axis_angle(&Vector3::x_axis(), 0.3),
+        );
+        assert_same_pose(&pitch, &mirror_pose(&pitch));
+    }
+
+    /// The property the whole mirror rests on: a point the original camera sees
+    /// at column `u` must be seen at `width - u` by the mirrored camera looking at
+    /// the mirrored world, in the same row, at the same depth.
+    #[test]
+    fn a_mirrored_dataset_sees_every_point_at_the_reflected_column() {
+        // Off-centre on purpose, like the real sensor's: with a centred lens
+        // `width - cx` equals `cx` and a missing correction would go unnoticed.
+        let k = Intrinsics {
+            cx: WIDTH as f32 / 2.0 + 3.7,
+            ..intrinsics()
+        };
+        let project = |at: &Isometry3<f32>, cx: f32, p: &Vector3<f32>| {
+            let c = at.inverse() * nalgebra::Point3::from(*p);
+            (k.fx * c.x / c.z + cx, k.fy * c.y / c.z + k.cy, c.z)
+        };
+
+        let mirrored_cx = mirror_intrinsics(&k, WIDTH).cx;
+        for (axis, angle, translation) in [
+            (Vector3::new(0.0, 1.0, 0.0), 0.0, Vector3::new(0.0, 0.0, 0.0)),
+            (Vector3::new(0.0, 1.0, 0.0), 0.4, Vector3::new(0.5, -0.1, 0.2)),
+            (Vector3::new(0.3, -0.7, 0.5), 0.9, Vector3::new(-0.8, 0.3, 0.6)),
+        ] {
+            let camera = pose(axis, angle, translation);
+            let mirrored_camera = mirror_pose(&camera);
+            for point in [
+                Vector3::new(0.2, 0.1, 2.5),
+                Vector3::new(-0.4, -0.3, 3.0),
+                Vector3::new(1.1, 0.5, 4.0),
+            ] {
+                let (u, v, z) = project(&camera, k.cx, &point);
+                let (mu, mv, mz) = project(&mirrored_camera, mirrored_cx, &mirror_point(&point));
+                assert!((mu - (WIDTH as f32 - u)).abs() < 1e-3, "column {mu} vs {}", WIDTH as f32 - u);
+                assert!((mv - v).abs() < 1e-3, "row changed: {mv} vs {v}");
+                assert!((mz - z).abs() < 1e-4, "depth changed: {mz} vs {z}");
+            }
+        }
+    }
+
+    /// A view whose pixels are all different and whose validity mask is not
+    /// symmetric, so a missing or doubled flip cannot go unnoticed.
+    fn asymmetric_view(at: Isometry3<f32>) -> ColorView {
+        let mut v = view(at, 0);
+        v.color = (0..WIDTH * HEIGHT * 3).map(|i| (i * 7 % 251) as u8).collect();
+        // Left third invalid.
+        v.valid = (0..WIDTH * HEIGHT)
+            .map(|i| u8::from(i % WIDTH >= WIDTH / 3))
+            .collect();
+        v
+    }
+
+    fn decoded(path: &Path) -> Vec<u8> {
+        geom::png::decode_rgb8(&fs::read(path).expect("read png"))
+            .expect("decode png")
+            .2
+    }
+
+    #[test]
+    fn unmirroring_flips_images_masks_and_poses_together_and_only_when_asked() {
+        let original = pose(
+            Vector3::new(0.3, -0.7, 0.5),
+            0.9,
+            Vector3::new(1.0, 2.0, 3.0),
+        );
+        let source = asymmetric_view(original);
+
+        for unmirror in [false, true] {
+            let dir = TempDir::new(if unmirror { "flipped" } else { "raw" });
+            let (frames, _) = write_views(
+                std::slice::from_ref(&source),
+                &dir.path().join("images"),
+                &dir.path().join("masks"),
+                unmirror,
+            )
+            .expect("write");
+
+            let image = decoded(&dir.path().join("images/00000.png"));
+            let mask = decoded(&dir.path().join("masks/00000.png"));
+            let (expected_image, expected_valid, expected_pose) = if unmirror {
+                (
+                    flip_rows(WIDTH, HEIGHT, 3, &source.color),
+                    flip_rows(WIDTH, HEIGHT, 1, &source.valid),
+                    mirror_pose(&original),
+                )
+            } else {
+                (source.color.clone(), source.valid.clone(), original)
+            };
+            assert_eq!(image, expected_image, "image (unmirror = {unmirror})");
+            assert_eq!(
+                mask,
+                validity_mask(WIDTH, HEIGHT, &expected_valid),
+                "mask (unmirror = {unmirror})"
+            );
+            assert_eq!(
+                frames[0].matrix,
+                camera_to_world(&expected_pose),
+                "pose (unmirror = {unmirror})"
+            );
+        }
+
+        // The two orientations really do differ, or the test above proves nothing.
+        assert_ne!(
+            flip_rows(WIDTH, HEIGHT, 3, &source.color),
+            source.color,
+            "the fixture must not be left-right symmetric"
+        );
+    }
+
+    /// Numbers in a JSON-ish fragment, in order. Enough to read `transforms.json`
+    /// without a JSON dependency.
+    fn numbers(text: &str) -> Vec<f32> {
+        text.split(|c: char| !(c.is_ascii_digit() || matches!(c, '-' | '.' | 'e' | 'E' | '+')))
+            .filter_map(|token| token.parse().ok())
+            .collect()
+    }
+
+    fn scalar(json: &str, key: &str) -> f32 {
+        let after = json.split(&format!("\"{key}\":")).nth(1).expect("key present");
+        numbers(after.lines().next().unwrap())[0]
+    }
+
+    fn matrices(json: &str) -> Vec<Vec<f32>> {
+        json.split("\"transform_matrix\":")
+            .skip(1)
+            .map(|chunk| numbers(chunk)[..16].to_vec())
+            .collect()
+    }
+
+    #[test]
+    fn a_whole_dataset_is_mirrored_consistently_images_poses_principal_point_and_seed() {
+        let raw = TempDir::new("whole-raw");
+        let flipped = TempDir::new("whole-flipped");
+        // One scan, written both ways, so the two datasets describe the same surface.
+        let scanner = synthetic_scanner(6);
+        let a = write_dataset(&scanner, raw.path(), false).expect("raw");
+        let b = write_dataset(&scanner, flipped.path(), true).expect("flipped");
+        assert_eq!((a.views, a.points), (b.views, b.points));
+
+        let ja = fs::read_to_string(raw.path().join("transforms.json")).unwrap();
+        let jb = fs::read_to_string(flipped.path().join("transforms.json")).unwrap();
+
+        // Columns reversed, so the principal point reflects; nothing else about the camera moves.
+        let width = scalar(&ja, "w");
+        assert!((scalar(&ja, "cx") + scalar(&jb, "cx") - width).abs() < 1e-3);
+        assert_eq!(scalar(&ja, "cy"), scalar(&jb, "cy"));
+        assert_eq!(scalar(&ja, "fl_x"), scalar(&jb, "fl_x"));
+
+        // Every camera centre is reflected through x = 0: only x changes sign.
+        let (ma, mb) = (matrices(&ja), matrices(&jb));
+        assert_eq!(ma.len(), mb.len());
+        for (frame, (x, y)) in ma.iter().zip(&mb).enumerate() {
+            assert!((x[3] + y[3]).abs() < 1e-5, "frame {frame}: x {} vs {}", x[3], y[3]);
+            assert!((x[7] - y[7]).abs() < 1e-5, "frame {frame}: y changed");
+            assert!((x[11] - y[11]).abs() < 1e-5, "frame {frame}: z changed");
+        }
+
+        // The seed cloud is the same points, reflected.
+        let pa = geom::mesh::read_points_ply(&raw.path().join("init.ply")).unwrap();
+        let pb = geom::mesh::read_points_ply(&flipped.path().join("init.ply")).unwrap();
+        assert_eq!(pa.len(), pb.len());
+        assert!(!pa.is_empty());
+        for (index, (x, y)) in pa.iter().zip(&pb).enumerate() {
+            assert!(
+                (mirror_point(x) - y).norm() < 1e-6,
+                "seed point {index}: raw {x:?} mirrored should be {:?}, got {y:?}",
+                mirror_point(x)
+            );
+        }
+
+        // And the images are the same pictures, reversed left to right.
+        let image_a = decoded(&raw.path().join("images/00000.png"));
+        let image_b = decoded(&flipped.path().join("images/00000.png"));
+        assert_eq!(
+            flip_rows(crate::synthetic::WIDTH, crate::synthetic::HEIGHT, 3, &image_a),
+            image_b
+        );
+    }
+
+    #[test]
+    fn mirroring_moves_only_the_principal_point_x_and_uses_the_real_sensors_off_centre_value() {
+        // The Kinect v2 depth camera, as the scanner reports it.
+        let kinect = Intrinsics {
+            fx: 367.13,
+            fy: 367.13,
+            cx: 261.08,
+            cy: 211.21,
+        };
+        let mirrored = mirror_intrinsics(&kinect, 512);
+
+        assert!((mirrored.cx - 250.92).abs() < 1e-3, "cx {}", mirrored.cx);
+        assert!((kinect.cx - 256.0).abs() > 5.0, "the real lens is not centred");
+        assert_eq!(mirrored.fx, kinect.fx);
+        assert_eq!(mirrored.fy, kinect.fy);
+        assert_eq!(mirrored.cy, kinect.cy);
+        // Mirroring twice returns the original.
+        assert!((mirror_intrinsics(&mirrored, 512).cx - kinect.cx).abs() < 1e-3);
+    }
 }
+

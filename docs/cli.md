@@ -181,7 +181,7 @@ This is the cheapest way to exercise the Brush hand-off.
 | `--live` | `localize`: use the sensor instead of `--in` |
 | `--no-submaps` | Keep one model and skip unplaceable frames instead of starting a submap |
 | `--gpu` | GPU depth decode; requires `--features wgpu-decode` |
-| `--mirror` | Keep the raw sensor mirror orientation instead of flipping X |
+| `--mirror` | Keep the raw sensor mirror orientation instead of flipping X. A `--dataset` follows the same choice, all of it at once |
 | `--no-filter` | Disable decoder bilateral and edge-aware filters |
 
 ### Loop closure tuning

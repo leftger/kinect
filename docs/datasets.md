@@ -24,6 +24,23 @@ DATASET_DIR/
 The seed cloud is voxel-decimated to at most 250,000 points. The full surface
 stays in the exported mesh.
 
+## Orientation
+
+The Kinect v2 reads out mirrored frames, so the sensor's own frame is a
+reflection of the room. `scan` flips the exported mesh back by default, and the
+dataset follows it, so a trained splat model lines up with the mesh and with the
+real room.
+
+The whole dataset is reflected together: images and masks are reversed left to
+right, each pose becomes `M T M` (with `M = diag(-1, 1, 1)`, still a proper
+rotation), the principal point moves to `width - cx`, and the seed cloud's x is
+negated. Reflecting only some of these trains to nothing, which is why it is
+done in one place. `--mirror` writes the raw sensor frame instead, again all at
+once.
+
+A dataset written before this change is mirrored relative to the room: re-export
+it, or flip the splat model's x when you use it.
+
 ## Requirements
 
 A dataset needs colour views. Use one of:

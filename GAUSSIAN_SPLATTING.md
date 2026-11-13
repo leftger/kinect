@@ -180,10 +180,15 @@ subset and rejects things the docs permit.
 
 Two more invariants that are ours, not Brush's:
 
-- **Everything in a dataset must share one frame.** Images, poses and `init.ply`
-  are all written in the sensor frame. The `--mirror` flag flips the exported
-  *mesh* and must never touch a dataset: mirrored poses with unmirrored images
-  cannot train.
+- **Everything in a dataset must share one frame, mirrored together or not at
+  all.** The Kinect v2 reads out mirrored frames, so the sensor frame is a
+  reflection of the room. The exported mesh is flipped back by default, and the
+  dataset follows it: images and masks are reversed left to right, each pose
+  becomes `M T M` with `M = diag(-1, 1, 1)` (still a proper rotation), the
+  principal point moves to `width - cx` and `init.ply` has its x negated. Doing
+  only some of those trains to nothing. `--mirror` keeps the whole dataset in
+  the sensor's frame instead. Until this was done the splats came out mirrored
+  relative to the mesh, which is how it was noticed.
 - **`red/green/blue` is read as `u8 / 254`.** Writing floats would be read by
   `visit_f32` instead; both work, but do not mix them across a file.
 

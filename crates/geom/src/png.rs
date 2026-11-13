@@ -109,8 +109,10 @@ fn crc32(bytes: &[u8]) -> u32 {
 }
 
 /// Inflate a PNG this module produced and return `(width, height, rgb)`.
-#[cfg(test)]
-pub(crate) fn decode_rgb8(bytes: &[u8]) -> io::Result<(u32, u32, Vec<u8>)> {
+///
+/// Public so a test in another crate can read back what an exporter wrote and
+/// compare pixels, rather than inferring them from file sizes.
+pub fn decode_rgb8(bytes: &[u8]) -> io::Result<(u32, u32, Vec<u8>)> {
     let mut decoder = png::Decoder::new(std::io::Cursor::new(bytes));
     decoder.set_transformations(png::Transformations::IDENTITY);
     let mut reader = decoder.read_info().map_err(png_error)?;

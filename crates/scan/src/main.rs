@@ -169,7 +169,8 @@ struct Options {
     /// Export a Nerfstudio dataset for a Gaussian-splatting trainer: the colour
     /// views, their masks, `transforms.json`, and an initial point cloud.
     /// Needs `--color`, because the dataset is built from the colour views.
-    /// The dataset always stays in the sensor frame; the mirror does not apply.
+    /// The dataset follows the mesh: un-mirrored together by default, left in the
+    /// sensor frame with `--mirror`.
     dataset: Option<PathBuf>,
     /// Prior point cloud for `localize`, as ASCII or binary little-endian PLY.
     map: Option<PathBuf>,
@@ -694,8 +695,8 @@ fn usage_text() -> String {
          \x20               dropping frames or smearing them onto the old model.\n\
          \x20 --mirror      Keep the raw sensor mirror orientation instead of flipping\n\
          \x20               X to match real-world coordinates (un-mirrored by default).\n\
-         \x20               A dataset is always written in the sensor frame, so this\n\
-         \x20               does not apply to --dataset.\n\
+         \x20               A --dataset follows the same choice: its images, poses and\n\
+         \x20               seed cloud are mirrored together by default.\n\
          \x20 --level       Rotate the exported mesh and trajectory so the floor or\n\
          \x20               ceiling is horizontal. The world frame is the first camera\n\
          \x20               frame, so a tilted start gives a tilted model. Needs a\n\
@@ -1746,7 +1747,7 @@ pub(crate) fn finish(
         // trajectory. A dataset assembled before that would carry the drifted
         // poses the trainer is most sensitive to.
         println!("[scan] writing dataset to {} ...", dir.display());
-        let report = dataset::write_dataset(scanner, dir)?;
+        let report = dataset::write_dataset(scanner, dir, options.unmirror)?;
 
         println!(
             "[scan] dataset: {} views, {} initial points in {}",
@@ -1761,8 +1762,13 @@ pub(crate) fn finish(
             );
         }
         println!(
-            "[scan]   images, poses and init.ply are all in the sensor frame, so they agree; \
-             --mirror does not apply to a dataset"
+            "[scan]   {}",
+            if options.unmirror {
+                "images, poses, principal point and init.ply are mirrored together to match \
+                 the un-mirrored mesh (--mirror keeps the sensor frame)"
+            } else {
+                "images, poses and init.ply are in the sensor's mirrored frame, as --mirror asked"
+            }
         );
         dataset_report = Some(report);
     }
