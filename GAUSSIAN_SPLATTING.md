@@ -330,11 +330,17 @@ the panel can now assume a readable dataset.
 
 **Implemented.** The **Splats** panel in `scan gui` has:
 
-- trainer executable (default `brush-cli`), dataset directory, output
-  directory, and iteration count;
-- Start / Cancel, status, elapsed time, and a scrolling log;
-- Brush-shaped arguments (`<dataset> --total-train-iters N --export-every N
-  --export-path DIR --export-name export.ply`);
+- trainer executable (blank = the Brush found on `PATH`, with its version
+  shown), dataset directory, output directory, steps, and a preview interval;
+- Train / Cancel, status, a progress bar (steps, splat count, elapsed, rough
+  time left), and a scrolling log;
+- Brush-shaped arguments, chosen by asking the installed Brush which flags it
+  speaks: `<dataset> --total-steps N --export-every N --export-path DIR
+  --export-name export_{iter}.ply` for the 0.3.0 release, and the older
+  `--total-train-iters` / `export.ply` form otherwise;
+- **Live preview**: each `export_<step>.ply` is loaded into the viewport on a
+  background thread as Brush writes it, an optional Brush window, and **Train
+  after export**;
 - the dataset directory auto-filled from the last export, with a **use last
   export** button;
 - an exported dataset with quality warnings is marked *not trainable* and
@@ -345,10 +351,18 @@ into a bounded 240-line log, kills the child on Cancel, and joins it when the
 window closes. Three headless tests cover a missing dataset, a successful run
 that writes the PLY, and cancellation.
 
-**Still open:** the full click-through with the real `brush-cli` (a display and
-a manual start, not a sensor), arbitrary extra trainer arguments, and parsing a
-loss value rather than showing raw lines. The worker covers the process-control
-half; the synthetic Brush run covers the command half.
+**Verified against Brush 0.3.0:** the trainer worker drives the real binary on
+a freshly exported synthetic dataset (an opt-in test) and on a real 900-view room
+capture (3,000 steps in 42 s). That run found three things worth knowing: the
+released CLI uses `--total-steps`, not `--total-train-iters`; Brush fails any
+image under 16,387 bytes with `early eof` (the exporter now pads small ones); and
+Brush panics unless its working directory is writable (the worker runs it from
+the output directory).
+
+**Still open:** a human click-through of the window with a live Brush run (the
+checks above exercise the worker, the loader and the renderer, not the pixels on
+screen), arbitrary extra trainer arguments, and parsing a loss value, which
+Brush does not log at `info` level.
 
 **Done when:** a dataset exported from the window trains from the window,
 Cancel actually stops the child process, and the output path is reported. The

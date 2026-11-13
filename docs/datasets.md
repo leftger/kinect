@@ -54,17 +54,49 @@ The scanner checks the finished scan before training:
 A dataset with warnings is marked **not trainable**. The GUI still allows
 training, but requires **Train anyway**. The command line prints the warnings.
 
+## Installing Brush
+
+Brush publishes prebuilt binaries at
+<https://github.com/ArthurBrussee/brush/releases>. On Apple silicon:
+
+```sh
+gh release download v0.3.0 -R ArthurBrussee/brush -p 'brush-app-aarch64-apple-darwin.tar.xz*'
+shasum -a 256 -c brush-app-aarch64-apple-darwin.tar.xz.sha256
+tar -xJf brush-app-aarch64-apple-darwin.tar.xz
+install -m 755 brush-app-aarch64-apple-darwin/brush_app ~/.cargo/bin/brush
+brush --version        # brush-cli 0.3.0
+```
+
+The archive's binary is `brush_app`; the README calls it `brush`. The window
+looks for `brush`, `brush_app` and `brush-cli` on `PATH`. Run Brush from a
+directory it can write to: it creates a `target/` kernel cache in its working
+directory and panics with a `No such file or directory` otherwise (the window
+does this for you).
+
 ## Brush smoke test without a sensor
 
 ```sh
 scan synth --dataset out/ds-synth --frames 24 --out out/synth.ply
 
-brush-cli out/ds-synth --total-train-iters 100 --export-every 100 \
-    --export-path /tmp/brush-synth --export-name export.ply
+brush out/ds-synth --total-steps 100 --export-every 50 \
+    --export-path /tmp/brush-synth
 ```
 
-Brush loaded all 24 views and wrote a 119 MB PLY with 504,178 splats and the
-expected position, scale, rotation, opacity, and SH properties.
+Brush 0.3.0 names its flags `--total-steps` and `--export-name`, whose default
+is `export_{iter}.ply`, so each export keeps its own file. The flag was
+`--total-train-iters` in the older build this repo was first checked against.
+Brush prints nothing by default; `RUST_LOG=brush_cli=info` makes it report
+`Refine iter N, M splats.` and `Done training!`, which is what the window reads.
+
+An earlier Brush loaded all 24 views and wrote a 119 MB PLY with 504,178 splats
+and the expected position, scale, rotation, opacity, and SH properties.
+
+**Small images.** Brush 0.3.0 reads exactly 16,387 bytes from each image to learn
+its format and fails any smaller file with `early eof`. A real 512×424 frame is
+190–435 KB and never hits this, but the synthetic room's 160×120 frames are
+about 11 KB and did. The exporter pads every image past that with an ancillary
+PNG `tEXt` chunk placed after the image data: pixels are untouched and every
+decoder ignores it.
 
 The 24-frame synthetic run also crosses a submap boundary at frame 23, so the
 parse covers a dataset with two fragments. This proves the format and trainer
@@ -100,12 +132,27 @@ made training impractically slow.
 
 ## Training from the window
 
-After export, the Splats panel can run a configured Brush command as a child
-process. It exposes the executable, dataset, output directory, and iteration
-count, with Start/Cancel and a streamed log.
+After export, the Splats panel finds Brush, runs it as a child process, and
+shows each intermediate model in the viewport while training continues, with a
+progress bar (steps, splat count, elapsed, rough time left). **Train after
+export** starts a run as soon as a dataset is written. See
+[Scanner window](gui.md#splats).
 
-The trained `.ply` can be loaded into the viewport with Mesh/Splats,
-Fit-splats, and First-person controls. See [Scanner window](gui.md#splats).
+## A real room
+
+A 900-frame handheld capture of a living and dining room, replayed with loop
+closure and exported as a dataset (900 views of 512×424, a 198,341-point seed):
+
+| | |
+| --- | --- |
+| Brush | 0.3.0, Apple silicon GPU |
+| Steps | 3,000, a preview every 1,000 |
+| Time | 42 s, about 75 steps per second |
+| Splats | 206,502 at step 201, 274,117 at the end |
+| Exports | 50, 56 and 62 MB |
+
+That is a smoke test of the pipeline, not a quality result: 3,000 steps is a
+tenth of a normal run, and nobody has yet judged how the splats look.
 
 ## Current limits
 

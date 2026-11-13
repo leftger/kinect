@@ -103,21 +103,52 @@ Shows:
 
 ### Splats
 
-After an export, the Splats panel can run a configured Brush command as a child
-process.
+After an export, the Splats panel runs [Brush](https://github.com/ArthurBrussee/brush)
+as a child process and shows the model improving in the viewport while it trains.
+See [Datasets and splats](datasets.md) for installing Brush.
+
+The top of the panel says whether Brush was found on `PATH` (as `brush`,
+`brush_app` or `brush-cli`) and which version, with a **Re-detect** button and a
+download link when it is missing. Leave **Trainer** blank to use the one found,
+or type a path.
 
 Editable fields:
 
-- executable (`brush-cli` by default);
-- dataset directory;
+- trainer executable (blank = the Brush found on `PATH`);
+- dataset directory (filled from the last export);
 - output directory;
-- iteration count.
+- **Steps**, the training length;
+- **Preview every**, how often Brush writes a complete model.
 
-The panel has **Start**, **Cancel**, and a streamed log. An exported dataset with
-unmerged submaps or too many rejected frames is marked *not trainable*; Start
+Three checkboxes:
+
+- **Live preview** loads each preview model into the viewport as Brush writes it.
+  The first one frames the camera and switches to Splats; later ones only swap
+  the model, so your view is not reset. Models are read on a background thread,
+  so a large one does not freeze the window.
+- **Brush window** also opens Brush's own live viewer, a separate window.
+- **Train after export** starts training the moment an export writes a dataset.
+  It decides once, when the export lands, so ticking it later does not retrain
+  an export already on screen. It needs a dataset directory in Output.
+
+While training, a progress bar shows steps, the live splat count, elapsed time
+and a rough time left (linear in steps, so it runs optimistic: refinement makes
+later steps slower), and a line says which step's preview the viewport shows.
+Progress comes from the `export_<step>.ply` files and from Brush's
+`Refine iter N, M splats.` log lines. If a Brush version words those lines
+differently the bar still follows the exports, and the log is still streamed.
+
+The panel has **Train**, **Cancel**, and a streamed log. An exported dataset with
+unmerged submaps or too many rejected frames is marked *not trainable*; Train
 then requires **Train anyway**.
 
-The trained `.ply` can be loaded into the viewport with:
+The window runs Brush from the output directory, because Brush writes a kernel
+cache into its working directory and panics when that is not writable. It asks
+the installed Brush which command-line flags it speaks (`--total-steps` in the
+current release, `--total-train-iters` in older ones) and adapts. An older Brush
+writes only the final model, so there are no intermediate previews.
+
+A trained `.ply` can also be loaded into the viewport by hand, with:
 
 - **Mesh / Splats** toggle;
 - **Fit splats**;
@@ -126,6 +157,10 @@ The trained `.ply` can be loaded into the viewport with:
 The splat preview projects the anisotropic covariance and blends DC colour.
 Higher SH bands are not evaluated. Splat-size and minimum-opacity sliders make
 under-trained or floating-splat models inspectable.
+
+The preview is drawn on the CPU. A 274,000-splat room model takes about half a
+second a frame at 640×480 in a release build (a debug build is ten times slower),
+so orbiting a large model is sluggish. Loading and swapping previews is cheap.
 
 Clouds over 250k splats render at half raster resolution and are scaled by egui.
 First-person splats use the colour frame's x direction.

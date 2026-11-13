@@ -84,6 +84,11 @@ const IMAGE_DIR: &str = "images";
 const MASK_DIR: &str = "masks";
 const TRANSFORMS: &str = "transforms.json";
 const INIT_PLY: &str = "init.ply";
+/// Brush 0.3.0 reads exactly 16,387 bytes from each image with `read_exact` to
+/// learn its format and size, so a smaller file fails with "early eof". Every
+/// image is padded past that (see `geom::png::pad_to_min_size`). Masks are read
+/// whole, so they are left alone.
+const MIN_IMAGE_BYTES: usize = 16_400;
 
 /// What [`write_dataset`] wrote.
 #[derive(Debug)]
@@ -269,7 +274,10 @@ fn write_views(
         // sequence has no gaps even when a view above was skipped.
         let name = format!("{:05}.png", frames.len());
 
+        // A real 512x424 frame is far larger than Brush's header sniff, but a
+        // small capture (the synthetic room) is not, and would fail to load.
         let image = png::encode_rgb8(width as u32, height as u32, &view.color)?;
+        let image = png::pad_to_min_size(image, MIN_IMAGE_BYTES);
         fs::write(image_dir.join(&name), image)?;
 
         let mask = validity_mask(width, height, &view.valid);
@@ -394,6 +402,45 @@ fn build_transforms(
 
 fn invalid(message: impl Into<String>) -> io::Error {
     io::Error::new(ErrorKind::InvalidInput, message.into())
+}
+
+/// Write a small dataset from the synthetic room, for tests that need a real
+/// one on disk (including the opt-in run against an installed Brush). Short
+/// enough that every frame tracks.
+#[cfg(test)]
+pub(crate) fn write_synthetic_dataset(dir: &Path, shots: usize) -> DatasetReport {
+    use crate::scanner::{FrameColor, ScannerConfig};
+    use geom::tsdf::TsdfParams;
+
+    let intrinsics = crate::synthetic::intrinsics();
+    let mut scanner = Scanner::new(
+        intrinsics,
+        ScannerConfig {
+            tsdf: TsdfParams {
+                voxel_size: 0.03,
+                truncation: 0.12,
+                ..TsdfParams::default()
+            },
+            ..ScannerConfig::default()
+        },
+    );
+    for shot in &crate::synthetic::shots(shots) {
+        let rendered = crate::synthetic::render(shot, &intrinsics);
+        scanner.add_frame_with_color(
+            &rendered.depth,
+            crate::synthetic::WIDTH,
+            crate::synthetic::HEIGHT,
+            Some(FrameColor {
+                rgb: &rendered.rgb,
+                depth: &rendered.depth,
+                valid: &rendered.valid,
+                exposure: shot.brightness,
+                gain: 1.0,
+                gamma: 1.0,
+            }),
+        );
+    }
+    write_dataset(&scanner, dir).expect("write synthetic dataset")
 }
 
 #[cfg(test)]
@@ -1057,5 +1104,37 @@ mod tests {
         assert!(!seed.is_empty());
         assert!(seed.len() <= 1000, "kept {} points", seed.len());
         assert_eq!(seed_colors.as_ref().unwrap().len(), seed.len());
+    }
+
+    /// Regression: Brush 0.3.0 reads exactly 16,387 bytes from each image to
+    /// learn its format and fails any shorter file with "early eof". A small
+    /// capture's PNGs are well under that, so every image must be padded past it
+    /// while still decoding to the same pixels.
+    #[test]
+    fn every_image_is_long_enough_for_brushs_header_sniff() {
+        let dir = TempDir::new("brush-sniff");
+        let report = write_synthetic_dataset(dir.path(), 8);
+        assert!(report.views >= 7, "kept {} views", report.views);
+
+        let mut checked = 0;
+        for entry in fs::read_dir(dir.path().join("images")).expect("images") {
+            let path = entry.expect("entry").path();
+            let bytes = fs::read(&path).expect("read image");
+            assert!(
+                bytes.len() >= 16_387,
+                "{} is {} bytes, below Brush's 16,387-byte header read",
+                path.display(),
+                bytes.len()
+            );
+            // `geom`'s decoder is test-only there, so read the structure directly:
+            // signature, IHDR dimensions, and IEND still closing the file.
+            assert_eq!(&bytes[..8], &[0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1A, b'\n']);
+            let width = u32::from_be_bytes(bytes[16..20].try_into().unwrap()) as usize;
+            let height = u32::from_be_bytes(bytes[20..24].try_into().unwrap()) as usize;
+            assert_eq!((width, height), (crate::synthetic::WIDTH, crate::synthetic::HEIGHT));
+            assert_eq!(&bytes[bytes.len() - 8..bytes.len() - 4], b"IEND", "IEND must stay last");
+            checked += 1;
+        }
+        assert_eq!(checked, report.views);
     }
 }

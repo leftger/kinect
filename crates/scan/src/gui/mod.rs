@@ -27,6 +27,7 @@ mod trainer;
 use std::error::Error;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::mpsc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use eframe::egui;
@@ -40,7 +41,9 @@ use crate::{DEFAULT_FRAMES, Options};
 use render::{Camera, PreviewScene, Renderer};
 use session::{SessionConfig, SessionHandle, SessionSnapshot, Source, Status};
 use splat::SplatCloud;
-use trainer::{TrainerConfig, TrainerHandle, TrainerStatus, TrainerView};
+use trainer::{
+    BRUSH_RELEASES_URL, BrushInstall, TrainerConfig, TrainerHandle, find_brush, progress_summary,
+};
 
 /// Which source the controls are set to. The worker gets the resolved [`Source`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -175,23 +178,48 @@ impl UiConfig {
 
 /// The Splats panel's editable state.
 struct TrainerUi {
+    /// Blank means "use the Brush found on PATH".
     program: String,
     dataset: String,
     output: String,
     iterations: usize,
+    /// Brush writes a complete model every this many steps; the viewport shows
+    /// each one as it lands.
+    preview_every: usize,
+    /// Load each preview into the viewport automatically.
+    auto_preview: bool,
+    /// Also open Brush's own live viewer in a separate window.
+    viewer: bool,
+    /// Start training as soon as an export writes a dataset.
+    auto_train: bool,
     allow_unmerged: bool,
 }
 
 impl Default for TrainerUi {
     fn default() -> Self {
         Self {
-            program: "brush-cli".to_string(),
+            program: String::new(),
             dataset: String::new(),
             output: "out/splat-export".to_string(),
             iterations: 30_000,
+            // Brush's own default. Each preview is a complete model, so a
+            // smaller interval costs disk and a viewport reload each time.
+            preview_every: 5_000,
+            auto_preview: true,
+            viewer: false,
+            auto_train: false,
             allow_unmerged: false,
         }
     }
+}
+
+/// A preview model being read on a worker thread. A trained model can hold
+/// millions of splats, and parsing one on the UI thread would freeze the
+/// window for as long as it takes.
+struct PreviewLoad {
+    iteration: usize,
+    path: PathBuf,
+    receiver: mpsc::Receiver<Result<SplatCloud, String>>,
 }
 
 /// Open the scanner window.
@@ -238,6 +266,17 @@ struct ScannerApp {
     trainer: Option<TrainerHandle>,
     trainer_config: TrainerUi,
     trainer_error: Option<String>,
+    /// Brush as found on `PATH`, looked up at start and on demand.
+    brush: Option<BrushInstall>,
+    preview_load: Option<PreviewLoad>,
+    /// The training step of the preview the viewport is showing.
+    loaded_preview: Option<usize>,
+    /// The first preview of a run frames the camera and switches to splats;
+    /// later ones only swap the model, so the operator's view is not reset.
+    first_preview_pending: bool,
+    /// True while a scan is in progress, so the next export is recognised as
+    /// new rather than an old one still on screen.
+    auto_train_armed: bool,
     scene: Option<Arc<PreviewScene>>,
     scene_id: u64,
     splat: Option<SplatCloud>,
@@ -269,6 +308,11 @@ impl ScannerApp {
             trainer: None,
             trainer_config: TrainerUi::default(),
             trainer_error: None,
+            brush: find_brush(),
+            preview_load: None,
+            loaded_preview: None,
+            first_preview_pending: true,
+            auto_train_armed: false,
             scene: None,
             scene_id: 0,
             splat: None,
@@ -881,9 +925,42 @@ impl ScannerApp {
 
         ui.heading("Splats");
         ui.small(
-            "Run Brush on an exported dataset. The trainer is a child process, \
-             separate from the scan worker.",
+            "Train a Gaussian-splat model from the exported dataset with Brush, and \
+             watch it sharpen in the viewport as training runs. Brush is a child \
+             process, separate from the scan worker.",
         );
+
+        let mut redetect = false;
+        ui.horizontal_wrapped(|ui| {
+            match &self.brush {
+                Some(brush) => {
+                    let version = if brush.version.is_empty() {
+                        "version unknown"
+                    } else {
+                        brush.version.as_str()
+                    };
+                    ui.colored_label(
+                        egui::Color32::from_rgb(120, 200, 140),
+                        format!("Brush found: {version}"),
+                    );
+                    ui.small(brush.path.display().to_string());
+                }
+                None => {
+                    ui.colored_label(
+                        egui::Color32::from_rgb(240, 200, 90),
+                        "Brush not found on PATH.",
+                    );
+                    ui.hyperlink_to("Download a release", BRUSH_RELEASES_URL);
+                    ui.small("and put it on PATH as `brush`, or type its full path below.");
+                }
+            }
+            if ui.small_button("Re-detect").clicked() {
+                redetect = true;
+            }
+        });
+        if redetect {
+            self.brush = find_brush();
+        }
 
         let mut use_last = false;
         let mut load_splat = false;
@@ -894,7 +971,7 @@ impl ScannerApp {
                 ui.label("Trainer");
                 ui.add(
                     egui::TextEdit::singleline(&mut self.trainer_config.program)
-                        .hint_text("brush-cli"),
+                        .hint_text("blank = the Brush found on PATH"),
                 );
                 ui.end_row();
 
@@ -917,14 +994,44 @@ impl ScannerApp {
                 );
                 ui.end_row();
 
-                ui.label("Iterations");
+                ui.label("Steps");
                 ui.add(
                     egui::DragValue::new(&mut self.trainer_config.iterations)
                         .range(1..=1_000_000)
                         .speed(100.0),
                 );
                 ui.end_row();
+
+                ui.label("Preview every");
+                ui.add(
+                    egui::DragValue::new(&mut self.trainer_config.preview_every)
+                        .range(1..=1_000_000)
+                        .speed(50.0)
+                        .suffix(" steps"),
+                )
+                .on_hover_text(
+                    "Brush writes a complete model this often. Each one can be shown in \
+                     the viewport while training continues.",
+                );
+                ui.end_row();
             });
+
+        ui.horizontal_wrapped(|ui| {
+            ui.checkbox(&mut self.trainer_config.auto_preview, "Live preview")
+                .on_hover_text(
+                    "Load each preview model into the viewport as Brush writes it.",
+                );
+            ui.checkbox(&mut self.trainer_config.viewer, "Brush window")
+                .on_hover_text(
+                    "Also open Brush's own live viewer in a separate window. Takes \
+                     effect on the next Train.",
+                );
+            ui.checkbox(&mut self.trainer_config.auto_train, "Train after export")
+                .on_hover_text(
+                    "Start training as soon as a scan's dataset has been exported. \
+                     Set a dataset directory in Output first.",
+                );
+        });
 
         ui.horizontal(|ui| {
             ui.label("Splat file");
@@ -1025,6 +1132,42 @@ impl ScannerApp {
                 }
             }
         });
+        if running || view.iteration > 0 {
+            let elapsed = view
+                .started
+                .map(|started| view.finished.unwrap_or_else(Instant::now).duration_since(started))
+                .unwrap_or_default();
+            let text = progress_summary(view.iteration, view.total, view.splats, elapsed, running);
+            ui.add(
+                egui::ProgressBar::new(view.fraction().unwrap_or(0.0))
+                    .animate(running)
+                    .text(text),
+            );
+
+            let preview_note = match (self.loaded_preview, view.previews.last()) {
+                (Some(shown), _) => {
+                    let newer = if self.preview_load.is_some() {
+                        "; loading a newer one"
+                    } else {
+                        ""
+                    };
+                    format!("viewport: step-{shown} preview{newer}")
+                }
+                (None, Some(latest)) if self.preview_load.is_some() => {
+                    format!("loading the step-{} preview", latest.iteration)
+                }
+                (None, _) if running => format!(
+                    "waiting for the first preview, written every {} steps",
+                    self.trainer_config
+                        .preview_every
+                        .clamp(1, view.total.max(1))
+                ),
+                _ => String::new(),
+            };
+            if !preview_note.is_empty() {
+                ui.small(preview_note);
+            }
+        }
         if let Some(output) = &view.output {
             ui.monospace(output.display().to_string());
         }
@@ -1060,13 +1203,23 @@ impl ScannerApp {
             return;
         }
 
-        let program = self.trainer_config.program.trim().to_string();
+        let typed = self.trainer_config.program.trim().to_string();
         let dataset = self.trainer_config.dataset.trim().to_string();
         let output = self.trainer_config.output.trim().to_string();
-        if program.is_empty() {
-            self.trainer_error = Some("trainer executable is empty".to_string());
-            return;
-        }
+        let program = if typed.is_empty() {
+            match &self.brush {
+                Some(brush) => brush.path.display().to_string(),
+                None => {
+                    self.trainer_error = Some(format!(
+                        "Brush was not found on PATH. Install it from {BRUSH_RELEASES_URL} \
+                         and put it on PATH as `brush`, or type its path in the Trainer field"
+                    ));
+                    return;
+                }
+            }
+        } else {
+            typed
+        };
         if dataset.is_empty() {
             self.trainer_error = Some("choose a dataset directory".to_string());
             return;
@@ -1093,13 +1246,137 @@ impl ScannerApp {
             dataset: PathBuf::from(dataset),
             output,
             iterations: self.trainer_config.iterations,
+            preview_every: self.trainer_config.preview_every,
+            viewer: self.trainer_config.viewer,
         };
         match TrainerHandle::start(config) {
             Ok(handle) => {
                 self.trainer = Some(handle);
                 self.trainer_error = None;
+                // A new run: its first preview should frame the camera again,
+                // and an old run's preview must not count as already shown.
+                self.loaded_preview = None;
+                self.preview_load = None;
+                self.first_preview_pending = true;
             }
             Err(error) => self.trainer_error = Some(error),
+        }
+    }
+
+    /// Follow the trainer: start a run after an export when asked to, and show
+    /// each preview model Brush writes.
+    fn poll_trainer(&mut self) {
+        self.maybe_auto_train();
+
+        // Collect a model a worker thread has finished reading.
+        let finished = self.preview_load.as_ref().map(|load| {
+            (load.iteration, load.path.clone(), load.receiver.try_recv())
+        });
+        match finished {
+            Some((iteration, path, Ok(result))) => {
+                self.preview_load = None;
+                match result {
+                    Ok(cloud) => self.show_preview(iteration, &path, cloud),
+                    Err(error) => {
+                        // Give up on this one: the next preview, or the final
+                        // model, will be tried on its own.
+                        self.splat_error = Some(error);
+                        self.loaded_preview = Some(iteration);
+                    }
+                }
+            }
+            Some((iteration, _, Err(mpsc::TryRecvError::Disconnected))) => {
+                self.preview_load = None;
+                self.loaded_preview = Some(iteration);
+            }
+            Some((_, _, Err(mpsc::TryRecvError::Empty))) | None => {}
+        }
+
+        if !self.trainer_config.auto_preview || self.preview_load.is_some() {
+            return;
+        }
+        let Some(latest) = self
+            .trainer
+            .as_ref()
+            .and_then(|trainer| trainer.snapshot().previews.last().cloned())
+        else {
+            return;
+        };
+        if self.loaded_preview.is_some_and(|shown| shown >= latest.iteration) {
+            return;
+        }
+
+        let (sender, receiver) = mpsc::channel();
+        let path = latest.path.clone();
+        std::thread::spawn(move || {
+            let _ = sender.send(SplatCloud::load(&path));
+        });
+        self.preview_load = Some(PreviewLoad {
+            iteration: latest.iteration,
+            path: latest.path,
+            receiver,
+        });
+    }
+
+    /// Start training the moment an export lands, if asked to. The decision is
+    /// made once, at the transition into Exported, so ticking the box later
+    /// does not retrain an export that was already on screen.
+    fn maybe_auto_train(&mut self) {
+        if self.snapshot.status != Status::Exported {
+            self.auto_train_armed = true;
+            return;
+        }
+        let fire = self.auto_train_armed && self.trainer_config.auto_train;
+        self.auto_train_armed = false;
+        if !fire {
+            return;
+        }
+
+        let Some(dataset) = self.snapshot.dataset.clone() else {
+            self.trainer_error = Some(
+                "Train after export is on, but this export wrote no dataset; set a dataset \
+                 directory in Output"
+                    .to_string(),
+            );
+            return;
+        };
+        if self
+            .trainer
+            .as_ref()
+            .is_some_and(|trainer| trainer.snapshot().status.active())
+        {
+            return;
+        }
+        self.trainer_config.dataset = dataset.dir.display().to_string();
+        self.start_trainer(&dataset.warnings);
+    }
+
+    fn show_preview(&mut self, iteration: usize, path: &Path, cloud: SplatCloud) {
+        if self.first_preview_pending {
+            self.frame_splats(cloud.bounds);
+            self.show_splats = true;
+            self.first_preview_pending = false;
+        }
+        self.splat_path = path.display().to_string();
+        self.splat_error = None;
+        self.splat = Some(cloud);
+        self.loaded_preview = Some(iteration);
+        self.dirty = true;
+    }
+
+    /// Point the camera at a splat model: from inside it when it surrounds the
+    /// origin (a room scan), otherwise framed from outside.
+    fn frame_splats(&mut self, bounds: (Vector3<f32>, Vector3<f32>)) {
+        let (min, max) = bounds;
+        let contains_origin = min
+            .iter()
+            .zip(max.iter())
+            .all(|(min, max)| *min <= 0.0 && *max >= 0.0);
+        if contains_origin {
+            self.camera
+                .look_from(Vector3::zeros(), Vector3::new(0.0, 0.0, 2.0));
+        } else {
+            self.camera.fit(min, max);
         }
     }
 
@@ -1113,17 +1390,7 @@ impl ScannerApp {
 
         match SplatCloud::load(Path::new(path)) {
             Ok(cloud) => {
-                let (min, max) = cloud.bounds;
-                let contains_origin = min
-                    .iter()
-                    .zip(max.iter())
-                    .all(|(min, max)| *min <= 0.0 && *max >= 0.0);
-                if contains_origin {
-                    self.camera
-                        .look_from(Vector3::zeros(), Vector3::new(0.0, 0.0, 2.0));
-                } else {
-                    self.camera.fit(min, max);
-                }
+                self.frame_splats(cloud.bounds);
                 self.splat = Some(cloud);
                 self.show_splats = true;
                 self.dirty = true;
@@ -1155,7 +1422,13 @@ impl ScannerApp {
             if self.show_splats {
                 if let Some(splat) = &self.splat {
                     ui.separator();
-                    ui.small(format!("{} splats", splat.len()));
+                    match self.loaded_preview {
+                        Some(step) => ui.small(format!(
+                            "{} splats, training step {step}",
+                            splat.len()
+                        )),
+                        None => ui.small(format!("{} splats", splat.len())),
+                    };
                 }
             } else if let Some(scene) = &self.scene {
                 ui.separator();
@@ -1417,6 +1690,7 @@ impl ScannerApp {
 impl eframe::App for ScannerApp {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_session();
+        self.poll_trainer();
 
         let interval = if self.snapshot.status.is_active() {
             Duration::from_millis(33)
@@ -1610,4 +1884,280 @@ mod tests {
         options.level = true;
         assert!(UiConfig::from_options(&options).level);
     }
+
+    // --- the Splats workflow: Brush detection, auto-train, and live previews ---
+
+    use std::os::unix::fs::PermissionsExt;
+
+    fn workflow_dir(label: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("scan-gui-{label}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        dir
+    }
+
+    /// A stand-in for Brush: answers `--help` with the current flag, then runs
+    /// `body` with the real arguments ($7 is the export path).
+    fn fake_brush(dir: &Path, body: &str) -> PathBuf {
+        let path = dir.join("brush");
+        std::fs::write(
+            &path,
+            format!(
+                "#!/bin/sh\nif [ \"$1\" = \"--help\" ]; then echo '--total-steps'; exit 0; fi\n\
+                 if [ \"$1\" = \"--version\" ]; then echo 'fake-brush 1.0'; exit 0; fi\n{body}\n"
+            ),
+        )
+        .expect("write script");
+        let mut permissions = std::fs::metadata(&path).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&path, permissions).unwrap();
+        path
+    }
+
+    /// A one-splat model in the layout Brush writes, so `SplatCloud::load` accepts it.
+    fn tiny_splat_ply(path: &Path) {
+        let header = "ply\nformat binary_little_endian 1.0\nelement vertex 1\n\
+            property float x\nproperty float y\nproperty float z\n\
+            property float scale_0\nproperty float scale_1\nproperty float scale_2\n\
+            property float opacity\n\
+            property float rot_0\nproperty float rot_1\nproperty float rot_2\nproperty float rot_3\n\
+            property float f_dc_0\nproperty float f_dc_1\nproperty float f_dc_2\nend_header\n";
+        let mut bytes = header.as_bytes().to_vec();
+        for value in [1.0f32, 2.0, 3.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0] {
+            bytes.extend_from_slice(&value.to_le_bytes());
+        }
+        std::fs::write(path, bytes).expect("write ply");
+    }
+
+    fn app_with_brush(brush: Option<BrushInstall>) -> ScannerApp {
+        let mut app = ScannerApp::new(&Options::default(), SourceChoice::Synthetic, String::new());
+        app.brush = brush;
+        app
+    }
+
+    fn exported_snapshot(dataset: &Path) -> SessionSnapshot {
+        let mut snapshot = SessionSnapshot::default();
+        snapshot.status = Status::Exported;
+        snapshot.dataset = Some(session::DatasetSummary {
+            dir: dataset.to_path_buf(),
+            views: 3,
+            points: 10,
+            skipped: 0,
+            warnings: Vec::new(),
+        });
+        snapshot
+    }
+
+    fn wait_until(timeout: Duration, mut done: impl FnMut() -> bool) -> bool {
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            if done() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        done()
+    }
+
+    #[test]
+    fn the_trainer_defaults_use_the_detected_brush_and_five_thousand_step_previews() {
+        let ui = TrainerUi::default();
+        assert!(ui.program.is_empty(), "blank means the Brush found on PATH");
+        assert_eq!(ui.preview_every, 5_000);
+        assert!(ui.auto_preview, "previews are shown unless turned off");
+        assert!(!ui.viewer && !ui.auto_train, "the extras are opt-in");
+    }
+
+    #[test]
+    fn training_without_brush_says_where_to_get_it_instead_of_failing_silently() {
+        let dir = workflow_dir("nobrush");
+        let mut app = app_with_brush(None);
+        app.trainer_config.dataset = dir.display().to_string();
+        app.trainer_config.output = dir.join("out").display().to_string();
+
+        app.start_trainer(&[]);
+
+        let error = app.trainer_error.clone().expect("an error is shown");
+        assert!(error.contains("Brush was not found"), "{error}");
+        assert!(error.contains(BRUSH_RELEASES_URL), "{error}");
+        assert!(app.trainer.is_none());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_blank_trainer_field_runs_the_detected_brush() {
+        let dir = workflow_dir("detected");
+        let script = fake_brush(&dir, "printf x > \"$7/export_10.ply\"");
+        let mut app = app_with_brush(Some(BrushInstall {
+            path: script,
+            version: "fake-brush 1.0".to_string(),
+        }));
+        app.trainer_config.dataset = dir.display().to_string();
+        app.trainer_config.output = dir.join("out").display().to_string();
+        app.trainer_config.iterations = 10;
+        // Stale state from an earlier run must be cleared by a new one.
+        app.loaded_preview = Some(99);
+        app.first_preview_pending = false;
+
+        app.start_trainer(&[]);
+
+        assert!(app.trainer_error.is_none(), "{:?}", app.trainer_error);
+        assert!(app.trainer.is_some(), "the blank field must resolve to the detected Brush");
+        assert_eq!(app.loaded_preview, None, "a new run forgets the old preview");
+        assert!(app.first_preview_pending, "and frames the camera again");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn training_starts_once_when_an_export_lands_and_only_if_asked() {
+        let dir = workflow_dir("autotrain");
+        let dataset = dir.join("dataset");
+        std::fs::create_dir_all(&dataset).unwrap();
+        let script = fake_brush(&dir, "printf x > \"$7/export_10.ply\"");
+        let install = BrushInstall { path: script, version: String::new() };
+
+        // Asked for: a scan is in progress, then an export lands.
+        let mut app = app_with_brush(Some(install.clone()));
+        app.trainer_config.auto_train = true;
+        app.trainer_config.iterations = 10;
+        app.trainer_config.output = dir.join("out").display().to_string();
+        app.snapshot.status = Status::Running;
+        app.maybe_auto_train();
+        assert!(app.trainer.is_none(), "nothing to train while scanning");
+
+        app.snapshot = exported_snapshot(&dataset);
+        app.maybe_auto_train();
+        assert!(app.trainer.is_some(), "the export should start training");
+        assert_eq!(app.trainer_config.dataset, dataset.display().to_string());
+
+        // The decision was made once: dropping the run and polling again, with the
+        // same export still on screen, must not start another.
+        app.trainer = None;
+        app.maybe_auto_train();
+        assert!(app.trainer.is_none(), "an export already on screen is not retrained");
+
+        // Not asked for: the same sequence trains nothing, and ticking the box
+        // afterwards does not retrain the export that is still on screen.
+        let mut app = app_with_brush(Some(install));
+        app.trainer_config.output = dir.join("out2").display().to_string();
+        app.snapshot.status = Status::Running;
+        app.maybe_auto_train();
+        app.snapshot = exported_snapshot(&dataset);
+        app.maybe_auto_train();
+        assert!(app.trainer.is_none());
+        app.trainer_config.auto_train = true;
+        app.maybe_auto_train();
+        assert!(app.trainer.is_none(), "ticking the box late must not retrain");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn auto_train_without_a_dataset_says_so() {
+        let mut app = app_with_brush(None);
+        app.trainer_config.auto_train = true;
+        app.snapshot.status = Status::Running;
+        app.maybe_auto_train();
+
+        let mut snapshot = SessionSnapshot::default();
+        snapshot.status = Status::Exported; // exported, but no dataset requested
+        app.snapshot = snapshot;
+        app.maybe_auto_train();
+
+        let error = app.trainer_error.clone().expect("an explanation");
+        assert!(error.contains("dataset"), "{error}");
+        assert!(app.trainer.is_none());
+    }
+
+    #[test]
+    fn the_first_preview_frames_the_view_and_later_ones_only_swap_the_model() {
+        let cloud = |x: f32| SplatCloud {
+            splats: vec![splat::Splat {
+                position: Vector3::new(x, 0.0, 1.0),
+                scale: Vector3::new(0.1, 0.1, 0.1),
+                rotation: nalgebra::UnitQuaternion::identity(),
+                opacity: 0.5,
+                color: [0.5; 3],
+            }],
+            bounds: (Vector3::new(x, 0.0, 1.0), Vector3::new(x, 0.0, 1.0)),
+        };
+        let mut app = app_with_brush(None);
+        assert!(!app.show_splats);
+
+        app.show_preview(1000, Path::new("export_1000.ply"), cloud(1.0));
+        assert!(app.show_splats, "the first preview switches to splats");
+        assert!(!app.first_preview_pending);
+        assert_eq!(app.loaded_preview, Some(1000));
+
+        // The operator goes back to the mesh; a later preview must not yank them.
+        app.show_splats = false;
+        app.show_preview(2000, Path::new("export_2000.ply"), cloud(2.0));
+        assert!(!app.show_splats, "later previews must not change the view mode");
+        assert_eq!(app.loaded_preview, Some(2000));
+        assert_eq!(app.splat_path, "export_2000.ply");
+        assert_eq!(app.splat.as_ref().unwrap().splats[0].position.x, 2.0);
+    }
+
+    #[test]
+    fn a_preview_the_trainer_writes_is_loaded_into_the_viewport_on_its_own() {
+        let dir = workflow_dir("preview");
+        let fixture = dir.join("fixture.ply");
+        tiny_splat_ply(&fixture);
+        let script = fake_brush(
+            &dir,
+            &format!("cp \"{}\" \"$7/export_5.ply\"", fixture.display()),
+        );
+        let mut app = app_with_brush(Some(BrushInstall { path: script, version: String::new() }));
+        app.trainer_config.dataset = dir.display().to_string();
+        app.trainer_config.output = dir.join("out").display().to_string();
+        app.trainer_config.iterations = 5;
+        app.trainer_config.preview_every = 5;
+
+        app.start_trainer(&[]);
+        assert!(app.trainer.is_some(), "{:?}", app.trainer_error);
+
+        let shown = wait_until(Duration::from_secs(15), || {
+            app.poll_trainer();
+            app.splat.is_some()
+        });
+        assert!(shown, "no preview reached the viewport; error {:?}", app.splat_error);
+        assert_eq!(app.loaded_preview, Some(5));
+        assert!(app.show_splats, "the first preview switches the viewport to splats");
+        assert_eq!(app.splat.as_ref().unwrap().len(), 1);
+        assert!(app.preview_load.is_none(), "the background load is collected");
+
+        // With Live preview off, the same export is not loaded again.
+        app.splat = None;
+        app.trainer_config.auto_preview = false;
+        app.loaded_preview = None;
+        app.poll_trainer();
+        assert!(app.splat.is_none() && app.preview_load.is_none());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_preview_that_cannot_be_read_is_reported_and_not_retried_forever() {
+        let dir = workflow_dir("badpreview");
+        // Not a splat file: loading must fail once, be reported, and stop.
+        let script = fake_brush(&dir, "printf 'not a ply' > \"$7/export_5.ply\"");
+        let mut app = app_with_brush(Some(BrushInstall { path: script, version: String::new() }));
+        app.trainer_config.dataset = dir.display().to_string();
+        app.trainer_config.output = dir.join("out").display().to_string();
+        app.trainer_config.iterations = 5;
+        app.trainer_config.preview_every = 5;
+        app.start_trainer(&[]);
+
+        let reported = wait_until(Duration::from_secs(15), || {
+            app.poll_trainer();
+            app.splat_error.is_some()
+        });
+        assert!(reported, "the failure should reach the panel");
+        assert_eq!(app.loaded_preview, Some(5), "the bad preview is marked handled");
+        for _ in 0..5 {
+            app.poll_trainer();
+        }
+        assert!(app.preview_load.is_none(), "it must not be retried every frame");
+        assert!(app.splat.is_none());
+        let _ = std::fs::remove_dir_all(dir);
+    }
 }
+

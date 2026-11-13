@@ -50,6 +50,64 @@ pub fn encode_rgb8(width: u32, height: u32, rgb: &[u8]) -> io::Result<Vec<u8>> {
     Ok(png)
 }
 
+/// Grow `png` to at least `min_len` bytes by adding an ancillary `tEXt` chunk
+/// between the last image-data chunk and `IEND`.
+///
+/// Some readers sniff an image's format and size from a fixed-size first read
+/// and treat a shorter file as truncated. Brush 0.3.0 reads exactly 16,387
+/// bytes with `read_exact`, so any image file below that fails to load with
+/// "early eof" -- which is every frame of a small synthetic capture. Padding
+/// keeps such files loadable without touching a single pixel.
+///
+/// The chunk goes *after* the image data on purpose: a decoder only needs the
+/// header and the first `IDAT` to learn the dimensions, so those stay at the
+/// front of the file whatever the padding length. `tEXt` after `IDAT` is legal
+/// and every decoder ignores it. A file already long enough is returned as is,
+/// and so is anything that does not end in a well-formed `IEND`.
+pub fn pad_to_min_size(mut png: Vec<u8>, min_len: usize) -> Vec<u8> {
+    const IEND: [u8; 12] = [0, 0, 0, 0, b'I', b'E', b'N', b'D', 0xAE, 0x42, 0x60, 0x82];
+    const KEYWORD: &[u8] = b"Comment\0";
+    // length (4) + type (4) + keyword + crc (4)
+    const OVERHEAD: usize = 12 + KEYWORD.len();
+
+    if png.len() >= min_len || png.len() < 8 + IEND.len() || !png.ends_with(&IEND) {
+        return png;
+    }
+
+    let body_len = (min_len - png.len()).max(OVERHEAD) - 12;
+    let mut body = Vec::with_capacity(body_len);
+    body.extend_from_slice(KEYWORD);
+    body.resize(body_len, b' ');
+
+    let mut chunk = Vec::with_capacity(12 + body_len);
+    chunk.extend_from_slice(&(body_len as u32).to_be_bytes());
+    chunk.extend_from_slice(b"tEXt");
+    chunk.extend_from_slice(&body);
+    let crc = crc32(&chunk[4..]);
+    chunk.extend_from_slice(&crc.to_be_bytes());
+
+    let iend_at = png.len() - IEND.len();
+    png.splice(iend_at..iend_at, chunk);
+    png
+}
+
+/// CRC-32 (IEEE, reflected) as PNG chunks use it. Bitwise: chunks here are
+/// small and this runs once per padded image.
+fn crc32(bytes: &[u8]) -> u32 {
+    let mut crc = 0xFFFF_FFFFu32;
+    for &byte in bytes {
+        crc ^= u32::from(byte);
+        for _ in 0..8 {
+            crc = if crc & 1 != 0 {
+                (crc >> 1) ^ 0xEDB8_8320
+            } else {
+                crc >> 1
+            };
+        }
+    }
+    !crc
+}
+
 /// Inflate a PNG this module produced and return `(width, height, rgb)`.
 #[cfg(test)]
 pub(crate) fn decode_rgb8(bytes: &[u8]) -> io::Result<(u32, u32, Vec<u8>)> {
@@ -173,5 +231,54 @@ mod tests {
             bytes > 190_000_000,
             "stored 8192 atlas would be {bytes} bytes"
         );
+    }
+
+    #[test]
+    fn crc32_matches_the_png_specification_check_value() {
+        // The standard CRC-32 check value for the ASCII digits "123456789".
+        assert_eq!(crc32(b"123456789"), 0xCBF4_3926);
+        // IEND's well-known CRC, which `pad_to_min_size` relies on.
+        assert_eq!(crc32(b"IEND"), 0xAE42_6082);
+    }
+
+    #[test]
+    fn padding_reaches_the_minimum_without_changing_a_pixel() {
+        let rgb: Vec<u8> = (0..12 * 9 * 3).map(|i| (i * 7 % 251) as u8).collect();
+        let png = encode_rgb8(12, 9, &rgb).expect("encode");
+        assert!(png.len() < 16_400, "the fixture must start small");
+
+        let padded = pad_to_min_size(png.clone(), 16_400);
+        assert!(padded.len() >= 16_400, "padded to {}", padded.len());
+        assert!(padded.len() < 16_400 + 64, "overshot to {}", padded.len());
+
+        // Still a valid PNG with the same image: the decoder verifies chunk CRCs.
+        let (width, height, decoded) = decode_rgb8(&padded).expect("decode padded");
+        assert_eq!((width, height), (12, 9));
+        assert_eq!(decoded, rgb);
+
+        // The header and the first IDAT stay at the front, where a size sniff
+        // looks; only the tail grew.
+        assert_eq!(&padded[..png.len() - 12], &png[..png.len() - 12]);
+        assert!(padded.ends_with(&png[png.len() - 12..]), "IEND must stay last");
+    }
+
+    #[test]
+    fn padding_leaves_a_long_enough_or_malformed_file_alone() {
+        let png = encode_rgb8(4, 4, &[9; 48]).expect("encode");
+        assert_eq!(pad_to_min_size(png.clone(), png.len()), png);
+        assert_eq!(pad_to_min_size(png.clone(), 10), png);
+
+        let truncated = png[..png.len() - 3].to_vec();
+        assert_eq!(pad_to_min_size(truncated.clone(), 20_000), truncated);
+        assert_eq!(pad_to_min_size(Vec::new(), 100), Vec::<u8>::new());
+    }
+
+    #[test]
+    fn a_tiny_deficit_still_produces_a_valid_chunk() {
+        let png = encode_rgb8(4, 4, &[9; 48]).expect("encode");
+        // One byte short: the chunk has a fixed minimum size, so it overshoots.
+        let padded = pad_to_min_size(png.clone(), png.len() + 1);
+        assert!(padded.len() > png.len() + 1);
+        assert!(decode_rgb8(&padded).is_ok());
     }
 }
