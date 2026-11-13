@@ -150,6 +150,7 @@ six-dimensional correlative search is too expensive for a live frame.
 | [Scanner window](docs/gui.md) | Sources, panels, viewport controls, transport, telemetry, Splats |
 | [Colour](docs/colour.md) | Registration, visibility tests, colour modes, output formats |
 | [Datasets and splats](docs/datasets.md) | Dataset layout, quality gate, Brush smoke test, real-capture results |
+| [Improving splats](docs/splat-improvements.md) | Using depth to improve splats, live training updates, what was and was not checked |
 | [How it works](docs/how-it-works.md) | Pipeline, odometry, fusion, mesh extraction, loop closure |
 | [Performance](docs/performance.md) | Measured timings, GPU decode results, profiling notes |
 | [Development](docs/development.md) | Layout, tests, vendored driver, diagnostics, known gaps |
