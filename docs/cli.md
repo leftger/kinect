@@ -129,6 +129,12 @@ pose, and only a failed ICP falls back to the 4-DOF global search. Nothing is
 fused and the prior is never changed. Without `--out`, the poses are printed
 only.
 
+A map saved by `scan` is mirrored in X unless it was exported with `--mirror`,
+and `localize` compares against the sensor frame. It does not matter which you
+have: if no frame has been located yet and one fails, that frame is retried
+against an X-flipped copy of the prior. The first orientation that locates is
+used for the rest of the run, and a line says which one it was.
+
 `--frames N` limits how many recording frames or live frames are localised; live
 defaults to 60. The first frame starts from identity, so the recording should
 begin near the prior map's origin or within the global search radius. A room

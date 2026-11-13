@@ -548,6 +548,8 @@ fn usage_text() -> String {
          \x20               or be depth only. With `gui`, preselects replay.\n\
          \x20 --map FILE    `localize`: prior map as ASCII or binary little-endian\n\
          \x20               PLY. With --live, use the sensor instead of --in. Only the vertex positions are read.\n\
+         \x20               A map exported with or without --mirror both work: the\n\
+         \x20               orientation is detected on the first frames.\n\
          \x20 --synthetic   On `gui`: use the analytic room, no sensor needed.\n\
          \x20 --auto-start  On `gui`: start the selected source when the window\n\
          \x20               opens. `live --viewer` does this too.\n\
@@ -939,6 +941,7 @@ async fn localize(options: &Options) -> Result<(), Box<dyn Error>> {
         map.len(),
         map_path.display()
     );
+    let mut prior = Prior::new(prior_points, params, map);
 
     let mut pose = Isometry3::identity();
     let mut trajectory = Vec::new();
@@ -962,9 +965,7 @@ async fn localize(options: &Options) -> Result<(), Box<dyn Error>> {
             points.retain(|point| {
                 point.z >= options.tsdf.min_depth && point.z <= options.tsdf.max_depth
             });
-            if let Some(global) =
-                localize_cloud(index, &points, &map, &params, &mut pose, &mut trajectory)
-            {
+            if let Some(global) = prior.locate(index, &points, &mut pose, &mut trajectory) {
                 located += 1;
                 global_hits += global as usize;
             }
@@ -992,9 +993,7 @@ async fn localize(options: &Options) -> Result<(), Box<dyn Error>> {
             points.retain(|point| {
                 point.z >= options.tsdf.min_depth && point.z <= options.tsdf.max_depth
             });
-            if let Some(global) =
-                localize_cloud(index, &points, &map, &params, &mut pose, &mut trajectory)
-            {
+            if let Some(global) = prior.locate(index, &points, &mut pose, &mut trajectory) {
                 located += 1;
                 global_hits += global as usize;
             }
@@ -1023,34 +1022,113 @@ async fn localize(options: &Options) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-fn localize_cloud(
-    index: usize,
-    points: &[Vector3<f32>],
-    map: &FrozenMap,
-    params: &FrozenMapParams,
-    pose: &mut Isometry3<f32>,
-    trajectory: &mut Vec<Vector3<f32>>,
-) -> Option<bool> {
-    match map.localize(points, *pose, params) {
-        Some(found) => {
-            *pose = found.pose;
-            trajectory.push(pose.translation.vector);
-            let global = found.score > 0.0;
-            println!(
-                "[localize] {:5} t=({:+.3},{:+.3},{:+.3}) inliers {:.2} rmse {:.3}{}",
-                index + 1,
-                pose.translation.x,
-                pose.translation.y,
-                pose.translation.z,
-                found.inlier_ratio,
-                found.rmse,
-                if global { " global" } else { "" }
-            );
-            Some(global)
+/// A frozen prior map that may be stored mirrored.
+///
+/// `scan` flips X on export by default, so a PLY written without `--mirror` is
+/// the mirror image of the sensor frame that `localize` compares live depth
+/// against. Rather than make the user remember that, the map is used as given
+/// until the first frame is located; a frame that fails before that point is
+/// retried against the other orientation, built lazily. The first orientation
+/// that locates wins and is kept for the rest of the run.
+struct Prior {
+    points: Vec<Vector3<f32>>,
+    params: FrozenMapParams,
+    map: FrozenMap,
+    flipped: Option<FrozenMap>,
+    use_flipped: bool,
+    located_any: bool,
+    flip_attempts: usize,
+}
+
+/// How many failed frames may trigger a try of the other orientation. A bad
+/// frame should not decide the orientation, but a genuinely lost scan should
+/// not keep paying for a second solve forever.
+const MAX_FLIP_ATTEMPTS: usize = 5;
+
+impl Prior {
+    fn new(points: Vec<Vector3<f32>>, params: FrozenMapParams, map: FrozenMap) -> Self {
+        Self {
+            points,
+            params,
+            map,
+            flipped: None,
+            use_flipped: false,
+            located_any: false,
+            flip_attempts: 0,
         }
-        None => {
-            println!("[localize] {:5} lost; keeping the last pose", index + 1);
-            None
+    }
+
+    fn active(&self) -> &FrozenMap {
+        match (&self.flipped, self.use_flipped) {
+            (Some(flipped), true) => flipped,
+            _ => &self.map,
+        }
+    }
+
+    /// Localise one frame, auto-detecting a mirrored prior before the first hit.
+    fn locate(
+        &mut self,
+        index: usize,
+        points: &[Vector3<f32>],
+        pose: &mut Isometry3<f32>,
+        trajectory: &mut Vec<Vector3<f32>>,
+    ) -> Option<bool> {
+        let mut found = self.active().localize(points, *pose, &self.params);
+
+        if found.is_none() && !self.located_any && self.flip_attempts < MAX_FLIP_ATTEMPTS {
+            self.flip_attempts += 1;
+            if self.flipped.is_none() {
+                let mirrored: Vec<Vector3<f32>> = self
+                    .points
+                    .iter()
+                    .map(|point| Vector3::new(-point.x, point.y, point.z))
+                    .collect();
+                self.flipped = FrozenMap::from_points(&mirrored, &self.params);
+            }
+            let other = !self.use_flipped;
+            let candidate = if other {
+                self.flipped.as_ref()
+            } else {
+                Some(&self.map)
+            };
+            if let Some(result) =
+                candidate.and_then(|map| map.localize(points, *pose, &self.params))
+            {
+                self.use_flipped = other;
+                println!(
+                    "[localize] prior matches only when {}; using it that way",
+                    if other {
+                        "mirrored in X (it was exported without --mirror)"
+                    } else {
+                        "as stored"
+                    }
+                );
+                found = Some(result);
+            }
+        }
+
+        match found {
+            Some(found) => {
+                self.located_any = true;
+                *pose = found.pose;
+                trajectory.push(pose.translation.vector);
+                let global = found.score > 0.0;
+                println!(
+                    "[localize] {:5} t=({:+.3},{:+.3},{:+.3}) inliers {:.2} rmse {:.3}{}",
+                    index + 1,
+                    pose.translation.x,
+                    pose.translation.y,
+                    pose.translation.z,
+                    found.inlier_ratio,
+                    found.rmse,
+                    if global { " global" } else { "" }
+                );
+                Some(global)
+            }
+            None => {
+                println!("[localize] {:5} lost; keeping the last pose", index + 1);
+                None
+            }
         }
     }
 }

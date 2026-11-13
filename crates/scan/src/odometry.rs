@@ -785,7 +785,15 @@ impl Odometry {
             }
         }
 
+        // Composing `Isometry3`s multiplies quaternions without renormalising,
+        // and `inverse()` is a conjugate. The next frame's `base` and `guess`
+        // are derived from this candidate, so a 1e-7 norm error feeds back and
+        // compounds until the rotation scales vectors. Pin it to unit norm.
         let candidate = base * transform;
+        let candidate = Isometry3::from_parts(
+            candidate.translation,
+            UnitQuaternion::new_normalize(*candidate.rotation.quaternion()),
+        );
 
         // Motion between this frame and the frame the target came from. `base` is
         // the predicted pose of *that* frame, so this is one frame's worth of
