@@ -15,12 +15,14 @@
 //! 7. [`texturing`] — atlas built from the colour views.
 //! 8. [`export`] — write that mesh as PLY, OBJ, glTF or GLB.
 //! 9. [`png`] — the compressed RGB image those textured formats embed or sit beside.
+//! 10. [`level`] — optionally rotate a finished model so its floor is horizontal.
 
 pub mod coloring;
 pub mod export;
 pub mod frozen_map;
 pub mod global_search;
 pub mod icp;
+pub mod level;
 pub mod mesh;
 pub mod normals;
 pub mod png;

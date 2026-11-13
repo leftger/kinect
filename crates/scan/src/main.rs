@@ -48,6 +48,7 @@ use geom::DepthImage;
 use geom::coloring::{ColorMode, ColoringParams, ColoringReport};
 use geom::export::{self, MeshFormat};
 use geom::frozen_map::{FrozenMap, FrozenMapParams};
+use geom::level::{self, LevelParams, Leveling};
 use geom::texturing::TexturingReport;
 use geom::tsdf::TsdfParams;
 use loop_closure::LoopClosureConfig;
@@ -110,6 +111,9 @@ struct Options {
     /// Un-mirror the reconstruction horizontally so real-world left and right match.
     /// True by default: the Kinect v2 sensor reads out mirrored frames.
     unmirror: bool,
+    /// Rotate the exported model so its dominant floor or ceiling is horizontal.
+    /// Off by default: it assumes a large flat surface and an upright sensor.
+    level: bool,
     /// Track each frame against a render of the fused model instead of against
     /// the previous frame, so tracking error stops accumulating.
     ///
@@ -193,6 +197,7 @@ impl Default for Options {
             preview_every: 2,
             playback_fps: 10.0,
             unmirror: true,
+            level: false,
             frame_to_model: false,
             relocalize: false,
             submaps: true,
@@ -328,6 +333,7 @@ fn parse_args(
             "--gpu" => options.gpu = true,
             "--mirror" => options.unmirror = false,
             "--no-mirror" | "--unmirror" => options.unmirror = true,
+            "--level" => options.level = true,
             "--frame-to-model" => options.frame_to_model = true,
             "--relocalize" => options.relocalize = true,
             "--relocalize-keyframes" => {
@@ -690,6 +696,11 @@ fn usage_text() -> String {
          \x20               X to match real-world coordinates (un-mirrored by default).\n\
          \x20               A dataset is always written in the sensor frame, so this\n\
          \x20               does not apply to --dataset.\n\
+         \x20 --level       Rotate the exported mesh and trajectory so the floor or\n\
+         \x20               ceiling is horizontal. The world frame is the first camera\n\
+         \x20               frame, so a tilted start gives a tilted model. Needs a\n\
+         \x20               large flat surface within 25 degrees of level; otherwise\n\
+         \x20               the model is left as scanned. Not applied to --dataset.\n\
          \x20 --dataset DIR With colour views (live --color, or a colour recording):\n\
          \x20               also write a dataset a Gaussian-\n\
          \x20               splatting trainer can read. DIR gains images/ (the\n\
@@ -1303,6 +1314,40 @@ pub(crate) struct FinishSummary {
     pub loop_attempts: usize,
 }
 
+/// Level an exported model in place and say what happened.
+///
+/// Estimated from, and applied to, the mesh as it will be written, so the mesh
+/// and the trajectory (which the caller rotates with the returned [`Leveling`])
+/// stay in the same frame. `None` means the model was left exactly as scanned.
+fn level_export(exported: &mut ExportMesh) -> Option<Leveling> {
+    let params = LevelParams::default();
+    let found = match exported {
+        ExportMesh::Geometry(mesh, _) => level::estimate(&mesh.vertices, &params),
+        ExportMesh::Atlas(textured, _) => level::estimate(&textured.positions, &params),
+    };
+
+    let Some(leveling) = found else {
+        println!(
+            "[scan] level: no large horizontal surface within {:.0} degrees of level; \
+             left as scanned",
+            params.max_tilt.to_degrees()
+        );
+        return None;
+    };
+
+    match exported {
+        ExportMesh::Geometry(mesh, _) => mesh.rotate(&leveling.rotation),
+        ExportMesh::Atlas(textured, _) => textured.rotate(&leveling.rotation),
+    }
+    println!(
+        "[scan] level: rotated {:.1} degrees to put the dominant floor/ceiling plane \
+         horizontal ({:.1}% of sampled points)",
+        leveling.tilt.to_degrees(),
+        leveling.inlier_fraction * 100.0
+    );
+    Some(leveling)
+}
+
 /// Close loops, then write the mesh. Live, replay, and the scanner window all
 /// end here, so closing the window still corrects the trajectory before export.
 pub(crate) fn finish_scan(scanner: &mut Scanner, options: &Options) -> Result<(), Box<dyn Error>> {
@@ -1605,7 +1650,8 @@ pub(crate) fn finish(
     // The atlas is built in the volume's frame. Mirroring happens inside
     // `export_mesh`, after that, so positions, normals and winding all flip
     // and the texture coordinates stay on the image that was just painted.
-    let Some(exported) = scanner.export_mesh(options.unmirror, format.uses_texture_atlas()) else {
+    let Some(mut exported) = scanner.export_mesh(options.unmirror, format.uses_texture_atlas())
+    else {
         println!("[scan] no surface extracted - was anything in range?");
         return Ok(FinishSummary {
             output: out,
@@ -1616,6 +1662,14 @@ pub(crate) fn finish(
             loops_dropped,
             loop_attempts,
         });
+    };
+
+    // After the mirror, in whatever frame the file will be written in: `y` is
+    // untouched by the X flip, so "level" means the same thing either way.
+    let leveling = if options.level {
+        level_export(&mut exported)
+    } else {
+        None
     };
 
     let mesh_summary = match &exported {
@@ -1649,7 +1703,7 @@ pub(crate) fn finish(
     println!("[scan] wrote {}", out.display());
 
     let trajectory = out.with_extension("trajectory.ply");
-    let trajectory_points: Vec<Vector3<f32>> = if options.unmirror {
+    let mut trajectory_points: Vec<Vector3<f32>> = if options.unmirror {
         scanner
             .trajectory()
             .iter()
@@ -1658,6 +1712,11 @@ pub(crate) fn finish(
     } else {
         scanner.trajectory().to_vec()
     };
+    if let Some(leveling) = &leveling {
+        for point in &mut trajectory_points {
+            *point = leveling.apply(point);
+        }
+    }
     geom::mesh::save_points_ply(&trajectory, &trajectory_points)?;
     println!(
         "[scan] wrote {} ({} camera positions)",
@@ -1708,6 +1767,7 @@ pub(crate) fn finish(
 mod tests {
     use super::*;
     use geom::Intrinsics;
+    use geom::mesh::Mesh;
 
     #[test]
     fn finish_names_an_unsupported_extension() {
@@ -2330,5 +2390,77 @@ mod tests {
         }
         assert!(trajectory.is_empty());
         assert!(prior.flip_attempts <= MAX_FLIP_ATTEMPTS);
+    }
+
+
+    #[test]
+    fn level_is_opt_in_and_parses() {
+        let (_, options) = parse_args(words(&["replay", "--in", "capture.k2df"])).expect("parse");
+        assert!(!options.level, "levelling must be off unless asked for");
+
+        let (_, options) =
+            parse_args(words(&["replay", "--in", "capture.k2df", "--level"])).expect("parse");
+        assert!(options.level);
+    }
+
+    /// A floor and a wall as a vertex-only mesh, with the sensor pitched by
+    /// `pitch` radians so the floor is not perpendicular to `y`.
+    fn tilted_floor_and_wall(pitch: f32) -> Mesh {
+        let rotation = nalgebra::Rotation3::from_euler_angles(pitch, 0.0, 0.0);
+        let mut vertices = Vec::new();
+        for i in 0..80 {
+            for j in 0..80 {
+                let u = -2.0 + 4.0 * i as f32 / 79.0;
+                let v = 0.5 + 4.0 * j as f32 / 79.0;
+                vertices.push(rotation * Vector3::new(u, 1.4, v));
+                vertices.push(rotation * Vector3::new(u, -1.2 + 2.6 * j as f32 / 79.0, 4.5));
+            }
+        }
+        Mesh {
+            vertices,
+            triangles: Vec::new(),
+            colors: None,
+        }
+    }
+
+    #[test]
+    fn level_export_flattens_a_tilted_floor_and_reports_the_rotation() {
+        let mut exported = ExportMesh::Geometry(tilted_floor_and_wall(8.0f32.to_radians()), None);
+
+        let leveling = level_export(&mut exported).expect("a floor is present");
+        assert!((leveling.tilt.to_degrees() - 8.0).abs() < 0.7, "{}", leveling.tilt.to_degrees());
+
+        let ExportMesh::Geometry(mesh, _) = &exported else {
+            panic!("the export kind must not change");
+        };
+        // The floor vertices (every other one) now sit at one height.
+        let floor: Vec<f32> = mesh.vertices.iter().step_by(2).map(|v| v.y).collect();
+        let low = floor.iter().cloned().fold(f32::MAX, f32::min);
+        let high = floor.iter().cloned().fold(f32::MIN, f32::max);
+        assert!(high - low < 0.06, "the floor still spans {:.3} m", high - low);
+        assert!((floor[0] - 1.4).abs() < 0.08);
+    }
+
+    #[test]
+    fn level_export_leaves_a_scan_without_a_floor_untouched() {
+        // A single vertical wall: nothing horizontal to level against.
+        let wall: Vec<Vector3<f32>> = (0..60 * 60)
+            .map(|i| Vector3::new((i % 60) as f32 * 0.05, -1.2 + (i / 60) as f32 * 0.05, 3.0))
+            .collect();
+        let before = wall.clone();
+        let mut exported = ExportMesh::Geometry(
+            Mesh {
+                vertices: wall,
+                triangles: Vec::new(),
+                colors: None,
+            },
+            None,
+        );
+
+        assert!(level_export(&mut exported).is_none());
+        let ExportMesh::Geometry(mesh, _) = &exported else {
+            panic!("the export kind must not change");
+        };
+        assert_eq!(mesh.vertices, before, "an unlevelled scan must be unchanged");
     }
 }

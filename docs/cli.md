@@ -176,6 +176,7 @@ This is the cheapest way to exercise the Brush hand-off.
 | `--submap-frames N` | Finish a tracking submap after N fused frames; odometry stays continuous |
 | `--submap-metres M` | Finish a tracking submap after M metres of camera motion |
 | `--graph-worker` | Solve the online pose graph (keyframe or submap) off the capture thread; implies `--online-loops` |
+| `--level` | Rotate the exported mesh and trajectory so the floor or ceiling is horizontal; not applied to `--dataset` |
 | `--map FILE` | `localize`: prior map as ASCII or binary little-endian PLY |
 | `--live` | `localize`: use the sensor instead of `--in` |
 | `--no-submaps` | Keep one model and skip unplaceable frames instead of starting a submap |

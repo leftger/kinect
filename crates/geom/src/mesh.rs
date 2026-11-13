@@ -107,6 +107,17 @@ impl Mesh {
         }
     }
 
+    /// Rotate every vertex about the origin.
+    ///
+    /// A proper rotation preserves winding, so triangles are untouched. Normals
+    /// are not stored: [`Mesh::vertex_normals`] derives them from the faces and
+    /// so follows the rotation.
+    pub fn rotate(&mut self, rotation: &nalgebra::Rotation3<f32>) {
+        for v in &mut self.vertices {
+            *v = rotation * *v;
+        }
+    }
+
     pub fn save_ply(&self, path: &Path) -> io::Result<()> {
         let file = File::create(path)?;
         let mut writer = BufWriter::new(file);
@@ -666,5 +677,27 @@ mod tests {
         assert!((read[0] - Vector3::new(0.0, 1.0, 2.0)).norm() < 1e-6);
         assert!((read[1] - Vector3::new(-1.0, 0.5, 3.0)).norm() < 1e-6);
         std::fs::remove_file(&path).ok();
+    }
+
+
+    #[test]
+    fn rotate_turns_vertices_and_keeps_winding_and_normals_consistent() {
+        let mut mesh = tetrahedron();
+        let before_normals = mesh.vertex_normals();
+        let before_triangles = mesh.triangles.clone();
+        let before_vertices = mesh.vertices.clone();
+        let rotation = nalgebra::Rotation3::from_euler_angles(0.3, -0.2, 0.5);
+
+        mesh.rotate(&rotation);
+
+        assert_eq!(mesh.triangles, before_triangles, "a rotation must not touch winding");
+        for (moved, original) in mesh.vertices.iter().zip(&before_vertices) {
+            assert!((moved - rotation * original).norm() < 1.0e-6);
+            assert!((moved.norm() - original.norm()).abs() < 1.0e-5, "rotation changed a length");
+        }
+        // Derived normals follow the rotation, so they still point outward.
+        for (after, before) in mesh.vertex_normals().iter().zip(&before_normals) {
+            assert!((after - rotation * before).norm() < 1.0e-5);
+        }
     }
 }

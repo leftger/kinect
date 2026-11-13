@@ -81,6 +81,17 @@ impl TexturedMesh {
         self.indices.len() / 3
     }
 
+    /// Rotate positions and normals about the origin. Winding and texture
+    /// coordinates are unaffected by a proper rotation.
+    pub fn rotate(&mut self, rotation: &nalgebra::Rotation3<f32>) {
+        for position in &mut self.positions {
+            *position = rotation * *position;
+        }
+        for normal in &mut self.normals {
+            *normal = rotation * *normal;
+        }
+    }
+
     /// Mirror X, as [`Mesh::flip_x`] does, after UVs have been built.
     ///
     /// Positions and normals take the reflection (a normal's X component flips
@@ -1362,5 +1373,35 @@ mod tests {
             exposure_scales: Vec::new(),
         };
         assert_eq!(empty.coverage(), 0.0);
+    }
+
+
+    #[test]
+    fn rotate_turns_positions_and_normals_and_keeps_winding_and_uvs() {
+        let mut textured = TexturedMesh {
+            positions: vec![
+                Vector3::new(0.2, 0.0, 2.0),
+                Vector3::new(0.9, 0.1, 2.35),
+                Vector3::new(0.15, 0.7, 2.05),
+            ],
+            normals: vec![Vector3::new(0.0, 0.3, -0.95).normalize(); 3],
+            uvs: vec![[0.1, 0.2], [0.3, 0.4], [0.5, 0.6]],
+            indices: vec![0, 2, 1],
+            atlas: vec![0; 3],
+            atlas_width: 1,
+            atlas_height: 1,
+        };
+        let before = textured.clone();
+        let rotation = nalgebra::Rotation3::from_euler_angles(0.25, 0.1, -0.4);
+
+        textured.rotate(&rotation);
+
+        assert_eq!(textured.indices, before.indices);
+        assert_eq!(textured.uvs, before.uvs);
+        for index in 0..3 {
+            assert!((textured.positions[index] - rotation * before.positions[index]).norm() < 1.0e-6);
+            assert!((textured.normals[index] - rotation * before.normals[index]).norm() < 1.0e-6);
+            assert!((textured.normals[index].norm() - 1.0).abs() < 1.0e-5);
+        }
     }
 }
