@@ -1540,4 +1540,27 @@ mod tests {
             odometry.relocalize_target_frames()
         );
     }
+
+
+    /// Regression: the pose, the next frame's guess and its search base are all
+    /// derived from the previous candidate, so a unit-norm error compounds. Run
+    /// long enough for that feedback to show and require the pose to stay a
+    /// rotation.
+    #[test]
+    fn the_pose_rotation_stays_unit_norm_over_a_long_sequence() {
+        let mut odometry = odometry();
+
+        for step in 0..40 {
+            let eye = Vector3::new(0.03 * step as f32, 0.0, 0.0);
+            let frame = render_room(eye);
+            let image = DepthImage::new(WIDTH, HEIGHT, &frame);
+            odometry.track(&image, None);
+
+            let norm = odometry.pose().rotation.quaternion().norm();
+            assert!(
+                (norm - 1.0).abs() < 1.0e-4,
+                "step {step}: pose rotation has norm {norm}"
+            );
+        }
+    }
 }

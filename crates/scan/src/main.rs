@@ -2248,4 +2248,87 @@ mod tests {
         finish_scan(&mut left, &Options::default()).expect("empty scan");
         assert!(left.closure().is_none());
     }
+
+
+    /// The sensor-frame points of the first synthetic view, as the prior a user
+    /// would have scanned of the same room.
+    fn synthetic_prior() -> (Vec<Vector3<f32>>, Vec<Vector3<f32>>, FrozenMapParams) {
+        let intrinsics = synthetic::intrinsics();
+        let shot = &synthetic::shots(2)[0];
+        let rendered = synthetic::render(shot, &intrinsics);
+        let image = DepthImage::new(synthetic::WIDTH, synthetic::HEIGHT, &rendered.depth);
+        let points = image.to_points(&intrinsics);
+        let params = FrozenMapParams {
+            voxel: 0.04,
+            ..FrozenMapParams::default()
+        };
+        (points.clone(), points, params)
+    }
+
+    fn mirror_x(points: &[Vector3<f32>]) -> Vec<Vector3<f32>> {
+        points
+            .iter()
+            .map(|point| Vector3::new(-point.x, point.y, point.z))
+            .collect()
+    }
+
+    #[test]
+    fn a_prior_in_the_sensor_frame_is_used_as_stored() {
+        let (stored, query, params) = synthetic_prior();
+        let map = FrozenMap::from_points(&stored, &params).expect("map");
+        let mut prior = Prior::new(stored, params, map);
+
+        let mut pose = Isometry3::identity();
+        let mut trajectory = Vec::new();
+        assert!(prior.locate(0, &query, &mut pose, &mut trajectory).is_some());
+        assert!(!prior.use_flipped, "a matching prior must not be flipped");
+        assert!(prior.flipped.is_none(), "the flipped copy should stay unbuilt");
+        assert_eq!(trajectory.len(), 1);
+    }
+
+    #[test]
+    fn a_mirrored_prior_is_detected_and_flipped_back() {
+        // What `scan` writes by default: the sensor frame, mirrored in X.
+        let (sensor, query, params) = synthetic_prior();
+        let stored = mirror_x(&sensor);
+        let map = FrozenMap::from_points(&stored, &params).expect("map");
+        let mut prior = Prior::new(stored, params, map);
+
+        let mut pose = Isometry3::identity();
+        let mut trajectory = Vec::new();
+        for index in 0..3 {
+            assert!(
+                prior
+                    .locate(index, &query, &mut pose, &mut trajectory)
+                    .is_some(),
+                "frame {index} was not located against the mirrored prior"
+            );
+        }
+        assert!(prior.use_flipped, "the mirrored prior should be flipped");
+        assert_eq!(trajectory.len(), 3);
+        assert!(
+            pose.translation.vector.norm() < 0.05,
+            "the pose should stay near the origin: {:?}",
+            pose.translation.vector
+        );
+    }
+
+    #[test]
+    fn a_prior_that_never_matches_stops_trying_the_flip() {
+        let (sensor, _, params) = synthetic_prior();
+        let map = FrozenMap::from_points(&sensor, &params).expect("map");
+        let mut prior = Prior::new(sensor, params, map);
+
+        // A query nowhere near the map: a plane far outside the working volume.
+        let nothing: Vec<Vector3<f32>> = (0..400)
+            .map(|index| Vector3::new((index % 20) as f32 * 0.05, (index / 20) as f32 * 0.05, 50.0))
+            .collect();
+        let mut pose = Isometry3::identity();
+        let mut trajectory = Vec::new();
+        for index in 0..(MAX_FLIP_ATTEMPTS + 3) {
+            let _ = prior.locate(index, &nothing, &mut pose, &mut trajectory);
+        }
+        assert!(trajectory.is_empty());
+        assert!(prior.flip_attempts <= MAX_FLIP_ATTEMPTS);
+    }
 }

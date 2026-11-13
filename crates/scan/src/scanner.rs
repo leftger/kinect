@@ -3218,4 +3218,65 @@ mod tests {
             scanner.pose().translation.x
         );
     }
+
+
+    /// Regression: `Isometry3` composition does not renormalise its quaternion and
+    /// `inverse()` is a conjugate, so the odometry's `base`/`guess` feedback grew
+    /// the rotation's norm until it scaled vectors. Around frame 22 the tracker
+    /// then failed, the norm-9 candidate seeded `world_from_submap`, and a 1.9 m
+    /// path tracked as roughly 17 m (199 m over 120 frames).
+    #[test]
+    fn a_synthetic_path_tracks_in_one_submap_with_unit_rotations() {
+        let intrinsics = crate::synthetic::intrinsics();
+        let shots = crate::synthetic::shots(30);
+        let mut scanner = Scanner::new(
+            intrinsics,
+            ScannerConfig {
+                tsdf: TsdfParams {
+                    voxel_size: 0.04,
+                    truncation: 0.16,
+                    ..TsdfParams::default()
+                },
+                ..ScannerConfig::default()
+            },
+        );
+
+        for (index, shot) in shots.iter().enumerate() {
+            let rendered = crate::synthetic::render(shot, &intrinsics);
+            let report = scanner.add_frame(
+                &rendered.depth,
+                crate::synthetic::WIDTH,
+                crate::synthetic::HEIGHT,
+            );
+            let norm = report.track.pose.rotation.quaternion().norm();
+            assert!(
+                (norm - 1.0).abs() < 1.0e-3,
+                "frame {index}: pose rotation has norm {norm}"
+            );
+        }
+
+        assert_eq!(
+            scanner.submaps(),
+            1,
+            "a clean synthetic path should not lose tracking: starts {:?}",
+            scanner.submap_starts()
+        );
+
+        // The world frame is the first frame's camera frame, so divide the
+        // anchor out before comparing with the true path.
+        let anchor = shots[0].pose;
+        let truth: Vec<Vector3<f32>> = shots
+            .iter()
+            .map(|shot| (anchor.inverse() * shot.pose).translation.vector)
+            .collect();
+        let truth_path: f32 = truth.windows(2).map(|pair| (pair[1] - pair[0]).norm()).sum();
+        let lived = scanner.trajectory();
+        let lived_path: f32 = lived.windows(2).map(|pair| (pair[1] - pair[0]).norm()).sum();
+        assert!(
+            (lived_path - truth_path).abs() < 0.25 * truth_path,
+            "tracked {lived_path:.3} m for a {truth_path:.3} m path"
+        );
+        let end_error = (lived[lived.len() - 1] - truth[truth.len() - 1]).norm();
+        assert!(end_error < 0.1, "ended {end_error:.3} m from the truth");
+    }
 }
