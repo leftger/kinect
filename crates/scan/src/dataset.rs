@@ -17,6 +17,7 @@
 //! <dir>/transforms.json   intrinsics, poses, and the path of the point cloud
 //! <dir>/images/00000.png  the registered colour, one file per kept view
 //! <dir>/masks/00000.png   white where a colour sample was registered
+//! <dir>/depth/00000.png   16-bit depth in millimetres (0 = invalid)
 //! <dir>/init.ply          mesh vertices, coloured, as initial Gaussian means
 //! ```
 //!
@@ -97,6 +98,7 @@ const IMAGE_DIR: &str = "images";
 /// looking for a directory named `masks` whose path past that point matches the
 /// image's, and matching the stem.
 const MASK_DIR: &str = "masks";
+const DEPTH_DIR: &str = "depth";
 const TRANSFORMS: &str = "transforms.json";
 const INIT_PLY: &str = "init.ply";
 /// Brush 0.3.0 reads exactly 16,387 bytes from each image with `read_exact` to
@@ -121,6 +123,7 @@ pub struct DatasetReport {
 #[derive(Debug)]
 struct Frame {
     file_path: String,
+    depth_path: String,
     matrix: [[f32; 4]; 4],
 }
 
@@ -143,8 +146,9 @@ pub fn write_dataset(scanner: &Scanner, dir: &Path, unmirror: bool) -> io::Resul
 
     let image_dir = dir.join(IMAGE_DIR);
     let mask_dir = dir.join(MASK_DIR);
+    let depth_dir = dir.join(DEPTH_DIR);
 
-    let (frames, skipped) = write_views(views, &image_dir, &mask_dir, unmirror)?;
+    let (frames, skipped) = write_views(views, &image_dir, &mask_dir, &depth_dir, unmirror)?;
 
     // Every view carries the same intrinsics: the scanner copies one `Intrinsics`
     // onto each. Taking the first is therefore not a sample, it is the value.
@@ -263,6 +267,7 @@ fn write_views(
     views: &[ColorView],
     image_dir: &Path,
     mask_dir: &Path,
+    depth_dir: &Path,
     unmirror: bool,
 ) -> io::Result<(Vec<Frame>, usize)> {
     let Some(first) = views.first() else {
@@ -287,6 +292,7 @@ fn write_views(
     // Created here rather than by the caller so this is usable on its own.
     fs::create_dir_all(image_dir)?;
     fs::create_dir_all(mask_dir)?;
+    fs::create_dir_all(depth_dir)?;
 
     let mut frames: Vec<Frame> = Vec::with_capacity(views.len());
     let mut skipped = 0;
@@ -324,8 +330,16 @@ fn write_views(
         let mask = png::encode_rgb8(width as u32, height as u32, &mask)?;
         fs::write(mask_dir.join(&name), mask)?;
 
+        let mut depth_mm = depth_to_mm(&view.depth, width * height);
+        if unmirror {
+            depth_mm = flip_rows(width, height, 1, &depth_mm);
+        }
+        let depth_png = png::encode_gray16(width as u32, height as u32, &depth_mm)?;
+        fs::write(depth_dir.join(&name), depth_png)?;
+
         frames.push(Frame {
             file_path: format!("{IMAGE_DIR}/{name}"),
+            depth_path: format!("{DEPTH_DIR}/{name}"),
             matrix: camera_to_world(pose),
         });
     }
@@ -339,9 +353,9 @@ fn write_views(
     Ok((frames, skipped))
 }
 
-/// Reverse every row of a `width` x `height` image with `channels` bytes per
+/// Reverse every row of a `width` x `height` image with `channels` elements per
 /// pixel: the picture a camera would take of the mirrored scene.
-fn flip_rows(width: usize, height: usize, channels: usize, data: &[u8]) -> Vec<u8> {
+fn flip_rows<T: Copy>(width: usize, height: usize, channels: usize, data: &[T]) -> Vec<T> {
     let row = width * channels;
     let mut out = data.to_vec();
     for y in 0..height {
@@ -451,6 +465,21 @@ fn validity_mask(width: usize, height: usize, valid: &[u8]) -> Vec<u8> {
     mask
 }
 
+/// Convert metric depth (`m`) to 16-bit unsigned millimetres (`0` = invalid).
+fn depth_to_mm(depth: &[f32], pixels: usize) -> Vec<u16> {
+    depth
+        .iter()
+        .take(pixels)
+        .map(|&d| {
+            if d.is_finite() && d > 0.0 {
+                (d * 1000.0).round().clamp(1.0, u16::MAX as f32) as u16
+            } else {
+                0
+            }
+        })
+        .collect()
+}
+
 /// Build `transforms.json`.
 ///
 /// `camera_model` is deliberately absent rather than spelled out. The registered
@@ -474,6 +503,7 @@ fn build_transforms(
     out.push_str(&format!("  \"cy\": {},\n", intrinsics.cy));
     out.push_str(&format!("  \"w\": {width},\n"));
     out.push_str(&format!("  \"h\": {height},\n"));
+    out.push_str("  \"depth_unit_scale_factor\": 0.001,\n");
     if has_init {
         out.push_str(&format!("  \"ply_file_path\": \"{INIT_PLY}\",\n"));
     }
@@ -482,6 +512,10 @@ fn build_transforms(
     for (index, frame) in frames.iter().enumerate() {
         out.push_str("    {\n");
         out.push_str(&format!("      \"file_path\": \"{}\",\n", frame.file_path));
+        out.push_str(&format!(
+            "      \"depth_file_path\": \"{}\",\n",
+            frame.depth_path
+        ));
         out.push_str("      \"transform_matrix\": [\n");
         for (row, values) in frame.matrix.iter().enumerate() {
             let comma = if row == 3 { "" } else { "," };
@@ -765,6 +799,7 @@ mod tests {
             &views,
             &dir.path().join("images"),
             &dir.path().join("masks"),
+            &dir.path().join("depth"),
             false,
         )
         .expect("write");
@@ -806,6 +841,7 @@ mod tests {
             &views,
             &dir.path().join("images"),
             &dir.path().join("masks"),
+            &dir.path().join("depth"),
             false,
         )
         .expect("write");
@@ -813,12 +849,17 @@ mod tests {
         assert_eq!(skipped, 1, "the unusable pose should have been skipped");
         assert_eq!(frames.len(), 2);
         assert_eq!(frames[0].file_path, "images/00000.png");
+        assert_eq!(frames[0].depth_path, "depth/00000.png");
         assert_eq!(frames[1].file_path, "images/00001.png");
+        assert_eq!(frames[1].depth_path, "depth/00001.png");
 
         // Both surviving frames, and nothing for the dropped one.
         assert!(dir.path().join("images/00000.png").exists());
         assert!(dir.path().join("images/00001.png").exists());
         assert!(!dir.path().join("images/00002.png").exists());
+        assert!(dir.path().join("depth/00000.png").exists());
+        assert!(dir.path().join("depth/00001.png").exists());
+        assert!(!dir.path().join("depth/00002.png").exists());
     }
 
     #[test]
@@ -857,6 +898,7 @@ mod tests {
             &[view(good, 0), resized],
             &dir.path().join("images"),
             &dir.path().join("masks"),
+            &dir.path().join("depth"),
             false,
         )
         .expect_err("mixed sizes");
@@ -869,10 +911,12 @@ mod tests {
         let frames = vec![
             Frame {
                 file_path: "images/00000.png".to_string(),
+                depth_path: "depth/00000.png".to_string(),
                 matrix: camera_to_world(&Isometry3::identity()),
             },
             Frame {
                 file_path: "images/00001.png".to_string(),
+                depth_path: "depth/00001.png".to_string(),
                 matrix: camera_to_world(&pose(
                     Vector3::z_axis().into_inner(),
                     0.5,
@@ -887,10 +931,13 @@ mod tests {
         assert!(json.contains("\"fl_y\": 40"), "{json}");
         assert!(json.contains(&format!("\"w\": {WIDTH}")), "{json}");
         assert!(json.contains(&format!("\"h\": {HEIGHT}")), "{json}");
+        assert!(json.contains("\"depth_unit_scale_factor\": 0.001"), "{json}");
         assert!(json.contains("\"ply_file_path\": \"init.ply\""), "{json}");
         assert!(json.contains("\"transform_matrix\""), "{json}");
         assert!(json.contains("\"images/00000.png\""), "{json}");
         assert!(json.contains("\"images/00001.png\""), "{json}");
+        assert!(json.contains("\"depth/00000.png\""), "{json}");
+        assert!(json.contains("\"depth/00001.png\""), "{json}");
 
         // Two frames, so exactly one separating comma between them and no
         // trailing comma before `]`, which JSON does not allow.
@@ -906,6 +953,7 @@ mod tests {
     fn without_an_initial_cloud_the_file_does_not_reference_one() {
         let frames = vec![Frame {
             file_path: "images/00000.png".to_string(),
+            depth_path: "depth/00000.png".to_string(),
             matrix: camera_to_world(&Isometry3::identity()),
         }];
 
@@ -921,6 +969,7 @@ mod tests {
         let frames: Vec<_> = (0..3)
             .map(|i| Frame {
                 file_path: format!("images/{i:05}.png"),
+                depth_path: format!("depth/{i:05}.png"),
                 matrix: camera_to_world(&pose(
                     Vector3::new(1.0, 1.0, 0.0),
                     0.3 * i as f32,
@@ -1069,8 +1118,14 @@ mod tests {
     fn no_views_at_all_is_reported_as_a_missing_colour_stream() {
         let dir = TempDir::new("empty");
 
-        let error = write_views(&[], &dir.path().join("images"), &dir.path().join("masks"), false)
-            .expect_err("no views");
+        let error = write_views(
+            &[],
+            &dir.path().join("images"),
+            &dir.path().join("masks"),
+            &dir.path().join("depth"),
+            false,
+        )
+        .expect_err("no views");
 
         assert!(error.to_string().contains("live --color"), "{error}");
     }
@@ -1087,6 +1142,7 @@ mod tests {
             &[view(broken, 0)],
             &dir.path().join("images"),
             &dir.path().join("masks"),
+            &dir.path().join("depth"),
             false,
         )
         .expect_err("nothing usable");
@@ -1387,6 +1443,7 @@ mod tests {
                 std::slice::from_ref(&source),
                 &dir.path().join("images"),
                 &dir.path().join("masks"),
+                &dir.path().join("depth"),
                 unmirror,
             )
             .expect("write");

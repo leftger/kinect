@@ -50,6 +50,40 @@ pub fn encode_rgb8(width: u32, height: u32, rgb: &[u8]) -> io::Result<Vec<u8>> {
     Ok(png)
 }
 
+/// Encode `gray` as a 16-bit grayscale PNG, row-major, one `u16` per pixel.
+pub fn encode_gray16(width: u32, height: u32, gray: &[u16]) -> io::Result<Vec<u8>> {
+    if width == 0 || height == 0 {
+        return Err(invalid("png dimensions must be non-zero"));
+    }
+    let expected = (width as usize)
+        .checked_mul(height as usize)
+        .ok_or_else(|| invalid("png dimensions overflow"))?;
+    if gray.len() != expected {
+        return Err(invalid(format!(
+            "png pixel buffer is {} pixels, expected {expected} for a {width}x{height} gray16 image",
+            gray.len()
+        )));
+    }
+
+    // PNG 16-bit samples are big-endian.
+    let mut bytes = Vec::with_capacity(expected * 2);
+    for &sample in gray {
+        bytes.extend_from_slice(&sample.to_be_bytes());
+    }
+
+    let mut png = Vec::new();
+    {
+        let mut encoder = png::Encoder::new(&mut png, width, height);
+        encoder.set_color(png::ColorType::Grayscale);
+        encoder.set_depth(png::BitDepth::Sixteen);
+        encoder.set_compression(png::Compression::Fast);
+        let mut writer = encoder.write_header().map_err(png_error)?;
+        writer.write_image_data(&bytes).map_err(png_error)?;
+        writer.finish().map_err(png_error)?;
+    }
+    Ok(png)
+}
+
 /// Grow `png` to at least `min_len` bytes by adding an ancillary `tEXt` chunk
 /// between the last image-data chunk and `IEND`.
 ///
@@ -224,6 +258,29 @@ mod tests {
             "compressed {} bytes, stored encoding would be {stored}",
             png.len()
         );
+    }
+
+    #[test]
+    fn a_16bit_grayscale_png_round_trips() {
+        let samples = vec![0u16, 1, 500, 1500, 4500, 65535];
+        let encoded = encode_gray16(3, 2, &samples).expect("encode gray16");
+        assert_eq!(&encoded[..8], SIGNATURE);
+
+        let mut decoder = png::Decoder::new(std::io::Cursor::new(&encoded));
+        decoder.set_transformations(png::Transformations::IDENTITY);
+        let mut reader = decoder.read_info().expect("read info");
+        let info = reader.info();
+        assert_eq!((info.width, info.height), (3, 2));
+        assert_eq!(info.color_type, png::ColorType::Grayscale);
+        assert_eq!(info.bit_depth, png::BitDepth::Sixteen);
+
+        let mut buf = vec![0u8; reader.output_buffer_size()];
+        let frame = reader.next_frame(&mut buf).expect("frame");
+        let decoded: Vec<u16> = buf[..frame.buffer_size()]
+            .chunks_exact(2)
+            .map(|c| u16::from_be_bytes([c[0], c[1]]))
+            .collect();
+        assert_eq!(decoded, samples);
     }
 
     #[test]
