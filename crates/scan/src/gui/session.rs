@@ -681,10 +681,20 @@ impl SessionState {
         color: Option<FrameColor<'_>>,
         shared: &Arc<Mutex<SessionView>>,
     ) {
+        self.add_with_raw(depth, color, None, shared);
+    }
+
+    fn add_with_raw(
+        &mut self,
+        depth: &[f32],
+        color: Option<FrameColor<'_>>,
+        raw: Option<crate::scanner::RawColorData>,
+        shared: &Arc<Mutex<SessionView>>,
+    ) {
         self.frame += 1;
-        let report = self
-            .scanner
-            .add_frame_with_color(depth, self.width, self.height, color);
+        let report =
+            self.scanner
+                .add_frame_with_raw_color(depth, self.width, self.height, color, raw);
 
         self.last_pose = report.track.pose;
         self.last_points = build_points(
@@ -784,26 +794,27 @@ fn run_live(
         // Open the recording before the first frame. If it cannot be created,
         // stop the capture and fail before a scan is spent.
         let mut writer = match record_to {
-            Some(path) => match recording::FrameWriter::create_with_color(
-                path,
-                intrinsics,
-                width,
-                height,
-                config.options.color,
-            ) {
-                Ok(writer) => Some(writer),
-                Err(error) => {
-                    if let Err(stop_error) = capture.stop().await {
-                        shared
-                            .lock()
-                            .unwrap()
-                            .log(format!("stopping the sensor failed: {stop_error}"));
+            Some(path) => {
+                let res = if config.options.color {
+                    recording::FrameWriter::create_with_raw_color(path, intrinsics, width, height)
+                } else {
+                    recording::FrameWriter::create(path, intrinsics, width, height)
+                };
+                match res {
+                    Ok(writer) => Some(writer),
+                    Err(error) => {
+                        if let Err(stop_error) = capture.stop().await {
+                            shared
+                                .lock()
+                                .unwrap()
+                                .log(format!("stopping the sensor failed: {stop_error}"));
+                        }
+                        return Err(
+                            format!("cannot create recording {}: {error}", path.display()).into(),
+                        );
                     }
-                    return Err(
-                        format!("cannot create recording {}: {error}", path.display()).into(),
-                    );
                 }
-            },
+            }
             None => None,
         };
         let recording_path = record_to.map(|path| path.display().to_string());
@@ -862,7 +873,8 @@ fn run_live(
             // scanner. A failed write disables recording but keeps the scan.
             let mut write_failed = None;
             if let Some(active) = writer.as_mut() {
-                let recorded_color = capture.color().map(|captured| FrameColor {
+                let captured = capture.color();
+                let recorded_color = captured.map(|captured| FrameColor {
                     rgb: captured.rgb.as_slice(),
                     depth: captured.depth.as_slice(),
                     valid: captured.valid.as_slice(),
@@ -870,10 +882,12 @@ fn run_live(
                     gain: captured.gain,
                     gamma: captured.gamma,
                 });
-                if let Err(error) = active.write_frame_with_color(
+                let recorded_raw = captured.and_then(|c| c.raw.as_ref());
+                if let Err(error) = active.write_frame_with_raw_color(
                     recorded_from.elapsed().as_secs_f32(),
                     &depth,
                     recorded_color,
+                    recorded_raw,
                 ) {
                     write_failed = Some(error);
                 }
@@ -886,7 +900,8 @@ fn run_live(
                 writer = None;
             }
 
-            let color = capture.color().map(|captured| FrameColor {
+            let captured = capture.color();
+            let color = captured.map(|captured| FrameColor {
                 rgb: captured.rgb.as_slice(),
                 depth: captured.depth.as_slice(),
                 valid: captured.valid.as_slice(),
@@ -894,8 +909,9 @@ fn run_live(
                 gain: captured.gain,
                 gamma: captured.gamma,
             });
+            let raw = captured.and_then(|c| c.raw.clone());
 
-            state.add(&depth, color, shared);
+            state.add_with_raw(&depth, color, raw, shared);
             state.maybe_publish(shared, index == 1);
         }
 
@@ -996,7 +1012,7 @@ fn run_replay(
             gamma: color.gamma,
         });
 
-        state.add(&frame.depth, color, shared);
+        state.add_with_raw(&frame.depth, color, frame.raw_color.clone(), shared);
         state.maybe_publish(shared, state.frame == 1);
         pace.wait();
     }

@@ -75,16 +75,17 @@
 //! sensor saw it, again all at once.
 
 use geom::Intrinsics;
-use geom::coloring::ColorView;
+use geom::coloring::{ColorView, ColoringParams, adjust_rgb_exposure, estimate_view_exposures};
 use geom::mesh::save_colored_points_ply;
 use geom::png;
+use kinect_one::processor::color::ZuneColorProcessor;
 use nalgebra::{Isometry3, Translation3, UnitQuaternion, Vector3};
 use std::collections::HashSet;
 use std::fs;
 use std::io::{self, ErrorKind};
 use std::path::{Path, PathBuf};
 
-use crate::scanner::Scanner;
+use crate::scanner::{RawColorView, Scanner};
 
 /// A full TSDF surface can have millions of vertices. Training one Gaussian per
 /// vertex makes Brush slow and over-dense, so the seed cloud is voxel-decimated
@@ -148,24 +149,46 @@ pub fn write_dataset(scanner: &Scanner, dir: &Path, unmirror: bool) -> io::Resul
     let mask_dir = dir.join(MASK_DIR);
     let depth_dir = dir.join(DEPTH_DIR);
 
-    let (frames, skipped) = write_views(views, &image_dir, &mask_dir, &depth_dir, unmirror)?;
-
-    // Every view carries the same intrinsics: the scanner copies one `Intrinsics`
-    // onto each. Taking the first is therefore not a sample, it is the value.
-    let intrinsics = views[0].intrinsics;
-    let width = views[0].width;
-    let height = views[0].height;
-
-    // The mesh is in the sensor frame, like the poses: `Scanner::mesh` extracts
-    // from the volume without applying the export mirror. Its colours come from
-    // the same views that were just written, so the cloud starts near the colour
-    // the trainer is about to optimise towards.
-    //
-    // This extracts and paints the surface a second time, the first being the
-    // mesh export. Reusing the exported mesh would work only if its mirror
-    // matched this dataset's, and one function owning both is simpler than
-    // keeping two in step.
+    // Extract the surface once so we can both seed `init.ply` and estimate
+    // cross-view linear exposure scales from dense geometry overlaps.
     let mesh = scanner.mesh();
+    let normals = mesh.vertex_normals();
+    let exposures =
+        estimate_view_exposures(&mesh.vertices, &normals, views, &ColoringParams::default());
+
+    let raw_views = scanner.raw_color_views();
+    let use_hd = raw_views.len() == views.len()
+        && raw_views
+            .iter()
+            .zip(views.iter())
+            .all(|(r, v)| r.frame_index == v.frame_index)
+        && raw_views
+            .iter()
+            .all(|r| r.width == raw_views[0].width && r.height == raw_views[0].height);
+
+    let ((frames, skipped), intrinsics, width, height) = if use_hd {
+        let res = write_hd_views(
+            views,
+            raw_views,
+            &exposures,
+            scanner.intrinsics(),
+            &image_dir,
+            &depth_dir,
+            unmirror,
+        )?;
+        (
+            res,
+            raw_views[0].intrinsics,
+            raw_views[0].width as usize,
+            raw_views[0].height as usize,
+        )
+    } else {
+        let res = write_views_filtered(
+            views, &exposures, &image_dir, &mask_dir, &depth_dir, unmirror,
+        )?;
+        (res, views[0].intrinsics, views[0].width, views[0].height)
+    };
+
     let source_points = mesh.vertices.len();
     let (seed, seed_colors) =
         decimate_init(&mesh.vertices, mesh.colors.as_deref(), MAX_INIT_POINTS);
@@ -263,8 +286,260 @@ fn decimate_init(
 ///
 /// Split out from [`write_dataset`] so the per-view logic can be exercised
 /// without a scanner, and therefore without a sensor.
+const BLUR_WINDOW_RADIUS: usize = 4;
+const MIN_TEXTURE_VARIANCE: f32 = 20.0;
+const BLUR_RATIO_THRESHOLD: f32 = 0.35;
+
+/// Discrete 5-point Laplacian variance of Rec. 601 luminance across interior
+/// valid pixels. Returns `None` when fewer than 16 valid 5-point neighborhoods
+/// exist.
+fn laplacian_variance(
+    rgb: &[u8],
+    valid: Option<&[u8]>,
+    width: usize,
+    height: usize,
+) -> Option<f32> {
+    if width < 3 || height < 3 || rgb.len() < width * height * 3 {
+        return None;
+    }
+    let luma = |idx: usize| -> f64 {
+        let base = idx * 3;
+        0.299 * rgb[base] as f64 + 0.587 * rgb[base + 1] as f64 + 0.114 * rgb[base + 2] as f64
+    };
+    let mut sum = 0.0f64;
+    let mut sum_sq = 0.0f64;
+    let mut count = 0usize;
+
+    for y in 1..(height - 1) {
+        let row = y * width;
+        for x in 1..(width - 1) {
+            let idx = row + x;
+            if let Some(v) = valid
+                && (v[idx] == 0
+                    || v[idx - 1] == 0
+                    || v[idx + 1] == 0
+                    || v[idx - width] == 0
+                    || v[idx + width] == 0)
+            {
+                continue;
+            }
+            let lap = 4.0 * luma(idx)
+                - luma(idx - 1)
+                - luma(idx + 1)
+                - luma(idx - width)
+                - luma(idx + width);
+            sum += lap;
+            sum_sq += lap * lap;
+            count += 1;
+        }
+    }
+
+    if count < 16 {
+        return None;
+    }
+    let mean = sum / count as f64;
+    let var = (sum_sq / count as f64 - mean * mean).max(0.0);
+    Some(var as f32)
+}
+
+/// Keep frames that are not sudden motion-blur outliers relative to neighboring
+/// frames (`window = 2*R + 1`). Low-texture scenes stay kept via the texture
+/// variance floor so uniform walls are never falsely discarded.
+fn motion_blur_keep_mask(scores: &[Option<f32>]) -> Vec<bool> {
+    let n = scores.len();
+    let mut keep = vec![true; n];
+    if n < 3 {
+        return keep;
+    }
+    let mut scratch = Vec::with_capacity(2 * BLUR_WINDOW_RADIUS + 1);
+    for i in 0..n {
+        let Some(score) = scores[i] else {
+            continue;
+        };
+        let lo = i.saturating_sub(BLUR_WINDOW_RADIUS);
+        let hi = (i + BLUR_WINDOW_RADIUS + 1).min(n);
+        scratch.clear();
+        for s in &scores[lo..hi] {
+            if let Some(val) = s {
+                scratch.push(*val);
+            }
+        }
+        if scratch.len() < 3 {
+            continue;
+        }
+        scratch.sort_by(|a, b| a.total_cmp(b));
+        let med = scratch[scratch.len() / 2];
+        if med > MIN_TEXTURE_VARIANCE && score < BLUR_RATIO_THRESHOLD * med {
+            keep[i] = false;
+        }
+    }
+    keep
+}
+
+/// Reproject depth values (`w_d x h_d` metres) onto the colour grid (`w_c x h_c`)
+/// with a 3x3 z-buffer splat so dense interior pixels are filled while closer
+/// foreground surfaces win over occluded backgrounds.
+fn splat_depth_to_color(
+    depth_grid: &[f32],
+    w_d: usize,
+    h_d: usize,
+    depth_intrinsics: &Intrinsics,
+    color_intrinsics: &Intrinsics,
+    color_from_depth: &Isometry3<f32>,
+    w_c: usize,
+    h_c: usize,
+) -> Vec<f32> {
+    let mut out = vec![0.0f32; w_c * h_c];
+    for dy in 0..h_d {
+        let row = dy * w_d;
+        for dx in 0..w_d {
+            let z = depth_grid[row + dx];
+            if !z.is_finite() || z <= 0.0 {
+                continue;
+            }
+            let p_d = depth_intrinsics.back_project(dx as f32, dy as f32, z);
+            let p_c = color_from_depth.transform_point(&nalgebra::Point3::from(p_d));
+            let z_c = p_c.z;
+            if !z_c.is_finite() || z_c <= 0.05 {
+                continue;
+            }
+            let u = color_intrinsics.fx * (p_c.x / z_c) + color_intrinsics.cx;
+            let v = color_intrinsics.fy * (p_c.y / z_c) + color_intrinsics.cy;
+            let iu = u.round() as isize;
+            let iv = v.round() as isize;
+            if iu < -1 || iu > w_c as isize || iv < -1 || iv > h_c as isize {
+                continue;
+            }
+            for oy in -1..=1_isize {
+                let cy = iv + oy;
+                if cy < 0 || cy >= h_c as isize {
+                    continue;
+                }
+                let out_row = cy as usize * w_c;
+                for ox in -1..=1_isize {
+                    let cx = iu + ox;
+                    if cx < 0 || cx >= w_c as isize {
+                        continue;
+                    }
+                    let idx = out_row + cx as usize;
+                    if out[idx] == 0.0 || z_c < out[idx] {
+                        out[idx] = z_c;
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+#[allow(clippy::too_many_arguments)]
+fn write_hd_views(
+    views: &[ColorView],
+    raw_views: &[RawColorView],
+    exposures: &[f32],
+    depth_intrinsics: Intrinsics,
+    image_dir: &Path,
+    depth_dir: &Path,
+    unmirror: bool,
+) -> io::Result<(Vec<Frame>, usize)> {
+    fs::create_dir_all(image_dir)?;
+    fs::create_dir_all(depth_dir)?;
+
+    let scores: Vec<Option<f32>> = raw_views
+        .iter()
+        .map(|raw| {
+            ZuneColorProcessor::decode_rgb(&raw.jpeg)
+                .ok()
+                .and_then(|(w, h, rgb)| laplacian_variance(&rgb, None, w as usize, h as usize))
+        })
+        .collect();
+    let keep = motion_blur_keep_mask(&scores);
+
+    let mut frames: Vec<Frame> = Vec::with_capacity(views.len());
+    let mut skipped = 0usize;
+
+    for (i, (view, raw)) in views.iter().zip(raw_views.iter()).enumerate() {
+        let hd_pose = view.pose * raw.color_from_depth.inverse();
+        if !pose_is_finite(&hd_pose) || !keep[i] {
+            skipped += 1;
+            continue;
+        }
+
+        let (dec_w, dec_h, mut rgb) = ZuneColorProcessor::decode_rgb(&raw.jpeg)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("JPEG decode: {e}")))?;
+        if dec_w != raw.width || dec_h != raw.height {
+            return Err(invalid(format!(
+                "decoded JPEG dimensions {dec_w}x{dec_h} differ from metadata {}x{}",
+                raw.width, raw.height
+            )));
+        }
+
+        let w_c = raw.width as usize;
+        let h_c = raw.height as usize;
+        let exp = exposures.get(i).copied().unwrap_or(1.0);
+        adjust_rgb_exposure(&mut rgb, exp);
+
+        let mut splatted = splat_depth_to_color(
+            &view.depth,
+            view.width,
+            view.height,
+            &depth_intrinsics,
+            &raw.intrinsics,
+            &raw.color_from_depth,
+            w_c,
+            h_c,
+        );
+        let mut depth_mm = depth_to_mm(&splatted, w_c * h_c);
+        splatted.clear();
+
+        let final_pose;
+        let pose = if unmirror {
+            rgb = flip_rows(w_c, h_c, 3, &rgb);
+            depth_mm = flip_rows(w_c, h_c, 1, &depth_mm);
+            final_pose = mirror_pose(&hd_pose);
+            &final_pose
+        } else {
+            &hd_pose
+        };
+
+        let name = format!("{:05}.png", frames.len());
+        let image = png::encode_rgb8(raw.width, raw.height, &rgb)?;
+        let image = png::pad_to_min_size(image, MIN_IMAGE_BYTES);
+        fs::write(image_dir.join(&name), image)?;
+
+        let depth_png = png::encode_gray16(raw.width, raw.height, &depth_mm)?;
+        fs::write(depth_dir.join(&name), depth_png)?;
+
+        frames.push(Frame {
+            file_path: format!("{IMAGE_DIR}/{name}"),
+            depth_path: format!("{DEPTH_DIR}/{name}"),
+            matrix: camera_to_world(pose),
+        });
+    }
+
+    if frames.is_empty() {
+        return Err(invalid(
+            "every frame was skipped (non-finite pose or blur); dataset would be empty",
+        ));
+    }
+
+    Ok((frames, skipped))
+}
+
 fn write_views(
     views: &[ColorView],
+    image_dir: &Path,
+    mask_dir: &Path,
+    depth_dir: &Path,
+    unmirror: bool,
+) -> io::Result<(Vec<Frame>, usize)> {
+    let exposures = vec![1.0f32; views.len()];
+    write_views_filtered(views, &exposures, image_dir, mask_dir, depth_dir, unmirror)
+}
+
+fn write_views_filtered(
+    views: &[ColorView],
+    exposures: &[f32],
     image_dir: &Path,
     mask_dir: &Path,
     depth_dir: &Path,
@@ -294,14 +569,20 @@ fn write_views(
     fs::create_dir_all(mask_dir)?;
     fs::create_dir_all(depth_dir)?;
 
+    let scores: Vec<Option<f32>> = views
+        .iter()
+        .map(|view| laplacian_variance(&view.color, Some(&view.valid), width, height))
+        .collect();
+    let keep = motion_blur_keep_mask(&scores);
+
     let mut frames: Vec<Frame> = Vec::with_capacity(views.len());
     let mut skipped = 0;
 
-    for view in views {
+    for (i, view) in views.iter().enumerate() {
         // `NaN` is not JSON, and a view that cannot be described is worse than a
         // view that is left out. Nothing upstream should produce one; this only
         // keeps the file well-formed if something does.
-        if !pose_is_finite(&view.pose) {
+        if !pose_is_finite(&view.pose) || !keep[i] {
             skipped += 1;
             continue;
         }
@@ -310,16 +591,20 @@ fn write_views(
         // sequence has no gaps even when a view above was skipped.
         let name = format!("{:05}.png", frames.len());
 
+        let exp = exposures.get(i).copied().unwrap_or(1.0);
+        let mut adjusted = view.color.clone();
+        adjust_rgb_exposure(&mut adjusted, exp);
+
         // A real 512x424 frame is far larger than Brush's header sniff, but a
         // small capture (the synthetic room) is not, and would fail to load.
         let (color, valid, pose);
         let (color, valid, pose) = if unmirror {
-            color = flip_rows(width, height, 3, &view.color);
+            color = flip_rows(width, height, 3, &adjusted);
             valid = flip_rows(width, height, 1, &view.valid);
             pose = mirror_pose(&view.pose);
             (&color[..], &valid[..], &pose)
         } else {
-            (&view.color[..], &view.valid[..], &view.pose)
+            (&adjusted[..], &view.valid[..], &view.pose)
         };
 
         let image = png::encode_rgb8(width as u32, height as u32, color)?;
@@ -931,7 +1216,10 @@ mod tests {
         assert!(json.contains("\"fl_y\": 40"), "{json}");
         assert!(json.contains(&format!("\"w\": {WIDTH}")), "{json}");
         assert!(json.contains(&format!("\"h\": {HEIGHT}")), "{json}");
-        assert!(json.contains("\"depth_unit_scale_factor\": 0.001"), "{json}");
+        assert!(
+            json.contains("\"depth_unit_scale_factor\": 0.001"),
+            "{json}"
+        );
         assert!(json.contains("\"ply_file_path\": \"init.ply\""), "{json}");
         assert!(json.contains("\"transform_matrix\""), "{json}");
         assert!(json.contains("\"images/00000.png\""), "{json}");
@@ -1306,11 +1594,21 @@ mod tests {
             );
             // `geom`'s decoder is test-only there, so read the structure directly:
             // signature, IHDR dimensions, and IEND still closing the file.
-            assert_eq!(&bytes[..8], &[0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1A, b'\n']);
+            assert_eq!(
+                &bytes[..8],
+                &[0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1A, b'\n']
+            );
             let width = u32::from_be_bytes(bytes[16..20].try_into().unwrap()) as usize;
             let height = u32::from_be_bytes(bytes[20..24].try_into().unwrap()) as usize;
-            assert_eq!((width, height), (crate::synthetic::WIDTH, crate::synthetic::HEIGHT));
-            assert_eq!(&bytes[bytes.len() - 8..bytes.len() - 4], b"IEND", "IEND must stay last");
+            assert_eq!(
+                (width, height),
+                (crate::synthetic::WIDTH, crate::synthetic::HEIGHT)
+            );
+            assert_eq!(
+                &bytes[bytes.len() - 8..bytes.len() - 4],
+                b"IEND",
+                "IEND must stay last"
+            );
             checked += 1;
         }
         assert_eq!(checked, report.views);
@@ -1351,7 +1649,14 @@ mod tests {
         // Still a unit rotation, not a reflection or a scaled one.
         assert!((mirrored.rotation.quaternion().norm() - 1.0).abs() < 1e-5);
         assert!(
-            (mirrored.rotation.to_rotation_matrix().matrix().determinant() - 1.0).abs() < 1e-5
+            (mirrored
+                .rotation
+                .to_rotation_matrix()
+                .matrix()
+                .determinant()
+                - 1.0)
+                .abs()
+                < 1e-5
         );
         // M * (M * T * M) * M is T again.
         assert_same_pose(&original, &mirror_pose(&mirrored));
@@ -1390,9 +1695,21 @@ mod tests {
 
         let mirrored_cx = mirror_intrinsics(&k, WIDTH).cx;
         for (axis, angle, translation) in [
-            (Vector3::new(0.0, 1.0, 0.0), 0.0, Vector3::new(0.0, 0.0, 0.0)),
-            (Vector3::new(0.0, 1.0, 0.0), 0.4, Vector3::new(0.5, -0.1, 0.2)),
-            (Vector3::new(0.3, -0.7, 0.5), 0.9, Vector3::new(-0.8, 0.3, 0.6)),
+            (
+                Vector3::new(0.0, 1.0, 0.0),
+                0.0,
+                Vector3::new(0.0, 0.0, 0.0),
+            ),
+            (
+                Vector3::new(0.0, 1.0, 0.0),
+                0.4,
+                Vector3::new(0.5, -0.1, 0.2),
+            ),
+            (
+                Vector3::new(0.3, -0.7, 0.5),
+                0.9,
+                Vector3::new(-0.8, 0.3, 0.6),
+            ),
         ] {
             let camera = pose(axis, angle, translation);
             let mirrored_camera = mirror_pose(&camera);
@@ -1403,7 +1720,11 @@ mod tests {
             ] {
                 let (u, v, z) = project(&camera, k.cx, &point);
                 let (mu, mv, mz) = project(&mirrored_camera, mirrored_cx, &mirror_point(&point));
-                assert!((mu - (WIDTH as f32 - u)).abs() < 1e-3, "column {mu} vs {}", WIDTH as f32 - u);
+                assert!(
+                    (mu - (WIDTH as f32 - u)).abs() < 1e-3,
+                    "column {mu} vs {}",
+                    WIDTH as f32 - u
+                );
                 assert!((mv - v).abs() < 1e-3, "row changed: {mv} vs {v}");
                 assert!((mz - z).abs() < 1e-4, "depth changed: {mz} vs {z}");
             }
@@ -1414,7 +1735,9 @@ mod tests {
     /// symmetric, so a missing or doubled flip cannot go unnoticed.
     fn asymmetric_view(at: Isometry3<f32>) -> ColorView {
         let mut v = view(at, 0);
-        v.color = (0..WIDTH * HEIGHT * 3).map(|i| (i * 7 % 251) as u8).collect();
+        v.color = (0..WIDTH * HEIGHT * 3)
+            .map(|i| (i * 7 % 251) as u8)
+            .collect();
         // Left third invalid.
         v.valid = (0..WIDTH * HEIGHT)
             .map(|i| u8::from(i % WIDTH >= WIDTH / 3))
@@ -1489,7 +1812,10 @@ mod tests {
     }
 
     fn scalar(json: &str, key: &str) -> f32 {
-        let after = json.split(&format!("\"{key}\":")).nth(1).expect("key present");
+        let after = json
+            .split(&format!("\"{key}\":"))
+            .nth(1)
+            .expect("key present");
         numbers(after.lines().next().unwrap())[0]
     }
 
@@ -1523,7 +1849,12 @@ mod tests {
         let (ma, mb) = (matrices(&ja), matrices(&jb));
         assert_eq!(ma.len(), mb.len());
         for (frame, (x, y)) in ma.iter().zip(&mb).enumerate() {
-            assert!((x[3] + y[3]).abs() < 1e-5, "frame {frame}: x {} vs {}", x[3], y[3]);
+            assert!(
+                (x[3] + y[3]).abs() < 1e-5,
+                "frame {frame}: x {} vs {}",
+                x[3],
+                y[3]
+            );
             assert!((x[7] - y[7]).abs() < 1e-5, "frame {frame}: y changed");
             assert!((x[11] - y[11]).abs() < 1e-5, "frame {frame}: z changed");
         }
@@ -1545,7 +1876,12 @@ mod tests {
         let image_a = decoded(&raw.path().join("images/00000.png"));
         let image_b = decoded(&flipped.path().join("images/00000.png"));
         assert_eq!(
-            flip_rows(crate::synthetic::WIDTH, crate::synthetic::HEIGHT, 3, &image_a),
+            flip_rows(
+                crate::synthetic::WIDTH,
+                crate::synthetic::HEIGHT,
+                3,
+                &image_a
+            ),
             image_b
         );
     }
@@ -1562,12 +1898,181 @@ mod tests {
         let mirrored = mirror_intrinsics(&kinect, 512);
 
         assert!((mirrored.cx - 250.92).abs() < 1e-3, "cx {}", mirrored.cx);
-        assert!((kinect.cx - 256.0).abs() > 5.0, "the real lens is not centred");
+        assert!(
+            (kinect.cx - 256.0).abs() > 5.0,
+            "the real lens is not centred"
+        );
         assert_eq!(mirrored.fx, kinect.fx);
         assert_eq!(mirrored.fy, kinect.fy);
         assert_eq!(mirrored.cy, kinect.cy);
         // Mirroring twice returns the original.
         assert!((mirror_intrinsics(&mirrored, 512).cx - kinect.cx).abs() < 1e-3);
     }
-}
 
+    #[test]
+    fn blur_filter_drops_sudden_motion_blur_and_keeps_flat_regions() {
+        // 5 sharp high-frequency frames with 1 blurred frame at index 2.
+        let sharp_scores = vec![
+            Some(500.0),
+            Some(480.0),
+            Some(40.0),
+            Some(510.0),
+            Some(490.0),
+        ];
+        let keep = motion_blur_keep_mask(&sharp_scores);
+        assert_eq!(keep, vec![true, true, false, true, true]);
+
+        // Low-texture uniform wall across all frames must never be discarded.
+        let flat_scores = vec![Some(8.0), Some(7.5), Some(2.0), Some(8.2), Some(7.8)];
+        assert_eq!(motion_blur_keep_mask(&flat_scores), vec![true; 5]);
+    }
+
+    #[test]
+    fn splat_depth_to_color_keeps_foreground_occluder_and_fills_3x3() {
+        let depth_intr = Intrinsics {
+            fx: 10.0,
+            fy: 10.0,
+            cx: 4.0,
+            cy: 4.0,
+        };
+        let color_intr = Intrinsics {
+            fx: 20.0,
+            fy: 20.0,
+            cx: 8.0,
+            cy: 8.0,
+        };
+        let mut depth_grid = vec![0.0f32; 8 * 8];
+        // Both pixels project to the same color center if offset aligns, or test z-buffer overlap:
+        // Background at (4, 4) -> z = 4.0 -> color (8, 8).
+        // Foreground at (4, 4) vs neighbor (4, 4): place foreground at z=1.5 landing within 1px of (8, 8)
+        depth_grid[4 * 8 + 4] = 4.0;
+        let splatted = splat_depth_to_color(
+            &depth_grid,
+            8,
+            8,
+            &depth_intr,
+            &color_intr,
+            &Isometry3::identity(),
+            16,
+            16,
+        );
+        assert_eq!(splatted[8 * 16 + 8], 4.0);
+        // 3x3 fill covers neighbor pixel (9, 9).
+        assert_eq!(splatted[9 * 16 + 9], 4.0);
+
+        // Foreground closer surface at (4, 4) wins if we have z=1.5 nearby.
+        let mut two_layer = vec![0.0f32; 8 * 8];
+        two_layer[4 * 8 + 4] = 4.0;
+        // (4, 4) projects to (8, 8), (4, 4) is centered; shift x by +0.05 in depth via extrinsics
+        // or test directly with (3, 4) & baseline offset: at z=4.0, (4,4) -> (8,8); at z=1.5 with
+        // translation t_x = +0.15 -> x_c = -0.15+0.15=0 -> projects to (8, 8)!
+        two_layer[4 * 8 + 3] = 1.5; // p_d = (-0.15, 0, 1.5)
+        let occ = splat_depth_to_color(
+            &two_layer,
+            8,
+            8,
+            &depth_intr,
+            &color_intr,
+            &Isometry3::translation(0.15, 0.0, 0.0),
+            16,
+            16,
+        );
+        assert_eq!(occ[8 * 16 + 8], 1.5);
+    }
+
+    #[test]
+    fn write_dataset_exports_hd_jpeg_views_with_reprojected_depth_and_unmirror() {
+        // Valid 16x16 RGB JPEG (120, 80, 40)
+        const JPEG_16X16: &[u8] = &[
+            255, 216, 255, 224, 0, 16, 74, 70, 73, 70, 0, 1, 1, 0, 0, 1, 0, 1, 0, 0, 255, 219, 0,
+            67, 0, 5, 3, 4, 4, 4, 3, 5, 4, 4, 4, 5, 5, 5, 6, 7, 12, 8, 7, 7, 7, 7, 15, 11, 11, 9,
+            12, 17, 15, 18, 18, 17, 15, 17, 17, 19, 22, 28, 23, 19, 20, 26, 21, 17, 17, 24, 33, 24,
+            26, 29, 29, 31, 31, 31, 19, 23, 34, 36, 34, 30, 36, 28, 30, 31, 30, 255, 219, 0, 67, 1,
+            5, 5, 5, 7, 6, 7, 14, 8, 8, 14, 30, 20, 17, 20, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30,
+            30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30,
+            30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 30, 255, 192, 0,
+            17, 8, 0, 16, 0, 16, 3, 1, 34, 0, 2, 17, 1, 3, 17, 1, 255, 196, 0, 31, 0, 0, 1, 5, 1,
+            1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 255, 196, 0,
+            181, 16, 0, 2, 1, 3, 3, 2, 4, 3, 5, 5, 4, 4, 0, 0, 1, 125, 1, 2, 3, 0, 4, 17, 5, 18,
+            33, 49, 65, 6, 19, 81, 97, 7, 34, 113, 20, 50, 129, 145, 161, 8, 35, 66, 177, 193, 21,
+            82, 209, 240, 36, 51, 98, 114, 130, 9, 10, 22, 23, 24, 25, 26, 37, 38, 39, 40, 41, 42,
+            52, 53, 54, 55, 56, 57, 58, 67, 68, 69, 70, 71, 72, 73, 74, 83, 84, 85, 86, 87, 88, 89,
+            90, 99, 100, 101, 102, 103, 104, 105, 106, 115, 116, 117, 118, 119, 120, 121, 122, 131,
+            132, 133, 134, 135, 136, 137, 138, 146, 147, 148, 149, 150, 151, 152, 153, 154, 162,
+            163, 164, 165, 166, 167, 168, 169, 170, 178, 179, 180, 181, 182, 183, 184, 185, 186,
+            194, 195, 196, 197, 198, 199, 200, 201, 202, 210, 211, 212, 213, 214, 215, 216, 217,
+            218, 225, 226, 227, 228, 229, 230, 231, 232, 233, 234, 241, 242, 243, 244, 245, 246,
+            247, 248, 249, 250, 255, 196, 0, 31, 1, 0, 3, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0,
+            0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 255, 196, 0, 181, 17, 0, 2, 1, 2, 4, 4, 3, 4, 7,
+            5, 4, 4, 0, 1, 2, 119, 0, 1, 2, 3, 17, 4, 5, 33, 49, 6, 18, 65, 81, 7, 97, 113, 19, 34,
+            50, 129, 8, 20, 66, 145, 161, 177, 193, 9, 35, 51, 82, 240, 21, 98, 114, 209, 10, 22,
+            36, 52, 225, 37, 241, 23, 24, 25, 26, 38, 39, 40, 41, 42, 53, 54, 55, 56, 57, 58, 67,
+            68, 69, 70, 71, 72, 73, 74, 83, 84, 85, 86, 87, 88, 89, 90, 99, 100, 101, 102, 103,
+            104, 105, 106, 115, 116, 117, 118, 119, 120, 121, 122, 130, 131, 132, 133, 134, 135,
+            136, 137, 138, 146, 147, 148, 149, 150, 151, 152, 153, 154, 162, 163, 164, 165, 166,
+            167, 168, 169, 170, 178, 179, 180, 181, 182, 183, 184, 185, 186, 194, 195, 196, 197,
+            198, 199, 200, 201, 202, 210, 211, 212, 213, 214, 215, 216, 217, 218, 226, 227, 228,
+            229, 230, 231, 232, 233, 234, 242, 243, 244, 245, 246, 247, 248, 249, 250, 255, 218, 0,
+            12, 3, 1, 0, 2, 17, 3, 17, 0, 63, 0, 243, 218, 40, 162, 190, 80, 250, 83, 255, 217,
+        ];
+
+        let depth_intr = crate::synthetic::intrinsics();
+        let mut scanner = Scanner::new(
+            depth_intr,
+            ScannerConfig {
+                tsdf: TsdfParams {
+                    voxel_size: 0.03,
+                    truncation: 0.12,
+                    ..TsdfParams::default()
+                },
+                ..ScannerConfig::default()
+            },
+        );
+        let shot = &crate::synthetic::shots(2)[0];
+        let rendered = crate::synthetic::render(shot, &depth_intr);
+        let hd_intr = Intrinsics {
+            fx: 24.0,
+            fy: 24.0,
+            cx: 9.0,
+            cy: 8.0,
+        };
+        let raw = crate::scanner::RawColorData {
+            jpeg: JPEG_16X16.to_vec(),
+            width: 16,
+            height: 16,
+            intrinsics: hd_intr,
+            color_from_depth: Isometry3::translation(-0.05, 0.0, 0.0),
+        };
+        scanner.add_frame_with_raw_color(
+            &rendered.depth,
+            crate::synthetic::WIDTH,
+            crate::synthetic::HEIGHT,
+            Some(FrameColor {
+                rgb: &rendered.rgb,
+                depth: &rendered.depth,
+                valid: &rendered.valid,
+                exposure: 1.0,
+                gain: 1.0,
+                gamma: 1.0,
+            }),
+            Some(raw),
+        );
+
+        let dir = TempDir::new("hd-export");
+        let report = write_dataset(&scanner, dir.path(), true).expect("hd write");
+        assert_eq!(report.views, 1);
+
+        let image = fs::read(dir.path().join("images/00000.png")).expect("hd image");
+        assert_eq!(png_dimensions(&image), (16, 16));
+        let depth = fs::read(dir.path().join("depth/00000.png")).expect("hd depth");
+        assert_eq!(png_dimensions(&depth), (16, 16));
+        // Native full-frame RGB does not need a validity crop mask directory.
+        assert!(!dir.path().join("masks").exists());
+
+        let json = fs::read_to_string(dir.path().join("transforms.json")).expect("json");
+        assert!(json.contains("\"w\": 16"), "{json}");
+        assert!(json.contains("\"h\": 16"), "{json}");
+        // Unmirror moves cx = 16 - 9 = 7
+        assert!(json.contains("\"cx\": 7"), "{json}");
+    }
+}

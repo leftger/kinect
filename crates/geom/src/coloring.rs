@@ -610,6 +610,29 @@ pub(crate) fn linear_to_srgb(linear: f32) -> u8 {
     (encoded * 255.0).round().clamp(0.0, 255.0) as u8
 }
 
+/// Estimate per-view linear-light exposure multipliers across overlapping `views`.
+pub fn estimate_view_exposures(
+    vertices: &[Vector3<f32>],
+    normals: &[Vector3<f32>],
+    views: &[ColorView],
+    params: &ColoringParams,
+) -> Vec<f32> {
+    let observed = collect_observations(vertices, normals, views, params);
+    estimate_exposure(views.len(), &observed, params)
+}
+
+/// Apply a linear-light exposure `scale` in place to an sRGB `rgb` buffer.
+pub fn adjust_rgb_exposure(rgb: &mut [u8], scale: f32) {
+    if !scale.is_finite() || (scale - 1.0).abs() <= 1e-4 {
+        return;
+    }
+    let lut: [u8; 256] =
+        std::array::from_fn(|channel| linear_to_srgb(srgb_to_linear(channel as u8) * scale));
+    for channel in rgb.iter_mut() {
+        *channel = lut[*channel as usize];
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1484,5 +1507,31 @@ mod tests {
                 Vector3::new(x, 0.0, 2.0)
             })
             .collect()
+    }
+
+    #[test]
+    fn estimate_and_adjust_view_exposures_equalize_half_lit_view() {
+        let base = [160u8, 120, 80];
+        let dark = half_linear(base);
+        let views = vec![
+            view_at(Isometry3::identity(), base),
+            view_at(Isometry3::identity(), dark),
+        ];
+        let scales = estimate_view_exposures(
+            &repeated_vertex(),
+            &vec![facing_camera(); MIN_EXPOSURE_OVERLAPS],
+            &views,
+            &ColoringParams::default(),
+        );
+        assert_eq!(scales.len(), 2);
+        let mut adjusted = dark.to_vec();
+        adjust_rgb_exposure(&mut adjusted, scales[1]);
+        for (got, want) in adjusted.iter().zip(base.iter()) {
+            assert!(
+                (*got as i32 - *want as i32).abs() <= 4,
+                "got {adjusted:?} want {base:?} with scale {}",
+                scales[1]
+            );
+        }
     }
 }

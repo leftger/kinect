@@ -15,20 +15,23 @@ use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::path::Path;
 
 use geom::Intrinsics;
+use nalgebra::{Isometry3, Quaternion, Translation3, UnitQuaternion};
 
 const MAGIC: &[u8; 4] = b"K2DF";
 pub const VERSION_DEPTH_ONLY: u32 = 1;
 pub const VERSION_WITH_COLOR: u32 = 2;
+pub const VERSION_WITH_RAW_COLOR: u32 = 3;
 
-use crate::scanner::FrameColor;
+use crate::scanner::{FrameColor, RawColorData};
 
-/// Appends depth frames (and optionally registered colour) to a recording.
+/// Appends depth frames (and optionally registered/raw colour) to a recording.
 pub struct FrameWriter {
     writer: BufWriter<File>,
     pub width: usize,
     pub height: usize,
     pub count: usize,
     has_color: bool,
+    has_raw_color: bool,
 }
 
 impl FrameWriter {
@@ -38,7 +41,7 @@ impl FrameWriter {
         width: usize,
         height: usize,
     ) -> io::Result<Self> {
-        Self::create_with_color_flag(path, intrinsics, width, height, false)
+        Self::create_with_color_flag(path, intrinsics, width, height, false, false)
     }
 
     pub fn create_with_color(
@@ -48,7 +51,18 @@ impl FrameWriter {
         height: usize,
         has_color: bool,
     ) -> io::Result<Self> {
-        Self::create_with_color_flag(path, intrinsics, width, height, has_color)
+        Self::create_with_color_flag(path, intrinsics, width, height, has_color, false)
+    }
+
+    /// Create a version-3 recording that stores compressed native high-res
+    /// colour JPEGs and extrinsics alongside each depth-grid frame.
+    pub fn create_with_raw_color(
+        path: &Path,
+        intrinsics: Intrinsics,
+        width: usize,
+        height: usize,
+    ) -> io::Result<Self> {
+        Self::create_with_color_flag(path, intrinsics, width, height, true, true)
     }
 
     fn create_with_color_flag(
@@ -57,10 +71,13 @@ impl FrameWriter {
         width: usize,
         height: usize,
         has_color: bool,
+        has_raw_color: bool,
     ) -> io::Result<Self> {
         let mut writer = BufWriter::new(File::create(path)?);
         writer.write_all(MAGIC)?;
-        let version = if has_color {
+        let version = if has_raw_color {
+            VERSION_WITH_RAW_COLOR
+        } else if has_color {
             VERSION_WITH_COLOR
         } else {
             VERSION_DEPTH_ONLY
@@ -80,6 +97,7 @@ impl FrameWriter {
             height,
             count: 0,
             has_color,
+            has_raw_color,
         })
     }
 
@@ -94,6 +112,17 @@ impl FrameWriter {
         timestamp: f32,
         depth: &[f32],
         color: Option<FrameColor<'_>>,
+    ) -> io::Result<()> {
+        self.write_frame_with_raw_color(timestamp, depth, color, None)
+    }
+
+    /// Write depth along with optional registered colour and native high-res JPEG payload.
+    pub fn write_frame_with_raw_color(
+        &mut self,
+        timestamp: f32,
+        depth: &[f32],
+        color: Option<FrameColor<'_>>,
+        raw_color: Option<&RawColorData>,
     ) -> io::Result<()> {
         assert_eq!(
             depth.len(),
@@ -141,6 +170,37 @@ impl FrameWriter {
             }
         }
 
+        if self.has_raw_color {
+            match raw_color {
+                Some(raw) => {
+                    self.writer.write_all(&[1u8])?;
+                    self.writer.write_all(&raw.width.to_le_bytes())?;
+                    self.writer.write_all(&raw.height.to_le_bytes())?;
+                    for v in [
+                        raw.intrinsics.fx,
+                        raw.intrinsics.fy,
+                        raw.intrinsics.cx,
+                        raw.intrinsics.cy,
+                    ] {
+                        self.writer.write_all(&v.to_le_bytes())?;
+                    }
+                    let t = raw.color_from_depth.translation.vector;
+                    let q = raw.color_from_depth.rotation.quaternion();
+                    for v in [t.x, t.y, t.z, q.i, q.j, q.k, q.w] {
+                        self.writer.write_all(&v.to_le_bytes())?;
+                    }
+                    let len = u32::try_from(raw.jpeg.len()).map_err(|_| {
+                        io::Error::new(io::ErrorKind::InvalidInput, "JPEG payload too large")
+                    })?;
+                    self.writer.write_all(&len.to_le_bytes())?;
+                    self.writer.write_all(&raw.jpeg)?;
+                }
+                None => {
+                    self.writer.write_all(&[0u8])?;
+                }
+            }
+        }
+
         self.count += 1;
         Ok(())
     }
@@ -167,6 +227,7 @@ pub struct RecordedFrame {
     pub timestamp: f32,
     pub depth: Vec<f32>,
     pub color: Option<RecordedColor>,
+    pub raw_color: Option<RawColorData>,
 }
 
 #[derive(Debug)]
@@ -194,13 +255,17 @@ pub fn read(path: &Path) -> io::Result<Recording> {
     }
 
     let version = read_u32(&mut reader)?;
-    if version != VERSION_DEPTH_ONLY && version != VERSION_WITH_COLOR {
+    if version != VERSION_DEPTH_ONLY
+        && version != VERSION_WITH_COLOR
+        && version != VERSION_WITH_RAW_COLOR
+    {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!("unsupported recording version {version}"),
         ));
     }
-    let has_color = version == VERSION_WITH_COLOR;
+    let has_color = version >= VERSION_WITH_COLOR;
+    let has_raw_color = version == VERSION_WITH_RAW_COLOR;
 
     let width = read_u32(&mut reader)? as usize;
     let height = read_u32(&mut reader)? as usize;
@@ -276,10 +341,58 @@ pub fn read(path: &Path) -> io::Result<Recording> {
             None
         };
 
+        let raw_color = if has_raw_color {
+            let mut flag = [0u8; 1];
+            reader.read_exact(&mut flag)?;
+            match flag[0] {
+                0 => None,
+                1 => {
+                    let rw = read_u32(&mut reader)?;
+                    let rh = read_u32(&mut reader)?;
+                    let intrinsics = Intrinsics {
+                        fx: read_f32(&mut reader)?,
+                        fy: read_f32(&mut reader)?,
+                        cx: read_f32(&mut reader)?,
+                        cy: read_f32(&mut reader)?,
+                    };
+                    let tx = read_f32(&mut reader)?;
+                    let ty = read_f32(&mut reader)?;
+                    let tz = read_f32(&mut reader)?;
+                    let qi = read_f32(&mut reader)?;
+                    let qj = read_f32(&mut reader)?;
+                    let qk = read_f32(&mut reader)?;
+                    let qw = read_f32(&mut reader)?;
+                    let color_from_depth = Isometry3::from_parts(
+                        Translation3::new(tx, ty, tz),
+                        UnitQuaternion::new_normalize(Quaternion::new(qw, qi, qj, qk)),
+                    );
+                    let jpeg_len = read_u32(&mut reader)? as usize;
+                    let mut jpeg = vec![0u8; jpeg_len];
+                    reader.read_exact(&mut jpeg)?;
+                    Some(RawColorData {
+                        jpeg,
+                        width: rw,
+                        height: rh,
+                        intrinsics,
+                        color_from_depth,
+                    })
+                }
+                other => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("corrupt raw colour flag {other} in frame"),
+                    ));
+                }
+            }
+        } else {
+            None
+        };
+
         frames.push(RecordedFrame {
             timestamp: f32::from_le_bytes(timestamp_bytes),
             depth,
             color,
+            raw_color,
         });
     }
 
@@ -428,6 +541,69 @@ mod tests {
         let f1 = &recording.frames[1];
         assert_eq!(f1.timestamp, 0.033);
         assert!(f1.color.is_none());
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn v3_round_trips_raw_color_and_pose() {
+        let dir = std::env::temp_dir().join("k2df-roundtrip-v3");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("test_v3.k2df");
+
+        let depth_frame = vec![1.0, 2.0, 3.0, 4.0];
+        let rgb = vec![10u8; 4 * 3];
+        let color_depth = vec![1.0; 4];
+        let valid = vec![1u8; 4];
+        let color = FrameColor {
+            rgb: &rgb,
+            depth: &color_depth,
+            valid: &valid,
+            exposure: 0.02,
+            gain: 1.0,
+            gamma: 2.0,
+        };
+        let raw = RawColorData {
+            jpeg: vec![0xFF, 0xD8, 0xFF, 0xD9],
+            width: 1920,
+            height: 1080,
+            intrinsics: Intrinsics {
+                fx: 1081.0,
+                fy: 1081.0,
+                cx: 960.0,
+                cy: 540.0,
+            },
+            color_from_depth: Isometry3::from_parts(
+                Translation3::new(-0.052, 0.001, -0.002),
+                UnitQuaternion::from_euler_angles(0.01, -0.02, 0.005),
+            ),
+        };
+
+        let mut writer =
+            FrameWriter::create_with_raw_color(&path, test_intrinsics(), 2, 2).unwrap();
+        writer
+            .write_frame_with_raw_color(0.0, &depth_frame, Some(color), Some(&raw))
+            .unwrap();
+        writer
+            .write_frame_with_raw_color(0.033, &depth_frame, None, None)
+            .unwrap();
+        assert_eq!(writer.finish().unwrap(), 2);
+
+        let recording = read(&path).unwrap();
+        assert!(recording.has_color);
+        assert_eq!(recording.frames.len(), 2);
+        let r0 = recording.frames[0]
+            .raw_color
+            .as_ref()
+            .expect("raw color present on v3");
+        assert_eq!(r0.width, 1920);
+        assert_eq!(r0.height, 1080);
+        assert_eq!(r0.jpeg, raw.jpeg);
+        assert!((r0.intrinsics.fx - 1081.0).abs() < 1e-6);
+        let delta = r0.color_from_depth.inverse() * raw.color_from_depth;
+        assert!(delta.translation.vector.norm() < 1e-6);
+        assert!(delta.rotation.angle() < 1e-6);
+        assert!(recording.frames[1].raw_color.is_none());
 
         std::fs::remove_file(&path).ok();
     }

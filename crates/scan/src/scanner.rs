@@ -269,6 +269,29 @@ pub struct FrameColor<'a> {
     pub gamma: f32,
 }
 
+/// Native high-resolution colour metadata & compressed JPEG bytes (`1920×1080`
+/// on Kinect v2) carried alongside the depth-grid [`FrameColor`].
+#[derive(Clone, Debug)]
+pub struct RawColorData {
+    pub jpeg: Vec<u8>,
+    pub width: u32,
+    pub height: u32,
+    pub intrinsics: Intrinsics,
+    /// Rigid transform mapping depth-camera points into the colour camera frame.
+    pub color_from_depth: Isometry3<f32>,
+}
+
+/// High-res colour frame retained for a fused view.
+#[derive(Clone, Debug)]
+pub struct RawColorView {
+    pub jpeg: Vec<u8>,
+    pub width: u32,
+    pub height: u32,
+    pub intrinsics: Intrinsics,
+    pub color_from_depth: Isometry3<f32>,
+    pub frame_index: usize,
+}
+
 /// What [`Scanner::export_mesh`] decided to write.
 pub enum ExportMesh {
     /// Positions, normals and, for PLY, per-vertex colour. No atlas.
@@ -331,6 +354,8 @@ pub struct Scanner {
     /// contribute geometry, so its colour is not kept either. After an accepted
     /// loop closure each view's pose is the corrected pose of its frame.
     color_views: Vec<ColorView>,
+    /// Native high-resolution colour frames retained alongside fused `color_views`.
+    raw_color_views: Vec<RawColorView>,
     /// Frames that arrived with a colour buffer, including ones the tracker
     /// rejected. [`Self::color_view_count`] is the subset that was kept.
     color_supplied: usize,
@@ -822,6 +847,7 @@ impl Scanner {
             graph_total_loops: 0,
             graph_updates: 0,
             color_views: Vec::new(),
+            raw_color_views: Vec::new(),
             color_supplied: 0,
             dimensions: None,
             closure: None,
@@ -953,6 +979,19 @@ impl Scanner {
         width: usize,
         height: usize,
         color: Option<FrameColor<'_>>,
+    ) -> FrameReport {
+        self.add_frame_with_raw_color(depth_metres, width, height, color, None)
+    }
+
+    /// Feed a frame with optional depth-grid colour and optional native
+    /// high-res colour JPEG + stereo extrinsics.
+    pub fn add_frame_with_raw_color(
+        &mut self,
+        depth_metres: &[f32],
+        width: usize,
+        height: usize,
+        color: Option<FrameColor<'_>>,
+        raw_color: Option<RawColorData>,
     ) -> FrameReport {
         let intrinsics = self.intrinsics;
         let image = DepthImage::new(width, height, depth_metres);
@@ -1144,6 +1183,16 @@ impl Scanner {
                     frame_index: self.frames,
                     tracking_quality: track.inlier_ratio,
                 });
+                if let Some(raw) = raw_color {
+                    self.raw_color_views.push(RawColorView {
+                        jpeg: raw.jpeg,
+                        width: raw.width,
+                        height: raw.height,
+                        intrinsics: raw.intrinsics,
+                        color_from_depth: raw.color_from_depth,
+                        frame_index: self.frames,
+                    });
+                }
             }
         }
 
@@ -1884,6 +1933,16 @@ impl Scanner {
     /// The frames that contributed colour, for the live preview.
     pub fn color_views(&self) -> &[ColorView] {
         &self.color_views
+    }
+
+    /// Native high-resolution colour frames paired by `frame_index` with [`Self::color_views`].
+    pub fn raw_color_views(&self) -> &[RawColorView] {
+        &self.raw_color_views
+    }
+
+    /// Depth camera intrinsics configured for this scanner.
+    pub fn intrinsics(&self) -> Intrinsics {
+        self.intrinsics
     }
 
     /// How many frames contributed colour. Zero when texturing is off.

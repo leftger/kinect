@@ -787,7 +787,8 @@ where
 
         // Both come from `capture`, and the scanner needs them together to pair
         // them with one pose.
-        let color = capture.color().map(|captured| FrameColor {
+        let captured = capture.color();
+        let color = captured.map(|captured| FrameColor {
             rgb: captured.rgb.as_slice(),
             depth: captured.depth.as_slice(),
             valid: captured.valid.as_slice(),
@@ -795,7 +796,8 @@ where
             gain: captured.gain,
             gamma: captured.gamma,
         });
-        let report = scanner.add_frame_with_color(&frame, width, height, color);
+        let raw = captured.and_then(|c| c.raw.clone());
+        let report = scanner.add_frame_with_raw_color(&frame, width, height, color, raw);
         print_progress(index, &report);
 
         if !on_frame(index, &scanner) {
@@ -826,8 +828,11 @@ async fn record(options: &Options) -> Result<(), Box<dyn Error>> {
     let intrinsics = capture.intrinsics();
     let (width, height) = capture.dimensions();
 
-    let mut writer =
-        recording::FrameWriter::create_with_color(&out, intrinsics, width, height, color_enabled)?;
+    let mut writer = if color_enabled {
+        recording::FrameWriter::create_with_raw_color(&out, intrinsics, width, height)?
+    } else {
+        recording::FrameWriter::create(&out, intrinsics, width, height)?
+    };
     let mode_desc = if color_enabled {
         "depth + colour"
     } else {
@@ -841,20 +846,18 @@ async fn record(options: &Options) -> Result<(), Box<dyn Error>> {
     let started = std::time::Instant::now();
     for index in 1..=frames {
         let frame = capture.next_frame().await?.to_vec();
-        let color = if color_enabled {
-            capture.color().map(|c| FrameColor {
-                rgb: &c.rgb,
-                depth: &c.depth,
-                valid: &c.valid,
-                exposure: c.exposure,
-                gain: c.gain,
-                gamma: c.gamma,
-            })
-        } else {
-            None
-        };
+        let captured = if color_enabled { capture.color() } else { None };
+        let color = captured.map(|c| FrameColor {
+            rgb: &c.rgb,
+            depth: &c.depth,
+            valid: &c.valid,
+            exposure: c.exposure,
+            gain: c.gain,
+            gamma: c.gamma,
+        });
+        let raw = captured.and_then(|c| c.raw.as_ref());
         // Seconds since capture began, so the recording carries real timing.
-        writer.write_frame_with_color(started.elapsed().as_secs_f32(), &frame, color)?;
+        writer.write_frame_with_raw_color(started.elapsed().as_secs_f32(), &frame, color, raw)?;
 
         if index % 10 == 0 || index == frames {
             println!("[scan] recorded {index}/{frames}");
@@ -915,8 +918,13 @@ fn replay(options: &Options) -> Result<(), Box<dyn Error>> {
             gain: c.gain,
             gamma: c.gamma,
         });
-        let report =
-            scanner.add_frame_with_color(&frame.depth, recording.width, recording.height, color);
+        let report = scanner.add_frame_with_raw_color(
+            &frame.depth,
+            recording.width,
+            recording.height,
+            color,
+            frame.raw_color.clone(),
+        );
         print_progress(index + 1, &report);
     }
 

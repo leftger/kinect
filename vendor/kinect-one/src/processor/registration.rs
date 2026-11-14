@@ -91,9 +91,17 @@ impl Registration {
         self.fill_depth_to_color_map();
     }
 
+    pub fn ir_params(&self) -> &IrParams {
+        &self.ir_params
+    }
+
     pub fn set_color_params(&mut self, color_params: &ColorParams) {
         self.color_params = *color_params;
         self.fill_depth_to_color_map();
+    }
+
+    pub fn color_params(&self) -> &ColorParams {
+        &self.color_params
     }
 
     pub fn undistort_depth_and_color(

@@ -46,6 +46,23 @@ impl ZuneColorProcessor {
     pub fn new(color_space: ColorSpace) -> Result<Self, Box<dyn Error>> {
         Ok(Self(color_space.try_into()?))
     }
+
+    /// Synchronously decode JPEG bytes into `(width, height, rgb)` in `ColorSpace::RGB`.
+    pub fn decode_rgb(jpeg: &[u8]) -> Result<(u32, u32, Vec<u8>), Box<dyn Error>> {
+        let reader = Cursor::new(jpeg);
+        let mut decoder = JpegDecoder::new(reader);
+        decoder.set_options(
+            DecoderOptions::new_fast()
+                .set_max_height(COLOR_HEIGHT)
+                .set_max_width(COLOR_WIDTH)
+                .jpeg_set_out_colorspace(colorspace::ColorSpace::RGB),
+        );
+        let buffer = decoder.decode()?;
+        let (w, h) = decoder
+            .dimensions()
+            .ok_or("JPEG decoder reported no image dimensions")?;
+        Ok((w as u32, h as u32, buffer))
+    }
 }
 
 impl ProcessorTrait<ColorPacket, ColorFrame> for ZuneColorProcessor {
