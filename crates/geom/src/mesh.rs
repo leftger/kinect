@@ -227,7 +227,21 @@ pub fn write_colored_points_ply<W: Write>(
     points: &[Vector3<f32>],
     colors: Option<&[[u8; 3]]>,
 ) -> io::Result<()> {
+    write_colored_points_with_normals_ply(writer, points, colors, None)
+}
+
+/// Write a point cloud PLY with optional RGB colour and optional per-point unit
+/// normals (`nx`, `ny`, `nz`). Consumers that support normals use them to align
+/// disk splats tangent to the reconstructed surface while leaving Gaussian
+/// attributes (`scale_*`, `rot_*`, `opacity`) unset.
+pub fn write_colored_points_with_normals_ply<W: Write>(
+    writer: &mut W,
+    points: &[Vector3<f32>],
+    colors: Option<&[[u8; 3]]>,
+    normals: Option<&[Vector3<f32>]>,
+) -> io::Result<()> {
     let colored = colors.is_some_and(|colors| colors.len() == points.len());
+    let has_normals = normals.is_some_and(|normals| normals.len() == points.len());
 
     write!(
         writer,
@@ -244,6 +258,13 @@ pub fn write_colored_points_ply<W: Write>(
         )?;
     }
 
+    if has_normals {
+        write!(
+            writer,
+            "property float nx\nproperty float ny\nproperty float nz\n"
+        )?;
+    }
+
     write!(writer, "end_header\n")?;
 
     for (index, p) in points.iter().enumerate() {
@@ -253,6 +274,14 @@ pub fn write_colored_points_ply<W: Write>(
         if colored {
             if let Some(colors) = colors {
                 writer.write_all(&colors[index])?;
+            }
+        }
+        if has_normals {
+            if let Some(normals) = normals {
+                let n = normals[index];
+                for c in [n.x, n.y, n.z] {
+                    writer.write_all(&c.to_le_bytes())?;
+                }
             }
         }
     }
@@ -265,9 +294,18 @@ pub fn save_colored_points_ply(
     points: &[Vector3<f32>],
     colors: Option<&[[u8; 3]]>,
 ) -> io::Result<()> {
+    save_colored_points_with_normals_ply(path, points, colors, None)
+}
+
+pub fn save_colored_points_with_normals_ply(
+    path: &Path,
+    points: &[Vector3<f32>],
+    colors: Option<&[[u8; 3]]>,
+    normals: Option<&[Vector3<f32>]>,
+) -> io::Result<()> {
     let file = File::create(path)?;
     let mut writer = BufWriter::new(file);
-    write_colored_points_ply(&mut writer, points, colors)?;
+    write_colored_points_with_normals_ply(&mut writer, points, colors, normals)?;
     writer.flush()
 }
 
@@ -679,7 +717,6 @@ mod tests {
         std::fs::remove_file(&path).ok();
     }
 
-
     #[test]
     fn rotate_turns_vertices_and_keeps_winding_and_normals_consistent() {
         let mut mesh = tetrahedron();
@@ -690,14 +727,46 @@ mod tests {
 
         mesh.rotate(&rotation);
 
-        assert_eq!(mesh.triangles, before_triangles, "a rotation must not touch winding");
+        assert_eq!(
+            mesh.triangles, before_triangles,
+            "a rotation must not touch winding"
+        );
         for (moved, original) in mesh.vertices.iter().zip(&before_vertices) {
             assert!((moved - rotation * original).norm() < 1.0e-6);
-            assert!((moved.norm() - original.norm()).abs() < 1.0e-5, "rotation changed a length");
+            assert!(
+                (moved.norm() - original.norm()).abs() < 1.0e-5,
+                "rotation changed a length"
+            );
         }
         // Derived normals follow the rotation, so they still point outward.
         for (after, before) in mesh.vertex_normals().iter().zip(&before_normals) {
             assert!((after - rotation * before).norm() < 1.0e-5);
         }
+    }
+
+    #[test]
+    fn write_colored_points_with_normals_emits_binary_ply_normals() {
+        let mut buf = Vec::new();
+        let points = [Vector3::new(1.0, 2.0, 3.0)];
+        let colors = [[10u8, 20, 30]];
+        let normals = [Vector3::new(0.0, 1.0, 0.0)];
+        write_colored_points_with_normals_ply(&mut buf, &points, Some(&colors), Some(&normals))
+            .expect("write");
+
+        let header_end = buf
+            .windows(b"end_header\n".len())
+            .position(|w| w == b"end_header\n")
+            .unwrap()
+            + b"end_header\n".len();
+        let header = std::str::from_utf8(&buf[..header_end]).unwrap();
+        assert!(header.contains("property float nx\n"));
+        assert!(header.contains("property float ny\n"));
+        assert!(header.contains("property float nz\n"));
+        let payload = &buf[header_end..];
+        assert_eq!(payload.len(), 3 * 4 + 3 + 3 * 4);
+        let nx = f32::from_le_bytes(payload[15..19].try_into().unwrap());
+        let ny = f32::from_le_bytes(payload[19..23].try_into().unwrap());
+        let nz = f32::from_le_bytes(payload[23..27].try_into().unwrap());
+        assert_eq!([nx, ny, nz], [0.0, 1.0, 0.0]);
     }
 }

@@ -172,6 +172,12 @@ struct Options {
     /// The dataset follows the mesh: un-mirrored together by default, left in the
     /// sensor frame with `--mirror`.
     dataset: Option<PathBuf>,
+    /// Optional OpenCV lens distortion (k1,k2,p1,p2) for colour dataset export.
+    color_distortion: Option<geom::Distortion>,
+    /// Minimum camera translation between exported dataset keyframes (metres).
+    keyframe_distance: f32,
+    /// Minimum camera rotation between exported dataset keyframes (degrees).
+    keyframe_angle: f32,
     /// Prior point cloud for `localize`, as ASCII or binary little-endian PLY.
     map: Option<PathBuf>,
     /// `localize`: use the live sensor instead of a recording.
@@ -187,7 +193,7 @@ impl Default for Options {
             tsdf: TsdfParams::default(),
             filters: true,
             drain_color: false,
-            gpu: false,
+            gpu: cfg!(feature = "wgpu-decode"),
             loop_closure: false,
             color: false,
             color_mode: ColoringParams::default().mode,
@@ -217,6 +223,9 @@ impl Default for Options {
             submap_max_translation: 0.0,
             graph_worker: false,
             dataset: None,
+            color_distortion: None,
+            keyframe_distance: dataset::DatasetOptions::default().min_keyframe_translation,
+            keyframe_angle: dataset::DatasetOptions::default().min_keyframe_rotation_deg,
             map: None,
             localize_live: false,
         }
@@ -332,6 +341,7 @@ fn parse_args(
             }
             "--loop-closure" => options.loop_closure = true,
             "--gpu" => options.gpu = true,
+            "--no-gpu" => options.gpu = false,
             "--mirror" => options.unmirror = false,
             "--no-mirror" | "--unmirror" => options.unmirror = true,
             "--level" => options.level = true,
@@ -406,6 +416,36 @@ fn parse_args(
             "--no-submaps" => options.submaps = false,
             "--dataset" => {
                 options.dataset = Some(PathBuf::from(next_value(&mut args, "--dataset")?))
+            }
+            "--color-distortion" => {
+                let raw = next_value(&mut args, "--color-distortion")?;
+                let parts: Vec<f32> = raw
+                    .split(',')
+                    .map(|s| s.trim().parse::<f32>())
+                    .collect::<Result<Vec<_>, _>>()?;
+                if parts.len() != 4 || parts.iter().any(|v| !v.is_finite()) {
+                    return Err("--color-distortion expects 4 finite numbers: k1,k2,p1,p2".into());
+                }
+                options.color_distortion = Some(geom::Distortion {
+                    k1: parts[0],
+                    k2: parts[1],
+                    p1: parts[2],
+                    p2: parts[3],
+                });
+            }
+            "--keyframe-distance" => {
+                let dist: f32 = next_value(&mut args, "--keyframe-distance")?.parse()?;
+                if !(dist.is_finite() && dist >= 0.0) {
+                    return Err("--keyframe-distance must be zero or positive".into());
+                }
+                options.keyframe_distance = dist;
+            }
+            "--keyframe-angle" => {
+                let deg: f32 = next_value(&mut args, "--keyframe-angle")?.parse()?;
+                if !(deg.is_finite() && deg >= 0.0) {
+                    return Err("--keyframe-angle must be zero or positive".into());
+                }
+                options.keyframe_angle = deg;
             }
             "-h" | "--help" => return Ok((Command::Help, options)),
             other => {
@@ -600,11 +640,20 @@ fn usage_text() -> String {
          \x20 --drain-color On record: read and discard colour packets. Does not\n\
          \x20               apply to live; use --color there. The packets are not\n\
          \x20               written into the .k2df file.\n\
-         \x20 --gpu         Decode depth on the GPU during live and record.\n\
-         \x20               Needs `--features wgpu-decode` (Metal on macOS,\n\
-         \x20               Vulkan on Linux). OpenCL (`--features gpu-decode`)\n\
-         \x20               does not run kernels under Rusticl. Host CPU time\n\
-         \x20               drops sharply; a live scan does not finish sooner.\n\
+         \x20 --gpu         Decode depth on the GPU during live and record (enabled by\n\
+         \x20               default when built with `wgpu-decode`; falls back to CPU\n\
+         \x20               if no Vulkan/Metal GPU adapter is found). Pass `--no-gpu`\n\
+         \x20               to force the CPU decoder.\n\
+         \x20 --no-gpu      Force CPU depth decoding.\n\
+         \x20 --color-distortion k1,k2,p1,p2\n\
+         \x20               OpenCV lens distortion coefficients for the colour camera\n\
+         \x20               (emits `OPENCV` in transforms.json and warps depth export).\n\
+         \x20 --keyframe-distance M\n\
+         \x20               Skip stationary frames moving less than M metres (default\n\
+         \x20               0.025, 0 disables).\n\
+         \x20 --keyframe-angle DEG\n\
+         \x20               Minimum rotation delta in degrees alongside\n\
+         \x20               `--keyframe-distance` (default 2.5, 0 disables).\n\
          \x20 --loop-closure  Detect revisits, redistribute the accumulated drift\n\
          \x20               over the whole trajectory, and rebuild the model from\n\
          \x20               the corrected poses. Colour views move onto those\n\
@@ -1755,7 +1804,16 @@ pub(crate) fn finish(
         // trajectory. A dataset assembled before that would carry the drifted
         // poses the trainer is most sensitive to.
         println!("[scan] writing dataset to {} ...", dir.display());
-        let report = dataset::write_dataset(scanner, dir, options.unmirror)?;
+        let report = dataset::write_dataset_with_options(
+            scanner,
+            dir,
+            dataset::DatasetOptions {
+                unmirror: options.unmirror,
+                color_distortion: options.color_distortion,
+                min_keyframe_translation: options.keyframe_distance,
+                min_keyframe_rotation_deg: options.keyframe_angle,
+            },
+        )?;
 
         println!(
             "[scan] dataset: {} views, {} initial points in {}",
@@ -1765,7 +1823,7 @@ pub(crate) fn finish(
         );
         if report.skipped > 0 {
             println!(
-                "[scan]   {} views skipped: their pose could not be written",
+                "[scan]   {} views skipped (pose, motion blur, or stationary keyframe dedup)",
                 report.skipped
             );
         }
@@ -2345,7 +2403,6 @@ mod tests {
         assert!(left.closure().is_none());
     }
 
-
     /// The sensor-frame points of the first synthetic view, as the prior a user
     /// would have scanned of the same room.
     fn synthetic_prior() -> (Vec<Vector3<f32>>, Vec<Vector3<f32>>, FrozenMapParams) {
@@ -2376,9 +2433,16 @@ mod tests {
 
         let mut pose = Isometry3::identity();
         let mut trajectory = Vec::new();
-        assert!(prior.locate(0, &query, &mut pose, &mut trajectory).is_some());
+        assert!(
+            prior
+                .locate(0, &query, &mut pose, &mut trajectory)
+                .is_some()
+        );
         assert!(!prior.use_flipped, "a matching prior must not be flipped");
-        assert!(prior.flipped.is_none(), "the flipped copy should stay unbuilt");
+        assert!(
+            prior.flipped.is_none(),
+            "the flipped copy should stay unbuilt"
+        );
         assert_eq!(trajectory.len(), 1);
     }
 
@@ -2428,7 +2492,6 @@ mod tests {
         assert!(prior.flip_attempts <= MAX_FLIP_ATTEMPTS);
     }
 
-
     #[test]
     fn level_is_opt_in_and_parses() {
         let (_, options) = parse_args(words(&["replay", "--in", "capture.k2df"])).expect("parse");
@@ -2464,7 +2527,11 @@ mod tests {
         let mut exported = ExportMesh::Geometry(tilted_floor_and_wall(8.0f32.to_radians()), None);
 
         let leveling = level_export(&mut exported).expect("a floor is present");
-        assert!((leveling.tilt.to_degrees() - 8.0).abs() < 0.7, "{}", leveling.tilt.to_degrees());
+        assert!(
+            (leveling.tilt.to_degrees() - 8.0).abs() < 0.7,
+            "{}",
+            leveling.tilt.to_degrees()
+        );
 
         let ExportMesh::Geometry(mesh, _) = &exported else {
             panic!("the export kind must not change");
@@ -2473,7 +2540,11 @@ mod tests {
         let floor: Vec<f32> = mesh.vertices.iter().step_by(2).map(|v| v.y).collect();
         let low = floor.iter().cloned().fold(f32::MAX, f32::min);
         let high = floor.iter().cloned().fold(f32::MIN, f32::max);
-        assert!(high - low < 0.06, "the floor still spans {:.3} m", high - low);
+        assert!(
+            high - low < 0.06,
+            "the floor still spans {:.3} m",
+            high - low
+        );
         assert!((floor[0] - 1.4).abs() < 0.08);
     }
 
@@ -2497,9 +2568,11 @@ mod tests {
         let ExportMesh::Geometry(mesh, _) = &exported else {
             panic!("the export kind must not change");
         };
-        assert_eq!(mesh.vertices, before, "an unlevelled scan must be unchanged");
+        assert_eq!(
+            mesh.vertices, before,
+            "an unlevelled scan must be unchanged"
+        );
     }
-
 
     /// Run a short synthetic scan through the real export path and report what
     /// levelling did, so the GUI's "levelled" / "not found" log lines have a

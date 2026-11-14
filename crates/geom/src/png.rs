@@ -318,7 +318,10 @@ mod tests {
         // The header and the first IDAT stay at the front, where a size sniff
         // looks; only the tail grew.
         assert_eq!(&padded[..png.len() - 12], &png[..png.len() - 12]);
-        assert!(padded.ends_with(&png[png.len() - 12..]), "IEND must stay last");
+        assert!(
+            padded.ends_with(&png[png.len() - 12..]),
+            "IEND must stay last"
+        );
     }
 
     #[test]

@@ -72,8 +72,15 @@ pub trait DepthProcessorTrait {
     fn set_lookup_table(&mut self, lut: &[i16; LUT_SIZE]) -> Result<(), Box<dyn Error>>;
 
     fn set_ir_params(&mut self, ir_params: &IrParams) -> Result<(), Box<dyn Error>> {
-        let mut x_table = [0.0; DEPTH_SIZE];
-        let mut z_table = [0.0; DEPTH_SIZE];
+        // Heap-allocate directly so debug frames do not reserve ~1.7 MB on the stack.
+        let mut x_table: Box<[f32; DEPTH_SIZE]> = vec![0.0; DEPTH_SIZE]
+            .into_boxed_slice()
+            .try_into()
+            .unwrap_or_else(|_| unreachable!());
+        let mut z_table: Box<[f32; DEPTH_SIZE]> = vec![0.0; DEPTH_SIZE]
+            .into_boxed_slice()
+            .try_into()
+            .unwrap_or_else(|_| unreachable!());
         let mut lut = [0; LUT_SIZE];
 
         const SCALING_FACTOR: f32 = 8192.0;

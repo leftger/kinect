@@ -29,8 +29,8 @@ use std::collections::HashMap;
 use nalgebra::Vector3;
 
 use crate::coloring::{
-    collect_observations, encode, estimate_exposure, observe, scale_linear, ColorView,
-    ColoringParams, Observation,
+    ColorView, ColoringParams, Observation, collect_observations, encode, estimate_exposure,
+    observe, scale_linear,
 };
 use crate::mesh::Mesh;
 
@@ -727,7 +727,7 @@ fn normalize_uv(x: f32, y: f32, width: usize, height: usize) -> [f32; 2] {
 mod tests {
     use super::*;
     use crate::coloring::{
-        colorize, linear_to_srgb, srgb_to_linear, ColorMode, ColoringParams, MIN_EXPOSURE_OVERLAPS,
+        ColorMode, ColoringParams, MIN_EXPOSURE_OVERLAPS, colorize, linear_to_srgb, srgb_to_linear,
     };
     use crate::transform_point;
     use nalgebra::{Isometry3, Translation3, UnitQuaternion, Vector3};
@@ -1155,10 +1155,12 @@ mod tests {
 
         assert_eq!(report.unobserved, 1);
         assert_eq!(report.charts, 1);
-        assert!(only_hidden
-            .atlas
-            .chunks_exact(3)
-            .all(|pixel| pixel == [1, 2, 3]));
+        assert!(
+            only_hidden
+                .atlas
+                .chunks_exact(3)
+                .all(|pixel| pixel == [1, 2, 3])
+        );
         assert_unit_uvs(&only_hidden);
         for uv in &only_hidden.uvs {
             assert_eq!(sample(&only_hidden, *uv), [1, 2, 3]);
@@ -1375,7 +1377,6 @@ mod tests {
         assert_eq!(empty.coverage(), 0.0);
     }
 
-
     #[test]
     fn rotate_turns_positions_and_normals_and_keeps_winding_and_uvs() {
         let mut textured = TexturedMesh {
@@ -1399,7 +1400,9 @@ mod tests {
         assert_eq!(textured.indices, before.indices);
         assert_eq!(textured.uvs, before.uvs);
         for index in 0..3 {
-            assert!((textured.positions[index] - rotation * before.positions[index]).norm() < 1.0e-6);
+            assert!(
+                (textured.positions[index] - rotation * before.positions[index]).norm() < 1.0e-6
+            );
             assert!((textured.normals[index] - rotation * before.normals[index]).norm() < 1.0e-6);
             assert!((textured.normals[index].norm() - 1.0).abs() < 1.0e-5);
         }

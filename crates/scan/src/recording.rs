@@ -515,11 +515,16 @@ mod tests {
             gamma: 2.2,
         };
 
-        let mut writer = FrameWriter::create_with_color(&path, test_intrinsics(), 2, 2, true).unwrap();
+        let mut writer =
+            FrameWriter::create_with_color(&path, test_intrinsics(), 2, 2, true).unwrap();
         // Frame 1 with colour
-        writer.write_frame_with_color(0.0, &depth_frame, Some(color)).unwrap();
+        writer
+            .write_frame_with_color(0.0, &depth_frame, Some(color))
+            .unwrap();
         // Frame 2 without colour (e.g. colour packet not arrived yet)
-        writer.write_frame_with_color(0.033, &depth_frame, None).unwrap();
+        writer
+            .write_frame_with_color(0.033, &depth_frame, None)
+            .unwrap();
         assert_eq!(writer.finish().unwrap(), 2);
 
         let recording = read(&path).unwrap();

@@ -37,6 +37,10 @@ wgpu = { version = "25", optional = true }
 pollster = { version = "1", optional = true }
 
 [features]
+# Decode depth frames on the GPU by default via Vulkan/Metal (`wgpu-decode`),
+# falling back to the CPU decoder cleanly if no GPU adapter is present.
+default = ["wgpu-decode"]
+
 # Decode depth frames on the GPU via the vendored libfreenect2 OpenCL kernels.
 #
 # Off by default because it needs an OpenCL ICD at *runtime* (`mesa-opencl-icd`

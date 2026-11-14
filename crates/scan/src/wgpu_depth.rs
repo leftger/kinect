@@ -54,9 +54,9 @@
 use std::error::Error;
 
 use kinect_one::config::Config;
-use kinect_one::processor::depth::{DepthFrame, DepthPacket, DepthProcessorTrait, IrFrame};
 use kinect_one::processor::ProcessorTrait;
-use kinect_one::{DepthProcessorParams, DEPTH_SIZE, LUT_SIZE};
+use kinect_one::processor::depth::{DepthFrame, DepthPacket, DepthProcessorTrait, IrFrame};
+use kinect_one::{DEPTH_SIZE, DepthProcessorParams, LUT_SIZE};
 use wgpu::util::DeviceExt;
 
 const WORKGROUP: u32 = 64;
@@ -576,8 +576,8 @@ mod bytemuck_free {
 mod tests {
     use super::*;
     use kinect_one::data::{IrParams, P0Tables};
-    use kinect_one::processor::depth::CpuDepthProcessor;
     use kinect_one::processor::ProcessTrait;
+    use kinect_one::processor::depth::CpuDepthProcessor;
 
     /// Plausible sensor intrinsics. Exact values do not matter for comparing two
     /// decoders, only that both receive the same ones.
@@ -763,12 +763,19 @@ mod tests {
         gpu_depth: Vec<f32>,
     }
 
+    fn zero_p0_table() -> Box<[u16; DEPTH_SIZE]> {
+        vec![0u16; DEPTH_SIZE]
+            .into_boxed_slice()
+            .try_into()
+            .unwrap_or_else(|_| unreachable!())
+    }
+
     fn decode_both(config: Config, bytes: &[u8]) -> Run {
         let ir = ir_params();
         let p0 = P0Tables {
-            p0_table0: Box::new([0u16; DEPTH_SIZE]),
-            p0_table1: Box::new([0u16; DEPTH_SIZE]),
-            p0_table2: Box::new([0u16; DEPTH_SIZE]),
+            p0_table0: zero_p0_table(),
+            p0_table1: zero_p0_table(),
+            p0_table2: zero_p0_table(),
         };
 
         let mut cpu = CpuDepthProcessor::new().expect("CPU processor");

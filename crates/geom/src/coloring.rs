@@ -66,7 +66,7 @@ use std::cmp::Ordering;
 
 use nalgebra::Vector3;
 
-use crate::{transform_point, Intrinsics};
+use crate::{Intrinsics, transform_point};
 
 /// One frame's colour, registered into the depth camera's grid.
 ///
@@ -1430,10 +1430,12 @@ mod tests {
             &ColoringParams::default(),
         );
 
-        assert!(report
-            .exposure_scales
-            .iter()
-            .all(|scale| (scale - 1.0).abs() < 1e-6));
+        assert!(
+            report
+                .exposure_scales
+                .iter()
+                .all(|scale| (scale - 1.0).abs() < 1e-6)
+        );
         assert_eq!(colors[0], [140, 130, 120]);
     }
 

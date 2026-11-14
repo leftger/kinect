@@ -74,10 +74,10 @@
 //! property the tests check. With `unmirror` false everything is written as the
 //! sensor saw it, again all at once.
 
-use geom::Intrinsics;
 use geom::coloring::{ColorView, ColoringParams, adjust_rgb_exposure, estimate_view_exposures};
-use geom::mesh::save_colored_points_ply;
+use geom::mesh::{Mesh, save_colored_points_with_normals_ply};
 use geom::png;
+use geom::{Distortion, Intrinsics};
 use kinect_one::processor::color::ZuneColorProcessor;
 use nalgebra::{Isometry3, Translation3, UnitQuaternion, Vector3};
 use std::collections::HashSet;
@@ -128,6 +128,35 @@ struct Frame {
     matrix: [[f32; 4]; 4],
 }
 
+/// Options controlling dataset export.
+#[derive(Clone, Copy, Debug)]
+pub struct DatasetOptions {
+    /// Reflect X so images, poses, intrinsics, distortion, and `init.ply` match
+    /// the un-mirrored mesh.
+    pub unmirror: bool,
+    /// Optional OpenCV lens distortion `(k1, k2, p1, p2)` for the colour camera.
+    /// When non-zero, emitted into `transforms.json` (`"camera_model": "OPENCV"`)
+    /// and applied when reprojecting 1080p depth maps.
+    pub color_distortion: Option<Distortion>,
+    /// Skip consecutive sharp views whose translation delta is smaller than this
+    /// (metres) AND whose rotation delta is smaller than
+    /// `min_keyframe_rotation_deg`. `0` disables translation gating.
+    pub min_keyframe_translation: f32,
+    /// Minimum rotation delta (degrees) used alongside `min_keyframe_translation`.
+    pub min_keyframe_rotation_deg: f32,
+}
+
+impl Default for DatasetOptions {
+    fn default() -> Self {
+        Self {
+            unmirror: true,
+            color_distortion: None,
+            min_keyframe_translation: 0.025,
+            min_keyframe_rotation_deg: 2.5,
+        }
+    }
+}
+
 /// Write the scan's colour views, poses and surface to `dir`.
 ///
 /// Needs colour views: `live --color`, a colour `.k2df` replay, or the synthetic
@@ -136,7 +165,25 @@ struct Frame {
 ///
 /// With `unmirror` the whole dataset is reflected to match the un-mirrored mesh
 /// (see the module docs); without it everything stays in the sensor's frame.
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn write_dataset(scanner: &Scanner, dir: &Path, unmirror: bool) -> io::Result<DatasetReport> {
+    write_dataset_with_options(
+        scanner,
+        dir,
+        DatasetOptions {
+            unmirror,
+            ..DatasetOptions::default()
+        },
+    )
+}
+
+/// Write the scan's colour views, poses and surface to `dir` using custom
+/// [`DatasetOptions`].
+pub fn write_dataset_with_options(
+    scanner: &Scanner,
+    dir: &Path,
+    options: DatasetOptions,
+) -> io::Result<DatasetReport> {
     let views = scanner.color_views();
     if views.is_empty() {
         return Err(invalid(
@@ -166,15 +213,21 @@ pub fn write_dataset(scanner: &Scanner, dir: &Path, unmirror: bool) -> io::Resul
             .iter()
             .all(|r| r.width == raw_views[0].width && r.height == raw_views[0].height);
 
+    let min_rot_rad = options.min_keyframe_rotation_deg.to_radians();
+    let distortion = options.color_distortion.filter(|d| !d.is_zero());
+
     let ((frames, skipped), intrinsics, width, height) = if use_hd {
         let res = write_hd_views(
             views,
             raw_views,
             &exposures,
             scanner.intrinsics(),
+            distortion,
             &image_dir,
             &depth_dir,
-            unmirror,
+            options.unmirror,
+            options.min_keyframe_translation,
+            min_rot_rad,
         )?;
         (
             res,
@@ -184,38 +237,67 @@ pub fn write_dataset(scanner: &Scanner, dir: &Path, unmirror: bool) -> io::Resul
         )
     } else {
         let res = write_views_filtered(
-            views, &exposures, &image_dir, &mask_dir, &depth_dir, unmirror,
+            views,
+            &exposures,
+            &image_dir,
+            &mask_dir,
+            &depth_dir,
+            options.unmirror,
+            options.min_keyframe_translation,
+            min_rot_rad,
         )?;
         (res, views[0].intrinsics, views[0].width, views[0].height)
     };
 
     let source_points = mesh.vertices.len();
-    let (seed, seed_colors) =
-        decimate_init(&mesh.vertices, mesh.colors.as_deref(), MAX_INIT_POINTS);
-    let seed: Vec<Vector3<f32>> = if unmirror {
-        seed.iter().map(mirror_point).collect()
+    let curvatures = vertex_curvatures(&mesh, &normals);
+    let (seed, seed_colors, seed_normals) = curvature_weighted_init(
+        &mesh.vertices,
+        mesh.colors.as_deref(),
+        &normals,
+        &curvatures,
+        MAX_INIT_POINTS,
+    );
+    let (seed, seed_normals): (Vec<Vector3<f32>>, Vec<Vector3<f32>>) = if options.unmirror {
+        (
+            seed.iter().map(mirror_point).collect(),
+            seed_normals.iter().map(mirror_normal).collect(),
+        )
     } else {
-        seed
+        (seed, seed_normals)
     };
     let points = seed.len();
     if source_points > points {
         println!(
-            "[scan] init cloud: {points} of {source_points} vertices (capped at {MAX_INIT_POINTS})"
+            "[scan] init cloud: {points} of {source_points} vertices (curvature-weighted, cap {MAX_INIT_POINTS})"
         );
     }
     if points > 0 {
-        save_colored_points_ply(&dir.join(INIT_PLY), &seed, seed_colors.as_deref())?;
+        save_colored_points_with_normals_ply(
+            &dir.join(INIT_PLY),
+            &seed,
+            seed_colors.as_deref(),
+            Some(&seed_normals),
+        )?;
     } else {
         println!("[scan] no surface to seed the splats with; the trainer will start from its own");
     }
 
-    // Columns were reversed, so the principal point moves with them.
-    let intrinsics = if unmirror {
+    // Columns were reversed, so principal point (and tangential p2) move with them.
+    let intrinsics = if options.unmirror {
         mirror_intrinsics(&intrinsics, width)
     } else {
         intrinsics
     };
-    let transforms = build_transforms(&intrinsics, width, height, &frames, points > 0);
+    let export_distortion = distortion.map(|d| if options.unmirror { d.mirrored_x() } else { d });
+    let transforms = build_transforms(
+        &intrinsics,
+        export_distortion,
+        width,
+        height,
+        &frames,
+        points > 0,
+    );
     fs::write(dir.join(TRANSFORMS), transforms)?;
 
     Ok(DatasetReport {
@@ -226,60 +308,145 @@ pub fn write_dataset(scanner: &Scanner, dir: &Path, unmirror: bool) -> io::Resul
     })
 }
 
-/// Keep at most `max_points` seed vertices by taking the first vertex in each
-/// voxel. The voxel starts at 2 cm and is enlarged until the cloud fits.
-fn decimate_init(
+#[inline]
+fn mirror_normal(n: &Vector3<f32>) -> Vector3<f32> {
+    Vector3::new(-n.x, n.y, n.z)
+}
+
+/// Per-vertex normal variation in `[0, 2]`: average `1 - n_i · n_j` over
+/// incident triangle edges. High values highlight corners and silhouettes.
+fn vertex_curvatures(mesh: &Mesh, normals: &[Vector3<f32>]) -> Vec<f32> {
+    let n = mesh.vertices.len();
+    let mut accum = vec![0.0f32; n];
+    let mut counts = vec![0u32; n];
+    for tri in &mesh.triangles {
+        let edges = [(tri[0], tri[1]), (tri[1], tri[2]), (tri[2], tri[0])];
+        for (a, b) in edges {
+            let (a, b) = (a as usize, b as usize);
+            if a < n && b < n {
+                let d = (1.0 - normals[a].dot(&normals[b])).max(0.0);
+                accum[a] += d;
+                accum[b] += d;
+                counts[a] += 1;
+                counts[b] += 1;
+            }
+        }
+    }
+    accum
+        .into_iter()
+        .zip(counts)
+        .map(|(s, c)| if c > 0 { s / c as f32 } else { 0.0 })
+        .collect()
+}
+
+type SeedCloud = (Vec<Vector3<f32>>, Option<Vec<[u8; 3]>>, Vec<Vector3<f32>>);
+
+/// Keep at most `max_points` seed vertices with surface normals, balancing
+/// baseline flat-wall coverage (4 cm anchor cells) and extra density along
+/// high-curvature corners/edges.
+fn curvature_weighted_init(
     points: &[Vector3<f32>],
     colors: Option<&[[u8; 3]]>,
+    normals: &[Vector3<f32>],
+    curvatures: &[f32],
     max_points: usize,
-) -> (Vec<Vector3<f32>>, Option<Vec<[u8; 3]>>) {
+) -> SeedCloud {
     let max_points = max_points.max(1);
     let colors = colors.filter(|colors| colors.len() == points.len());
+    let safe_normal = |i: usize| -> Vector3<f32> {
+        let v = normals.get(i).copied().unwrap_or_else(Vector3::z);
+        let len = v.norm();
+        if len.is_finite() && len > 1e-6 {
+            v / len
+        } else {
+            Vector3::z()
+        }
+    };
+
     if points.len() <= max_points {
-        return (points.to_vec(), colors.map(|colors| colors.to_vec()));
+        let norms = (0..points.len()).map(safe_normal).collect();
+        return (points.to_vec(), colors.map(|c| c.to_vec()), norms);
     }
 
-    let mut voxel = 0.02f32;
-    for _ in 0..12 {
-        let inverse = 1.0 / voxel;
-        let mut seen = HashSet::new();
-        let mut kept = Vec::new();
-        let mut kept_colors = colors.map(|_| Vec::new());
+    // Order vertex indices by descending curvature so voxel representatives pick
+    // the sharpest detail point inside each cell and high-curvature regions get
+    // priority after the coarse floor anchors.
+    let mut order: Vec<usize> = (0..points.len()).collect();
+    order.sort_by(|&a, &b| {
+        let ca = curvatures.get(a).copied().unwrap_or(0.0);
+        let cb = curvatures.get(b).copied().unwrap_or(0.0);
+        cb.total_cmp(&ca)
+    });
 
-        for (index, point) in points.iter().enumerate() {
-            let key = [
-                (point.x * inverse).floor() as i32,
-                (point.y * inverse).floor() as i32,
-                (point.z * inverse).floor() as i32,
-            ];
-            if !seen.insert(key) {
+    // Anchor pass: pick one representative per coarse 4cm cell (capped at half
+    // the budget if the room is huge, or fallback scaling if needed).
+    let mut selected = vec![false; points.len()];
+    let mut chosen: Vec<usize> = Vec::with_capacity(max_points);
+    let coarse_inv = 1.0 / 0.04f32;
+    let mut coarse_seen = HashSet::new();
+    let coarse_cap = (max_points / 2).max(1);
+    for &idx in &order {
+        if chosen.len() >= coarse_cap {
+            break;
+        }
+        let p = points[idx];
+        let key = [
+            (p.x * coarse_inv).floor() as i32,
+            (p.y * coarse_inv).floor() as i32,
+            (p.z * coarse_inv).floor() as i32,
+        ];
+        if coarse_seen.insert(key) {
+            selected[idx] = true;
+            chosen.push(idx);
+        }
+    }
+
+    // Detail pass: fine 2cm voxel grid (enlarging if needed), visiting highest
+    // curvature vertices first until the remaining budget fills.
+    let mut voxel = 0.02f32;
+    for _ in 0..8 {
+        if chosen.len() >= max_points {
+            break;
+        }
+        let inv = 1.0 / voxel;
+        let mut seen = HashSet::new();
+        for &idx in &chosen {
+            let p = points[idx];
+            seen.insert([
+                (p.x * inv).floor() as i32,
+                (p.y * inv).floor() as i32,
+                (p.z * inv).floor() as i32,
+            ]);
+        }
+        let before = chosen.len();
+        for &idx in &order {
+            if chosen.len() >= max_points {
+                break;
+            }
+            if selected[idx] {
                 continue;
             }
-            kept.push(*point);
-            if let (Some(colors), Some(kept_colors)) = (colors, kept_colors.as_mut()) {
-                kept_colors.push(colors[index]);
+            let p = points[idx];
+            let key = [
+                (p.x * inv).floor() as i32,
+                (p.y * inv).floor() as i32,
+                (p.z * inv).floor() as i32,
+            ];
+            if seen.insert(key) {
+                selected[idx] = true;
+                chosen.push(idx);
             }
         }
-
-        if kept.len() <= max_points || kept.len() == points.len() {
-            return (kept, kept_colors);
+        if chosen.len() == before {
+            break;
         }
-        voxel *= 1.25;
+        voxel *= 0.75;
     }
 
-    // A pathological cloud can still miss the target after enlarging the
-    // voxels. A uniform stride is coarse, but it is bounded and never worse
-    // than handing the trainer millions of points.
-    let stride = points.len().div_ceil(max_points);
-    let mut kept = Vec::new();
-    let mut kept_colors = colors.map(|_| Vec::new());
-    for (index, point) in points.iter().enumerate().step_by(stride) {
-        kept.push(*point);
-        if let (Some(colors), Some(kept_colors)) = (colors, kept_colors.as_mut()) {
-            kept_colors.push(colors[index]);
-        }
-    }
-    (kept, kept_colors)
+    let kept = chosen.iter().map(|&i| points[i]).collect();
+    let kept_colors = colors.map(|c| chosen.iter().map(|&i| c[i]).collect());
+    let kept_normals = chosen.iter().map(|&i| safe_normal(i)).collect();
+    (kept, kept_colors, kept_normals)
 }
 
 /// Write one image and one mask per view, and describe each as a frame entry.
@@ -359,11 +526,7 @@ fn motion_blur_keep_mask(scores: &[Option<f32>]) -> Vec<bool> {
         let lo = i.saturating_sub(BLUR_WINDOW_RADIUS);
         let hi = (i + BLUR_WINDOW_RADIUS + 1).min(n);
         scratch.clear();
-        for s in &scores[lo..hi] {
-            if let Some(val) = s {
-                scratch.push(*val);
-            }
-        }
+        scratch.extend(scores[lo..hi].iter().flatten().copied());
         if scratch.len() < 3 {
             continue;
         }
@@ -379,12 +542,14 @@ fn motion_blur_keep_mask(scores: &[Option<f32>]) -> Vec<bool> {
 /// Reproject depth values (`w_d x h_d` metres) onto the colour grid (`w_c x h_c`)
 /// with a 3x3 z-buffer splat so dense interior pixels are filled while closer
 /// foreground surfaces win over occluded backgrounds.
+#[allow(clippy::too_many_arguments)]
 fn splat_depth_to_color(
     depth_grid: &[f32],
     w_d: usize,
     h_d: usize,
     depth_intrinsics: &Intrinsics,
     color_intrinsics: &Intrinsics,
+    color_distortion: Option<Distortion>,
     color_from_depth: &Isometry3<f32>,
     w_c: usize,
     h_c: usize,
@@ -403,8 +568,13 @@ fn splat_depth_to_color(
             if !z_c.is_finite() || z_c <= 0.05 {
                 continue;
             }
-            let u = color_intrinsics.fx * (p_c.x / z_c) + color_intrinsics.cx;
-            let v = color_intrinsics.fy * (p_c.y / z_c) + color_intrinsics.cy;
+            let (xn, yn) = (p_c.x / z_c, p_c.y / z_c);
+            let (xd, yd) = match color_distortion {
+                Some(d) => d.apply(xn, yn),
+                None => (xn, yn),
+            };
+            let u = color_intrinsics.fx * xd + color_intrinsics.cx;
+            let v = color_intrinsics.fy * yd + color_intrinsics.cy;
             let iu = u.round() as isize;
             let iv = v.round() as isize;
             if iu < -1 || iu > w_c as isize || iv < -1 || iv > h_c as isize {
@@ -432,15 +602,47 @@ fn splat_depth_to_color(
     out
 }
 
+/// Skip consecutive frames whose pose barely changed since the last kept
+/// keyframe so stationary pauses do not flood the training/eval split.
+fn apply_keyframe_dedup(
+    keep: &mut [bool],
+    poses: &[Isometry3<f32>],
+    min_trans_m: f32,
+    min_rot_rad: f32,
+) {
+    if min_trans_m <= 0.0 && min_rot_rad <= 0.0 {
+        return;
+    }
+    let mut last_kept: Option<Isometry3<f32>> = None;
+    for (k, pose) in keep.iter_mut().zip(poses.iter()) {
+        if !*k {
+            continue;
+        }
+        if let Some(prev) = last_kept {
+            let delta = prev.inverse() * pose;
+            let trans = delta.translation.vector.norm();
+            let rot = delta.rotation.angle();
+            if trans < min_trans_m && rot < min_rot_rad {
+                *k = false;
+                continue;
+            }
+        }
+        last_kept = Some(*pose);
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn write_hd_views(
     views: &[ColorView],
     raw_views: &[RawColorView],
     exposures: &[f32],
     depth_intrinsics: Intrinsics,
+    color_distortion: Option<Distortion>,
     image_dir: &Path,
     depth_dir: &Path,
     unmirror: bool,
+    min_trans_m: f32,
+    min_rot_rad: f32,
 ) -> io::Result<(Vec<Frame>, usize)> {
     fs::create_dir_all(image_dir)?;
     fs::create_dir_all(depth_dir)?;
@@ -453,14 +655,25 @@ fn write_hd_views(
                 .and_then(|(w, h, rgb)| laplacian_variance(&rgb, None, w as usize, h as usize))
         })
         .collect();
-    let keep = motion_blur_keep_mask(&scores);
+    let mut keep = motion_blur_keep_mask(&scores);
+    let hd_poses: Vec<Isometry3<f32>> = views
+        .iter()
+        .zip(raw_views.iter())
+        .map(|(v, r)| v.pose * r.color_from_depth.inverse())
+        .collect();
+    for (k, pose) in keep.iter_mut().zip(hd_poses.iter()) {
+        if !pose_is_finite(pose) {
+            *k = false;
+        }
+    }
+    apply_keyframe_dedup(&mut keep, &hd_poses, min_trans_m, min_rot_rad);
 
     let mut frames: Vec<Frame> = Vec::with_capacity(views.len());
     let mut skipped = 0usize;
 
     for (i, (view, raw)) in views.iter().zip(raw_views.iter()).enumerate() {
-        let hd_pose = view.pose * raw.color_from_depth.inverse();
-        if !pose_is_finite(&hd_pose) || !keep[i] {
+        let hd_pose = hd_poses[i];
+        if !keep[i] {
             skipped += 1;
             continue;
         }
@@ -485,6 +698,7 @@ fn write_hd_views(
             view.height,
             &depth_intrinsics,
             &raw.intrinsics,
+            color_distortion,
             &raw.color_from_depth,
             w_c,
             h_c,
@@ -526,6 +740,7 @@ fn write_hd_views(
     Ok((frames, skipped))
 }
 
+#[cfg(test)]
 fn write_views(
     views: &[ColorView],
     image_dir: &Path,
@@ -534,9 +749,12 @@ fn write_views(
     unmirror: bool,
 ) -> io::Result<(Vec<Frame>, usize)> {
     let exposures = vec![1.0f32; views.len()];
-    write_views_filtered(views, &exposures, image_dir, mask_dir, depth_dir, unmirror)
+    write_views_filtered(
+        views, &exposures, image_dir, mask_dir, depth_dir, unmirror, 0.0, 0.0,
+    )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn write_views_filtered(
     views: &[ColorView],
     exposures: &[f32],
@@ -544,6 +762,8 @@ fn write_views_filtered(
     mask_dir: &Path,
     depth_dir: &Path,
     unmirror: bool,
+    min_trans_m: f32,
+    min_rot_rad: f32,
 ) -> io::Result<(Vec<Frame>, usize)> {
     let Some(first) = views.first() else {
         return Err(invalid(
@@ -573,7 +793,14 @@ fn write_views_filtered(
         .iter()
         .map(|view| laplacian_variance(&view.color, Some(&view.valid), width, height))
         .collect();
-    let keep = motion_blur_keep_mask(&scores);
+    let mut keep = motion_blur_keep_mask(&scores);
+    let poses: Vec<Isometry3<f32>> = views.iter().map(|v| v.pose).collect();
+    for (k, pose) in keep.iter_mut().zip(poses.iter()) {
+        if !pose_is_finite(pose) {
+            *k = false;
+        }
+    }
+    apply_keyframe_dedup(&mut keep, &poses, min_trans_m, min_rot_rad);
 
     let mut frames: Vec<Frame> = Vec::with_capacity(views.len());
     let mut skipped = 0;
@@ -582,7 +809,7 @@ fn write_views_filtered(
         // `NaN` is not JSON, and a view that cannot be described is worse than a
         // view that is left out. Nothing upstream should produce one; this only
         // keeps the file well-formed if something does.
-        if !pose_is_finite(&view.pose) || !keep[i] {
+        if !keep[i] {
             skipped += 1;
             continue;
         }
@@ -775,6 +1002,7 @@ fn depth_to_mm(depth: &[f32], pixels: usize) -> Vec<u16> {
 /// rejected rather than misread.
 fn build_transforms(
     intrinsics: &Intrinsics,
+    distortion: Option<Distortion>,
     width: usize,
     height: usize,
     frames: &[Frame],
@@ -782,6 +1010,13 @@ fn build_transforms(
 ) -> String {
     let mut out = String::new();
     out.push_str("{\n");
+    if let Some(d) = distortion.filter(|d| !d.is_zero()) {
+        out.push_str("  \"camera_model\": \"OPENCV\",\n");
+        out.push_str(&format!("  \"k1\": {},\n", d.k1));
+        out.push_str(&format!("  \"k2\": {},\n", d.k2));
+        out.push_str(&format!("  \"p1\": {},\n", d.p1));
+        out.push_str(&format!("  \"p2\": {},\n", d.p2));
+    }
     out.push_str(&format!("  \"fl_x\": {},\n", intrinsics.fx));
     out.push_str(&format!("  \"fl_y\": {},\n", intrinsics.fy));
     out.push_str(&format!("  \"cx\": {},\n", intrinsics.cx));
@@ -1210,7 +1445,7 @@ mod tests {
             },
         ];
 
-        let json = build_transforms(&intrinsics(), WIDTH, HEIGHT, &frames, true);
+        let json = build_transforms(&intrinsics(), None, WIDTH, HEIGHT, &frames, true);
 
         assert!(json.contains("\"fl_x\": 40"), "{json}");
         assert!(json.contains("\"fl_y\": 40"), "{json}");
@@ -1245,7 +1480,7 @@ mod tests {
             matrix: camera_to_world(&Isometry3::identity()),
         }];
 
-        let json = build_transforms(&intrinsics(), WIDTH, HEIGHT, &frames, false);
+        let json = build_transforms(&intrinsics(), None, WIDTH, HEIGHT, &frames, false);
         assert!(!json.contains("ply_file_path"), "{json}");
     }
 
@@ -1266,7 +1501,7 @@ mod tests {
             })
             .collect();
 
-        let json = build_transforms(&intrinsics(), WIDTH, HEIGHT, &frames, true);
+        let json = build_transforms(&intrinsics(), None, WIDTH, HEIGHT, &frames, true);
 
         let mut depth = 0i32;
         for ch in json.chars() {
@@ -1565,11 +1800,19 @@ mod tests {
             }
         }
 
-        let (seed, seed_colors) = decimate_init(&points, Some(&colors), 1000);
+        let normals = vec![Vector3::z(); points.len()];
+        let curvatures: Vec<f32> = points
+            .iter()
+            .enumerate()
+            .map(|(i, _)| (i % 7) as f32)
+            .collect();
+        let (seed, seed_colors, seed_normals) =
+            curvature_weighted_init(&points, Some(&colors), &normals, &curvatures, 1000);
 
         assert!(!seed.is_empty());
         assert!(seed.len() <= 1000, "kept {} points", seed.len());
         assert_eq!(seed_colors.as_ref().unwrap().len(), seed.len());
+        assert_eq!(seed_normals.len(), seed.len());
     }
 
     /// Regression: Brush 0.3.0 reads exactly 16,387 bytes from each image to
@@ -1952,6 +2195,7 @@ mod tests {
             8,
             &depth_intr,
             &color_intr,
+            None,
             &Isometry3::identity(),
             16,
             16,
@@ -1973,6 +2217,7 @@ mod tests {
             8,
             &depth_intr,
             &color_intr,
+            None,
             &Isometry3::translation(0.15, 0.0, 0.0),
             16,
             16,
@@ -2074,5 +2319,75 @@ mod tests {
         assert!(json.contains("\"h\": 16"), "{json}");
         // Unmirror moves cx = 16 - 9 = 7
         assert!(json.contains("\"cx\": 7"), "{json}");
+    }
+
+    #[test]
+    fn keyframe_dedup_drops_stationary_frames_and_keeps_motion() {
+        let p0 = Isometry3::identity();
+        let p_still = Isometry3::translation(0.005, 0.0, 0.0);
+        let p_moved = Isometry3::translation(0.08, 0.0, 0.0);
+        let p_turned = Isometry3::from_parts(
+            Translation3::new(0.08, 0.0, 0.0),
+            UnitQuaternion::from_axis_angle(&Vector3::y_axis(), 0.12),
+        );
+        let poses = [p0, p_still, p_moved, p_turned];
+        let mut keep = vec![true; poses.len()];
+        apply_keyframe_dedup(&mut keep, &poses, 0.025, 2.5_f32.to_radians());
+        assert_eq!(keep, vec![true, false, true, true]);
+    }
+
+    #[test]
+    fn curvature_weighted_init_favors_high_curvature_vertices_over_flat_ones() {
+        let mut points = Vec::new();
+        let mut normals = Vec::new();
+        let mut curvatures = Vec::new();
+        // Flat low-curvature grid + sharp edge strip spaced > 2cm apart
+        for i in 0..30 {
+            let x = i as f32 * 0.05;
+            points.push(Vector3::new(x, 0.0, 0.0));
+            normals.push(Vector3::z());
+            curvatures.push(0.0);
+
+            points.push(Vector3::new(x, 0.03, 0.0));
+            normals.push(Vector3::y());
+            curvatures.push(1.5);
+        }
+        let (kept, _, kept_norms) =
+            curvature_weighted_init(&points, None, &normals, &curvatures, 30);
+        assert_eq!(kept.len(), 30);
+        assert_eq!(kept_norms.len(), 30);
+        let high_curv_kept = kept.iter().filter(|p| p.y > 0.01).count();
+        assert!(
+            high_curv_kept >= 25,
+            "expected high-curvature edge vertices prioritized, got {high_curv_kept}/30"
+        );
+    }
+
+    #[test]
+    fn transforms_emits_opencv_distortion_with_mirrored_p2() {
+        let frames = vec![Frame {
+            file_path: "images/00000.png".to_string(),
+            depth_path: "depth/00000.png".to_string(),
+            matrix: camera_to_world(&Isometry3::identity()),
+        }];
+        let dist = Distortion {
+            k1: -0.05,
+            k2: 0.01,
+            p1: 0.002,
+            p2: 0.004,
+        };
+        let json = build_transforms(
+            &intrinsics(),
+            Some(dist.mirrored_x()),
+            WIDTH,
+            HEIGHT,
+            &frames,
+            true,
+        );
+        assert!(json.contains("\"camera_model\": \"OPENCV\""), "{json}");
+        assert!(json.contains("\"k1\": -0.05"), "{json}");
+        assert!(json.contains("\"k2\": 0.01"), "{json}");
+        assert!(json.contains("\"p1\": 0.002"), "{json}");
+        assert!(json.contains("\"p2\": -0.004"), "{json}");
     }
 }

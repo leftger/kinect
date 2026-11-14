@@ -143,8 +143,14 @@ fn run_capture(program: &Path, args: &[&str], timeout: Duration) -> Option<Strin
     let (sender, receiver) = mpsc::channel::<(usize, String)>();
     let mut readers = 0;
     for (index, stream) in [
-        child.stdout.take().map(|s| Box::new(s) as Box<dyn Read + Send>),
-        child.stderr.take().map(|s| Box::new(s) as Box<dyn Read + Send>),
+        child
+            .stdout
+            .take()
+            .map(|s| Box::new(s) as Box<dyn Read + Send>),
+        child
+            .stderr
+            .take()
+            .map(|s| Box::new(s) as Box<dyn Read + Send>),
     ]
     .into_iter()
     .enumerate()
@@ -424,7 +430,9 @@ fn scan_exports(dir: &Path, settled: bool) -> Vec<Preview> {
                 return None;
             }
             if !settled {
-                let age = now.duration_since(meta.modified().ok()?).unwrap_or_default();
+                let age = now
+                    .duration_since(meta.modified().ok()?)
+                    .unwrap_or_default();
                 if age < SETTLE {
                     return None;
                 }
@@ -605,13 +613,15 @@ fn worker(config: TrainerConfig, cancel: Arc<AtomicBool>, view: Arc<Mutex<Traine
         .arg(style.steps_flag())
         .arg(config.iterations.to_string())
         .arg("--export-every")
-        .arg(match style {
-            // The legacy style only ever wrote one fixed name, so intermediate
-            // exports would just overwrite it.
-            CliStyle::Legacy => config.iterations,
-            CliStyle::Modern => preview_every,
-        }
-        .to_string())
+        .arg(
+            match style {
+                // The legacy style only ever wrote one fixed name, so intermediate
+                // exports would just overwrite it.
+                CliStyle::Legacy => config.iterations,
+                CliStyle::Modern => preview_every,
+            }
+            .to_string(),
+        )
         .arg("--export-path")
         .arg(&config.output)
         .arg("--export-name")
@@ -844,7 +854,10 @@ mod tests {
         assert_eq!(view.status, TrainerStatus::Finished, "{}", view.message);
         assert_eq!(view.output, Some(output.join("export_10.ply")));
         assert_eq!(
-            view.previews.iter().map(|p| p.iteration).collect::<Vec<_>>(),
+            view.previews
+                .iter()
+                .map(|p| p.iteration)
+                .collect::<Vec<_>>(),
             vec![5, 10]
         );
         assert_eq!(view.iteration, 10);
@@ -852,7 +865,11 @@ mod tests {
         assert_eq!(view.splats, Some(5000));
         assert_eq!(view.views, Some(3));
         assert_eq!(view.style, Some(CliStyle::Modern));
-        assert!(view.log.iter().any(|line| line.contains("starting")), "{:?}", view.log);
+        assert!(
+            view.log.iter().any(|line| line.contains("starting")),
+            "{:?}",
+            view.log
+        );
         let _ = fs::remove_dir_all(dir);
     }
 
@@ -867,7 +884,11 @@ mod tests {
                 &dir,
                 &format!(
                     "{help}\nprintf '%s\\n' \"$@\" > \"$7/args.txt\"\nprintf x > \"$7/{}\"",
-                    if steps_flag == "--total-steps" { "export_10.ply" } else { "export.ply" }
+                    if steps_flag == "--total-steps" {
+                        "export_10.ply"
+                    } else {
+                        "export.ply"
+                    }
                 ),
             );
             let mut handle = TrainerHandle::start(config(&script, &dir, 10)).expect("start");
@@ -890,7 +911,10 @@ mod tests {
     #[test]
     fn a_legacy_run_still_reports_its_single_export() {
         let dir = temp_dir("legacy");
-        let script = script(&dir, &format!("{LEGACY_HELP}\nprintf splat > \"$7/export.ply\""));
+        let script = script(
+            &dir,
+            &format!("{LEGACY_HELP}\nprintf splat > \"$7/export.ply\""),
+        );
         let output = dir.join("out");
         let mut handle = TrainerHandle::start(config(&script, &dir, 10)).expect("start");
         wait_for(&handle, Duration::from_secs(10));
@@ -978,16 +1002,28 @@ mod tests {
     fn log_lines_are_parsed_and_unrelated_lines_are_ignored() {
         assert_eq!(
             parse_line("[2026-11-13T08:47:21Z INFO  brush_cli] Refine iter 301, 10000 splats."),
-            Progress { iteration: Some(301), splats: Some(10000), views: None }
+            Progress {
+                iteration: Some(301),
+                splats: Some(10000),
+                views: None
+            }
         );
         assert_eq!(
             parse_line("[x INFO  brush_cli] Loaded dataset with 120 training, 4 eval views"),
-            Progress { iteration: None, splats: None, views: Some(120) }
+            Progress {
+                iteration: None,
+                splats: None,
+                views: Some(120)
+            }
         );
         // A refine line in some other shape still yields the iteration it can.
         assert_eq!(
             parse_line("Refine iter 50, grew"),
-            Progress { iteration: Some(50), splats: None, views: None }
+            Progress {
+                iteration: Some(50),
+                splats: None,
+                views: None
+            }
         );
         for ignored in [
             "",
@@ -1004,7 +1040,13 @@ mod tests {
     fn export_file_names_carry_the_iteration() {
         assert_eq!(export_iteration("export_5000.ply"), Some(5000));
         assert_eq!(export_iteration("export_0.ply"), Some(0));
-        for other in ["export.ply", "export_.ply", "export_12.txt", "model_12.ply", "export_1_2.ply"] {
+        for other in [
+            "export.ply",
+            "export_.ply",
+            "export_12.txt",
+            "model_12.ply",
+            "export_1_2.ply",
+        ] {
             assert_eq!(export_iteration(other), None, "{other}");
         }
     }
@@ -1012,7 +1054,12 @@ mod tests {
     #[test]
     fn exports_are_listed_in_order_and_unsettled_ones_are_held_back() {
         let dir = temp_dir("scan");
-        for (name, body) in [("export_200.ply", "b"), ("export_100.ply", "a"), ("export_300.ply", ""), ("notes.txt", "x")] {
+        for (name, body) in [
+            ("export_200.ply", "b"),
+            ("export_100.ply", "a"),
+            ("export_300.ply", ""),
+            ("notes.txt", "x"),
+        ] {
             fs::write(dir.join(name), body).unwrap();
         }
 
@@ -1031,13 +1078,25 @@ mod tests {
 
     #[test]
     fn help_text_selects_the_command_style() {
-        assert_eq!(CliStyle::from_help("  --total-steps <N>\n  --export-every"), CliStyle::Modern);
-        assert_eq!(CliStyle::from_help("  --total-train-iters <N>"), CliStyle::Legacy);
+        assert_eq!(
+            CliStyle::from_help("  --total-steps <N>\n  --export-every"),
+            CliStyle::Modern
+        );
+        assert_eq!(
+            CliStyle::from_help("  --total-train-iters <N>"),
+            CliStyle::Legacy
+        );
         // A build that mentions both is current.
-        assert_eq!(CliStyle::from_help("--total-steps --total-train-iters"), CliStyle::Modern);
+        assert_eq!(
+            CliStyle::from_help("--total-steps --total-train-iters"),
+            CliStyle::Modern
+        );
         // Unrecognised output must not strand a current install on the legacy flags.
         assert_eq!(CliStyle::from_help(""), CliStyle::Modern);
-        assert_eq!(CliStyle::from_help("usage: something else"), CliStyle::Modern);
+        assert_eq!(
+            CliStyle::from_help("usage: something else"),
+            CliStyle::Modern
+        );
     }
 
     #[test]
@@ -1050,7 +1109,11 @@ mod tests {
         fs::write(first.join("brush-cli"), "not a program").unwrap();
 
         let found = find_brush_in(&[first.clone(), second.clone()]).expect("found");
-        assert_eq!(found.path, second.join("brush"), "`brush` outranks `brush_app`");
+        assert_eq!(
+            found.path,
+            second.join("brush"),
+            "`brush` outranks `brush_app`"
+        );
         assert_eq!(found.version, "brush 9.9.9");
 
         let only_app = find_brush_in(std::slice::from_ref(&first)).expect("found");
@@ -1072,13 +1135,23 @@ mod tests {
         let found = find_brush_in(std::slice::from_ref(&dir)).expect("still found");
         assert_eq!(found.path, hang);
         assert!(found.version.is_empty(), "no version from a hung probe");
-        assert!(started.elapsed() < Duration::from_secs(10), "took {:?}", started.elapsed());
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "took {:?}",
+            started.elapsed()
+        );
         let _ = fs::remove_dir_all(dir);
     }
 
     #[test]
     fn the_progress_line_shows_steps_splats_elapsed_and_an_estimate() {
-        let line = progress_summary(10_000, 30_000, Some(1_234_567), Duration::from_secs(100), true);
+        let line = progress_summary(
+            10_000,
+            30_000,
+            Some(1_234_567),
+            Duration::from_secs(100),
+            true,
+        );
         assert_eq!(
             line,
             "10000 / 30000 steps  ·  1,234,567 splats  ·  1:40 elapsed  ·  ~3:20 left"
@@ -1093,8 +1166,15 @@ mod tests {
 
     #[test]
     fn iteration_only_moves_forward_and_drives_the_fraction() {
-        let mut view = TrainerView { total: 1000, ..TrainerView::default() };
-        assert_eq!(view.fraction(), None, "nothing is known before the first signal");
+        let mut view = TrainerView {
+            total: 1000,
+            ..TrainerView::default()
+        };
+        assert_eq!(
+            view.fraction(),
+            None,
+            "nothing is known before the first signal"
+        );
 
         view.push_log("Refine iter 400, 10 splats.".to_string());
         assert_eq!(view.fraction(), Some(0.4));
@@ -1103,7 +1183,10 @@ mod tests {
         view.push_log("Refine iter 100, 10 splats.".to_string());
         assert_eq!(view.iteration, 400);
 
-        view.set_previews(vec![Preview { iteration: 600, path: PathBuf::from("export_600.ply") }]);
+        view.set_previews(vec![Preview {
+            iteration: 600,
+            path: PathBuf::from("export_600.ply"),
+        }]);
         assert_eq!(view.fraction(), Some(0.6));
 
         view.iteration = 5000;
@@ -1145,17 +1228,35 @@ mod tests {
         let mut handle = TrainerHandle::start(cfg).expect("start");
         let view = wait_for(&handle, Duration::from_secs(300));
         handle.join();
-        let view = handle.snapshot().status.active().then_some(view).unwrap_or_else(|| handle.snapshot());
+        let view = handle
+            .snapshot()
+            .status
+            .active()
+            .then_some(view)
+            .unwrap_or_else(|| handle.snapshot());
 
-        assert_eq!(view.status, TrainerStatus::Finished, "{}\n{:#?}", view.message, view.log);
+        assert_eq!(
+            view.status,
+            TrainerStatus::Finished,
+            "{}\n{:#?}",
+            view.message,
+            view.log
+        );
         assert_eq!(view.style, Some(CliStyle::Modern));
         assert_eq!(
-            view.previews.iter().map(|p| p.iteration).collect::<Vec<_>>(),
+            view.previews
+                .iter()
+                .map(|p| p.iteration)
+                .collect::<Vec<_>>(),
             vec![125, 250]
         );
         assert_eq!(view.iteration, 250);
         assert_eq!(view.views, Some(report.views), "{:#?}", view.log);
-        assert!(view.splats.is_some_and(|n| n > 0), "no splat count in {:#?}", view.log);
+        assert!(
+            view.splats.is_some_and(|n| n > 0),
+            "no splat count in {:#?}",
+            view.log
+        );
 
         let output = view.output.expect("a final model");
         assert!(output.ends_with("export_250.ply"), "{}", output.display());

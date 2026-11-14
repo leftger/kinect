@@ -193,9 +193,16 @@ fn build_backend(use_gpu: bool) -> Result<DepthBackend, Box<dyn Error>> {
     // never executes a kernel. See examples/ocl_check.rs and vk_check.rs.
     #[cfg(feature = "wgpu-decode")]
     {
-        let processor = WgpuDepthProcessor::new()
-            .map_err(|e| format!("creating the GPU depth processor: {e}"))?;
-        return Ok(DepthBackend::Wgpu(processor));
+        match WgpuDepthProcessor::new() {
+            Ok(processor) => return Ok(DepthBackend::Wgpu(processor)),
+            Err(e) => {
+                eprintln!("[scan] wgpu GPU depth decode unavailable ({e}); falling back to CPU");
+                return Ok(DepthBackend::Cpu(
+                    CpuDepthProcessor::new()
+                        .map_err(|err| format!("creating CPU depth processor: {err}"))?,
+                ));
+            }
+        }
     }
 
     #[cfg(all(feature = "gpu-decode", not(feature = "wgpu-decode")))]

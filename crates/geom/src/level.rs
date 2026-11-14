@@ -96,7 +96,11 @@ pub fn estimate(points: &[Vector3<f32>], params: &LevelParams) -> Option<Levelin
 
     let band = f64::from(params.inlier_band).max(1.0e-4);
     let max_tilt = f64::from(params.max_tilt);
-    let radius = sample.iter().map(|p| p.norm()).fold(0.0f64, f64::max).max(band);
+    let radius = sample
+        .iter()
+        .map(|p| p.norm())
+        .fold(0.0f64, f64::max)
+        .max(band);
     let slabs = Slabs::new(radius, band);
 
     // Coarse: every direction in the cone around +y.
@@ -214,10 +218,7 @@ fn best_direction(
     directions
         .par_iter()
         .map(|direction| (*direction, slabs.peak(points, direction)))
-        .reduce(
-            || (Vector3::y(), 0),
-            |a, b| if b.1 > a.1 { b } else { a },
-        )
+        .reduce(|| (Vector3::y(), 0), |a, b| if b.1 > a.1 { b } else { a })
 }
 
 /// Unit directions within `max_angle` of `axis`, spaced about `step` apart.
@@ -227,12 +228,13 @@ fn cone(axis: &Vector3<f64>, max_angle: f64, step: f64) -> Vec<Vector3<f64>> {
     let mut directions = vec![*axis];
     for ring in 1..=rings {
         let tilt = (ring as f64 * step).min(max_angle);
-        let count = ((std::f64::consts::TAU * tilt.sin()) / step).ceil().max(1.0) as usize;
+        let count = ((std::f64::consts::TAU * tilt.sin()) / step)
+            .ceil()
+            .max(1.0) as usize;
         for index in 0..count {
             let azimuth = std::f64::consts::TAU * index as f64 / count as f64;
-            directions.push(
-                axis * tilt.cos() + (e1 * azimuth.cos() + e2 * azimuth.sin()) * tilt.sin(),
-            );
+            directions
+                .push(axis * tilt.cos() + (e1 * azimuth.cos() + e2 * azimuth.sin()) * tilt.sin());
         }
     }
     directions
@@ -352,11 +354,18 @@ mod tests {
         };
         for (name, wanted) in [("floor", 1.4f32), ("ceiling", -1.2f32)] {
             let heights = heights_after(wanted);
-            assert!(heights.len() > 1000, "{name}: only {} points", heights.len());
+            assert!(
+                heights.len() > 1000,
+                "{name}: only {} points",
+                heights.len()
+            );
             let mean = heights.iter().sum::<f32>() / heights.len() as f32;
             let low = heights.iter().cloned().fold(f32::MAX, f32::min);
             let high = heights.iter().cloned().fold(f32::MIN, f32::max);
-            assert!((mean - wanted).abs() < 0.08, "{name} sits at {mean:.3}, not {wanted}");
+            assert!(
+                (mean - wanted).abs() < 0.08,
+                "{name} sits at {mean:.3}, not {wanted}"
+            );
             assert!(high - low < 0.08, "{name} still spans {:.3} m", high - low);
         }
     }
@@ -370,7 +379,11 @@ mod tests {
             found.tilt.to_degrees()
         );
         let moved = found.apply(&Vector3::new(1.0, 1.0, 1.0)) - Vector3::new(1.0, 1.0, 1.0);
-        assert!(moved.norm() < 0.02, "moved a level scan by {}", moved.norm());
+        assert!(
+            moved.norm() < 0.02,
+            "moved a level scan by {}",
+            moved.norm()
+        );
     }
 
     #[test]

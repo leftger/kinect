@@ -19,7 +19,7 @@
 
 use nalgebra::{Isometry3, Vector3};
 
-use crate::icp::{align_points, CorrespondenceSource, IcpParams, IcpResult};
+use crate::icp::{CorrespondenceSource, IcpParams, IcpResult, align_points};
 use crate::{DepthImage, Intrinsics};
 
 /// One resolution level of a depth pyramid, with surface normals precomputed.
@@ -223,8 +223,16 @@ impl DepthPyramid {
         count: usize,
     ) -> Self {
         assert!(count >= 1, "a pyramid needs at least one level");
-        assert_eq!(image.depth.len(), image.width * image.height, "depth size mismatch");
-        assert_eq!(normals.len(), image.width * image.height, "normals size mismatch");
+        assert_eq!(
+            image.depth.len(),
+            image.width * image.height,
+            "depth size mismatch"
+        );
+        assert_eq!(
+            normals.len(),
+            image.width * image.height,
+            "normals size mismatch"
+        );
 
         let mut levels = Vec::with_capacity(count);
         let mut level = DepthLevel {

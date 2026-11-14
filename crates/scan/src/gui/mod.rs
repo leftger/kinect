@@ -1018,9 +1018,7 @@ impl ScannerApp {
 
         ui.horizontal_wrapped(|ui| {
             ui.checkbox(&mut self.trainer_config.auto_preview, "Live preview")
-                .on_hover_text(
-                    "Load each preview model into the viewport as Brush writes it.",
-                );
+                .on_hover_text("Load each preview model into the viewport as Brush writes it.");
             ui.checkbox(&mut self.trainer_config.viewer, "Brush window")
                 .on_hover_text(
                     "Also open Brush's own live viewer in a separate window. Takes \
@@ -1135,7 +1133,11 @@ impl ScannerApp {
         if running || view.iteration > 0 {
             let elapsed = view
                 .started
-                .map(|started| view.finished.unwrap_or_else(Instant::now).duration_since(started))
+                .map(|started| {
+                    view.finished
+                        .unwrap_or_else(Instant::now)
+                        .duration_since(started)
+                })
                 .unwrap_or_default();
             let text = progress_summary(view.iteration, view.total, view.splats, elapsed, running);
             ui.add(
@@ -1269,9 +1271,10 @@ impl ScannerApp {
         self.maybe_auto_train();
 
         // Collect a model a worker thread has finished reading.
-        let finished = self.preview_load.as_ref().map(|load| {
-            (load.iteration, load.path.clone(), load.receiver.try_recv())
-        });
+        let finished = self
+            .preview_load
+            .as_ref()
+            .map(|load| (load.iteration, load.path.clone(), load.receiver.try_recv()));
         match finished {
             Some((iteration, path, Ok(result))) => {
                 self.preview_load = None;
@@ -1302,7 +1305,10 @@ impl ScannerApp {
         else {
             return;
         };
-        if self.loaded_preview.is_some_and(|shown| shown >= latest.iteration) {
+        if self
+            .loaded_preview
+            .is_some_and(|shown| shown >= latest.iteration)
+        {
             return;
         }
 
@@ -1423,10 +1429,9 @@ impl ScannerApp {
                 if let Some(splat) = &self.splat {
                     ui.separator();
                     match self.loaded_preview {
-                        Some(step) => ui.small(format!(
-                            "{} splats, training step {step}",
-                            splat.len()
-                        )),
+                        Some(step) => {
+                            ui.small(format!("{} splats, training step {step}", splat.len()))
+                        }
                         None => ui.small(format!("{} splats", splat.len())),
                     };
                 }
@@ -1874,7 +1879,6 @@ mod tests {
         std::fs::remove_dir_all(&dir).expect("remove temp dir");
     }
 
-
     #[test]
     fn the_level_checkbox_starts_from_the_command_line_option() {
         // Off unless asked for, like the flag; and `--level` pre-ticks the box.
@@ -1923,7 +1927,9 @@ mod tests {
             property float rot_0\nproperty float rot_1\nproperty float rot_2\nproperty float rot_3\n\
             property float f_dc_0\nproperty float f_dc_1\nproperty float f_dc_2\nend_header\n";
         let mut bytes = header.as_bytes().to_vec();
-        for value in [1.0f32, 2.0, 3.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0] {
+        for value in [
+            1.0f32, 2.0, 3.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+        ] {
             bytes.extend_from_slice(&value.to_le_bytes());
         }
         std::fs::write(path, bytes).expect("write ply");
@@ -2002,8 +2008,14 @@ mod tests {
         app.start_trainer(&[]);
 
         assert!(app.trainer_error.is_none(), "{:?}", app.trainer_error);
-        assert!(app.trainer.is_some(), "the blank field must resolve to the detected Brush");
-        assert_eq!(app.loaded_preview, None, "a new run forgets the old preview");
+        assert!(
+            app.trainer.is_some(),
+            "the blank field must resolve to the detected Brush"
+        );
+        assert_eq!(
+            app.loaded_preview, None,
+            "a new run forgets the old preview"
+        );
         assert!(app.first_preview_pending, "and frames the camera again");
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -2014,7 +2026,10 @@ mod tests {
         let dataset = dir.join("dataset");
         std::fs::create_dir_all(&dataset).unwrap();
         let script = fake_brush(&dir, "printf x > \"$7/export_10.ply\"");
-        let install = BrushInstall { path: script, version: String::new() };
+        let install = BrushInstall {
+            path: script,
+            version: String::new(),
+        };
 
         // Asked for: a scan is in progress, then an export lands.
         let mut app = app_with_brush(Some(install.clone()));
@@ -2034,7 +2049,10 @@ mod tests {
         // same export still on screen, must not start another.
         app.trainer = None;
         app.maybe_auto_train();
-        assert!(app.trainer.is_none(), "an export already on screen is not retrained");
+        assert!(
+            app.trainer.is_none(),
+            "an export already on screen is not retrained"
+        );
 
         // Not asked for: the same sequence trains nothing, and ticking the box
         // afterwards does not retrain the export that is still on screen.
@@ -2047,7 +2065,10 @@ mod tests {
         assert!(app.trainer.is_none());
         app.trainer_config.auto_train = true;
         app.maybe_auto_train();
-        assert!(app.trainer.is_none(), "ticking the box late must not retrain");
+        assert!(
+            app.trainer.is_none(),
+            "ticking the box late must not retrain"
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -2091,7 +2112,10 @@ mod tests {
         // The operator goes back to the mesh; a later preview must not yank them.
         app.show_splats = false;
         app.show_preview(2000, Path::new("export_2000.ply"), cloud(2.0));
-        assert!(!app.show_splats, "later previews must not change the view mode");
+        assert!(
+            !app.show_splats,
+            "later previews must not change the view mode"
+        );
         assert_eq!(app.loaded_preview, Some(2000));
         assert_eq!(app.splat_path, "export_2000.ply");
         assert_eq!(app.splat.as_ref().unwrap().splats[0].position.x, 2.0);
@@ -2106,7 +2130,10 @@ mod tests {
             &dir,
             &format!("cp \"{}\" \"$7/export_5.ply\"", fixture.display()),
         );
-        let mut app = app_with_brush(Some(BrushInstall { path: script, version: String::new() }));
+        let mut app = app_with_brush(Some(BrushInstall {
+            path: script,
+            version: String::new(),
+        }));
         app.trainer_config.dataset = dir.display().to_string();
         app.trainer_config.output = dir.join("out").display().to_string();
         app.trainer_config.iterations = 5;
@@ -2119,11 +2146,21 @@ mod tests {
             app.poll_trainer();
             app.splat.is_some()
         });
-        assert!(shown, "no preview reached the viewport; error {:?}", app.splat_error);
+        assert!(
+            shown,
+            "no preview reached the viewport; error {:?}",
+            app.splat_error
+        );
         assert_eq!(app.loaded_preview, Some(5));
-        assert!(app.show_splats, "the first preview switches the viewport to splats");
+        assert!(
+            app.show_splats,
+            "the first preview switches the viewport to splats"
+        );
         assert_eq!(app.splat.as_ref().unwrap().len(), 1);
-        assert!(app.preview_load.is_none(), "the background load is collected");
+        assert!(
+            app.preview_load.is_none(),
+            "the background load is collected"
+        );
 
         // With Live preview off, the same export is not loaded again.
         app.splat = None;
@@ -2139,7 +2176,10 @@ mod tests {
         let dir = workflow_dir("badpreview");
         // Not a splat file: loading must fail once, be reported, and stop.
         let script = fake_brush(&dir, "printf 'not a ply' > \"$7/export_5.ply\"");
-        let mut app = app_with_brush(Some(BrushInstall { path: script, version: String::new() }));
+        let mut app = app_with_brush(Some(BrushInstall {
+            path: script,
+            version: String::new(),
+        }));
         app.trainer_config.dataset = dir.display().to_string();
         app.trainer_config.output = dir.join("out").display().to_string();
         app.trainer_config.iterations = 5;
@@ -2151,13 +2191,19 @@ mod tests {
             app.splat_error.is_some()
         });
         assert!(reported, "the failure should reach the panel");
-        assert_eq!(app.loaded_preview, Some(5), "the bad preview is marked handled");
+        assert_eq!(
+            app.loaded_preview,
+            Some(5),
+            "the bad preview is marked handled"
+        );
         for _ in 0..5 {
             app.poll_trainer();
         }
-        assert!(app.preview_load.is_none(), "it must not be retried every frame");
+        assert!(
+            app.preview_load.is_none(),
+            "it must not be retried every frame"
+        );
         assert!(app.splat.is_none());
         let _ = std::fs::remove_dir_all(dir);
     }
 }
-

@@ -532,11 +532,7 @@ fn position_bounds(positions: &[Vector3<f32>]) -> Option<([f32; 3], [f32; 3])> {
 }
 
 fn finite(value: f32) -> f32 {
-    if value.is_finite() {
-        value
-    } else {
-        0.0
-    }
+    if value.is_finite() { value } else { 0.0 }
 }
 
 fn gltf_json(

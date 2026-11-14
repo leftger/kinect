@@ -440,7 +440,9 @@ mod tests {
             // structure is what the tracker and a radiance field hold on to.
             let mut counts = std::collections::HashMap::new();
             for pixel in rendered.rgb.chunks_exact(3) {
-                *counts.entry([pixel[0], pixel[1], pixel[2]]).or_insert(0usize) += 1;
+                *counts
+                    .entry([pixel[0], pixel[1], pixel[2]])
+                    .or_insert(0usize) += 1;
             }
 
             let pixels = WIDTH * HEIGHT;
@@ -493,7 +495,11 @@ mod tests {
         let valid = mask();
 
         assert_eq!(valid[0], 0, "the corner should be masked");
-        assert_eq!(valid[(HEIGHT / 2) * WIDTH + WIDTH / 2], 255, "the middle should be kept");
+        assert_eq!(
+            valid[(HEIGHT / 2) * WIDTH + WIDTH / 2],
+            255,
+            "the middle should be kept"
+        );
 
         let kept = valid.iter().filter(|v| **v != 0).count();
         let fraction = kept as f32 / valid.len() as f32;

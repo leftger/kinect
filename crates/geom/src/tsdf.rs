@@ -9,7 +9,7 @@
 
 use crate::mesh::Mesh;
 use crate::spatial::Cell;
-use crate::{transform_point, DepthImage, Intrinsics};
+use crate::{DepthImage, Intrinsics, transform_point};
 use nalgebra::{Isometry3, Vector3};
 use std::collections::{HashMap, HashSet};
 

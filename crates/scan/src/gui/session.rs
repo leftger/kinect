@@ -590,8 +590,7 @@ fn export_scanner(scanner: &mut Scanner, options: &Options, shared: &Arc<Mutex<S
                 }
                 crate::LevelOutcome::NotFound => {
                     view.log(
-                        "level: no large horizontal surface found; exported as scanned"
-                            .to_string(),
+                        "level: no large horizontal surface found; exported as scanned".to_string(),
                     );
                 }
             }

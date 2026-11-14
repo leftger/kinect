@@ -1541,7 +1541,6 @@ mod tests {
         );
     }
 
-
     /// Regression: the pose, the next frame's guess and its search base are all
     /// derived from the previous candidate, so a unit-norm error compounds. Run
     /// long enough for that feedback to show and require the pose to stay a

@@ -3278,7 +3278,6 @@ mod tests {
         );
     }
 
-
     /// Regression: `Isometry3` composition does not renormalise its quaternion and
     /// `inverse()` is a conjugate, so the odometry's `base`/`guess` feedback grew
     /// the rotation's norm until it scaled vectors. Around frame 22 the tracker
@@ -3328,9 +3327,15 @@ mod tests {
             .iter()
             .map(|shot| (anchor.inverse() * shot.pose).translation.vector)
             .collect();
-        let truth_path: f32 = truth.windows(2).map(|pair| (pair[1] - pair[0]).norm()).sum();
+        let truth_path: f32 = truth
+            .windows(2)
+            .map(|pair| (pair[1] - pair[0]).norm())
+            .sum();
         let lived = scanner.trajectory();
-        let lived_path: f32 = lived.windows(2).map(|pair| (pair[1] - pair[0]).norm()).sum();
+        let lived_path: f32 = lived
+            .windows(2)
+            .map(|pair| (pair[1] - pair[0]).norm())
+            .sum();
         assert!(
             (lived_path - truth_path).abs() < 0.25 * truth_path,
             "tracked {lived_path:.3} m for a {truth_path:.3} m path"
